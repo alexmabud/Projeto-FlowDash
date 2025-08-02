@@ -18,87 +18,100 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
 
 ## 🗂️ Estrutura de Pastas
 
-| Pasta / Arquivo     | Descrição                                                                 |
-|---------------------|---------------------------------------------------------------------------|
-| `main.py`           | Arquivo principal da aplicação (ponto de entrada do sistema)              |
-| `lancamentos.py`    | Interface principal com lógica dos lançamentos e menus com Streamlit      |
-| `data/`             | Contém o banco de dados SQLite (`flowdash_data.db`)                       |
-| `banco.py`          | Módulo para conexão e operações com o banco de dados                      |
-| `ui.py`             | Componentes visuais e estilizações personalizadas para Streamlit          |
-| `dashboard.py`      | Geração de gráficos e indicadores financeiros                             |
-| `cadastro.py`       | Telas e funções para cadastro de dados (usuários, metas, taxas, etc.)     |
-| `funcoes.py`        | Funções utilitárias e auxiliares (validações, cálculos, formatações)      |
-| `fluxograma/`       | Contém o arquivo do fluxograma do sistema (imagem para consulta interna)  |
+| Pasta / Arquivo         | Descrição                                                                 |
+|--------------------------|--------------------------------------------------------------------------|
+| `main.py`               | Ponto de entrada principal do sistema.                                   |
+| `lancamentos.py`        | Interface principal: login, menu lateral e telas integradas.             |
+| `auth/`                 | Lógica de login, controle de sessão e verificação de perfil.             |
+| `banco/`                | Funções de acesso ao banco SQLite (leitura das tabelas).                 |
+| `cadastro/`             | Telas e funcionalidades para cadastro de usuários, metas, saldos etc.    |
+| `dashboard/`            | Geração de gráficos e indicadores financeiros.                           |
+| `services/`             | Regras de negócio reutilizáveis (ex: cálculo de comissão, metas).        |
+| `ui/`                   | Componentes visuais e estilizações personalizadas com Streamlit.         |
+| `utils/`                | Funções auxiliares (formatação, datas úteis, hash de senha etc.).        |
+| `data/flowdash_data.db` | Banco de dados SQLite com as tabelas do sistema.                         |
+| `fluxograma/`           | Contém o diagrama do fluxo da aplicação (`Fluxograma FlowDash.png`).     |
+| `README.md`             | Apresentação geral do projeto (este arquivo).                            |
+| `README_ESTRUTURA.md`   | Explicação técnica da estrutura de pastas e organização do sistema.      |
 
 ---
 
 ## ✅ Funcionalidades Implementadas
 
-- **Login com controle de perfil** (Administrador, Gerente, Vendedor)
+- **Login com controle de perfil**:
+  - Administrador
+  - Gerente
+  - Vendedor
+
 - **Lançamentos do Dia**:
-  - Cadastro de Entradas
-  - Cadastro de Saídas
+  - Cadastro de entradas
+  - Cadastro de saídas
   - Transferência entre Caixa e Caixa 2
+
 - **Cadastro**:
-  - Usuários com status ativo/inativo
-  - Taxas de maquininhas por forma de pagamento, bandeira e parcelas
-  - Cartões de crédito (com vencimento e fechamento)
-  - Saldos bancários e em caixa
-  - Metas de vendas (diária, semanal, mensal e por nível)
+  - Usuários com ativação/desativação
+  - Taxas de maquininhas por forma, bandeira e parcelas
+  - Cartões de crédito (vencimento e fechamento)
+  - Saldos bancários e de caixa
+  - Metas por vendedor (diária, semanal, mensal e por nível)
+
 - **Fechamento de Caixa**:
   - Entradas confirmadas (com taxas aplicadas)
-  - Visualização do saldo em caixa e bancos
-  - Correções manuais
+  - Saldo final esperado por caixa e banco
+  - Correções manuais e controle de saldos acumulados
+
 - **Dashboard**: em construção
-- **DRE**: em construção
+- **DRE (Demonstrativo de Resultado)**: em construção
 
 ---
 
 ## 🔐 Segurança
 
-- **Hash de senhas:** as senhas dos usuários são armazenadas com `SHA-256` usando `hashlib`.
+- Senhas dos usuários são protegidas com **hash SHA-256** usando `hashlib`.
+- Validação de senha forte com letras, números e símbolos.
+- Controle de acesso baseado em perfil (restrição por seção).
 
 ---
 
 ## 🛠️ Tecnologias Utilizadas
 
 - **Linguagem:** Python 3.10+
-- **Framework Web:** Streamlit
+- **Interface:** Streamlit
 - **Banco de Dados:** SQLite3
-- **Gráficos:** Plotly
+- **Visualizações:** Plotly
 - **Manipulação de Dados:** Pandas
 - **Calendário de Feriados:** Workalendar (com suporte ao DF)
-- **Hash de Senhas:** hashlib (SHA-256)
+- **Criptografia de Senhas:** hashlib (SHA-256)
 - **Outras:** datetime, os, re
 
 ---
 
 ## 📦 Bibliotecas e Dependências
 
-Essas são as principais bibliotecas usadas no projeto:
-
-| Biblioteca         | Tipo            | Finalidade                                                         |
-|--------------------|------------------|----------------------------------------------------------------------|
-| `streamlit`        | Externa          | Interface gráfica e menus interativos                               |
-| `sqlite3`          | Nativa           | Conexão e manipulação do banco de dados SQLite                      |
-| `os`               | Nativa           | Manipulação de diretórios e caminhos                                |
-| `hashlib`          | Nativa           | Criptografia de senhas (SHA-256)                                    |
-| `pandas`           | Externa          | Manipulação de tabelas, DataFrames, dados financeiros               |
-| `re`               | Nativa           | Validação de senhas e expressões regulares                          |
-| `datetime`         | Nativa           | Manipulação de datas e períodos                                     |
-| `plotly.graph_objects` | Externa     | Geração de gráficos interativos                                     |
-| `workalendar.america.BrazilDistritoFederal` | Externa | Cálculo de dias úteis e feriados do DF                              |
+| Biblioteca         | Tipo      | Finalidade                                                       |
+|--------------------|-----------|------------------------------------------------------------------|
+| `streamlit`        | Externa   | Interface gráfica interativa                                     |
+| `sqlite3`          | Nativa    | Acesso ao banco SQLite                                           |
+| `os`               | Nativa    | Manipulação de diretórios e caminhos                             |
+| `hashlib`          | Nativa    | Hash de senhas com SHA-256                                       |
+| `pandas`           | Externa   | Manipulação de dados financeiros (entradas, saídas, metas)       |
+| `re`               | Nativa    | Validação de expressões regulares (ex: senha forte)              |
+| `datetime`         | Nativa    | Cálculo de datas e períodos                                      |
+| `plotly.graph_objects` | Externa | Geração de gráficos interativos                                |
+| `workalendar.america.BrazilDistritoFederal` | Externa | Cálculo de dias úteis e feriados regionais (DF) |
 
 ---
 
 ## 📝 Banco de Dados
 
 - Arquivo: `data/flowdash_data.db`
-- Principais Tabelas:
+- Tabelas principais:
   - `entrada`, `saida`
-  - `usuarios`, `taxas_maquinas`
-  - `saldos_caixas`, `saldos_bancos`, `correcao_caixa`, `fechamento_caixa`
-  - `metas`, `cartoes_credito`, `fatura_cartao`
+  - `usuarios`, `taxas_maquinas`, `metas`
+  - `saldos_caixas`, `saldos_bancos`
+  - `correcao_caixa`, `fechamento_caixa`
+  - `cartoes_credito`, `fatura_cartao`
+  - `compras`, `contas_a_pagar`, `emprestimos_financiamentos`
 
 ---
 
@@ -107,21 +120,8 @@ Essas são as principais bibliotecas usadas no projeto:
 1. Instale os requisitos:
 ```bash
 pip install -r requirements.txt
-```
-
-2. Execute o sistema:
-```bash
-streamlit run lancamentos.py
-```
 
 ---
 
-## 📁 Arquivos de Referência
-
-- `fluxograma/Fluxograma FlowDash.png`: diagrama com o fluxo geral da aplicação
-- `funcoes_completas.py`: conjunto de funções reutilizáveis (utils, auth, banco, dashboard etc.)
-
----
-
-**Autor:** Alex Abud
+**Autor:** Alex Abud  
 **Projeto:** FlowDash – Sistema de Fluxo de Caixa + Dashboard Inteligente
