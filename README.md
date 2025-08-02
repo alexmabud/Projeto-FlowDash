@@ -46,7 +46,7 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
 - **Lançamentos do Dia**:
   - Cadastro de entradas
   - Cadastro de saídas
-  - Transferência entre Caixa e Caixa 2
+  - Transferência entre Caixas
 
 - **Cadastro**:
   - Usuários com ativação/desativação
@@ -60,16 +60,16 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
   - Saldo final esperado por caixa e banco
   - Correções manuais e controle de saldos acumulados
 
-- **Dashboard**: em construção
+- **Dashboard**: em construção  
 - **DRE (Demonstrativo de Resultado)**: em construção
 
 ---
 
 ## 🔐 Segurança
 
-- Senhas dos usuários são protegidas com **hash SHA-256** usando `hashlib`.
-- Validação de senha forte com letras, números e símbolos.
-- Controle de acesso baseado em perfil (restrição por seção).
+- Senhas dos usuários são protegidas com **hash SHA-256** usando `hashlib`
+- Validação de senha forte com letras, números e símbolos
+- Controle de acesso baseado em perfil (restrição por seção)
 
 ---
 
@@ -117,11 +117,20 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
 
 ## 🚀 Como Executar o Projeto
 
-1. Instale os requisitos:
+1. Clone o repositório:
+```bash
+git clone https://github.com/seu-usuario/flowdash.git
+cd flowdash
+```
+
+2. Instale as dependências:
 ```bash
 pip install -r requirements.txt
+```
 
 ---
 
-**Autor:** Alex Abud  
+## 👨‍💻 Autor
+
+**Alex Abud**  
 **Projeto:** FlowDash – Sistema de Fluxo de Caixa + Dashboard Inteligente

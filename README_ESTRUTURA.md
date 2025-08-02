@@ -1,3 +1,4 @@
+
 # 📁 Estrutura de Pastas — FlowDash
 
 Este arquivo descreve a estrutura organizacional do projeto **FlowDash**, com explicações sobre o propósito de cada pasta e arquivo, conforme a estrutura modular real utilizada.
@@ -6,42 +7,44 @@ Este arquivo descreve a estrutura organizacional do projeto **FlowDash**, com ex
 
 ## 🌳 Estrutura Atual
 
+```
 FlowDash/
 │
 ├── main.py
 ├── lancamentos.py
 │
 ├── auth/
-│ └── auth.py
+│   └── auth.py
 │
 ├── banco/
-│ └── banco.py
+│   └── banco.py
 │
 ├── cadastro/
-│ └── cadastro.py
+│   └── cadastro.py
 │
 ├── dashboard/
-│ └── dashboard.py
+│   └── dashboard.py
 │
 ├── services/
-│ └── (regras de negócio: ex. comissões, metas, validações)
+│   └── (regras de negócio: ex. comissões, metas, validações)
 │
 ├── ui/
-│ └── ui.py
+│   └── ui.py
 │
 ├── utils/
-│ └── utils.py
+│   └── utils.py
 │
 ├── data/
-│ └── flowdash_data.db
+│   └── flowdash_data.db
 │
 ├── fluxograma/
-│ └── Fluxograma FlowDash.png
+│   └── Fluxograma FlowDash.png
 │
 ├── README.md
 └── README_ESTRUTURA.md
+```
 
-
+---
 
 ## 🗂️ Detalhamento das Pastas e Arquivos
 
