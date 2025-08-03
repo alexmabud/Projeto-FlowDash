@@ -2,7 +2,6 @@ import streamlit as st
 import sqlite3
 from utils.utils import gerar_hash_senha
 
-
 def validar_login(email: str, senha: str, caminho_banco: str) -> dict | None:
     """
     Valida o login do usuário com base no banco de dados.
@@ -16,18 +15,18 @@ def validar_login(email: str, senha: str, caminho_banco: str) -> dict | None:
         dict | None: Dicionário com nome, email e perfil se válido; None se inválido.
     """
     senha_hash = gerar_hash_senha(senha)
+    query = """
+        SELECT nome, email, perfil
+        FROM usuarios
+        WHERE email = ? AND senha = ? AND ativo = 1
+    """
     with sqlite3.connect(caminho_banco) as conn:
-        cursor = conn.execute("""
-            SELECT nome, email, perfil
-            FROM usuarios
-            WHERE email = ? AND senha = ? AND ativo = 1
-        """, (email, senha_hash))
+        cursor = conn.execute(query, (email, senha_hash))
         resultado = cursor.fetchone()
 
     if resultado:
         return {"nome": resultado[0], "email": resultado[1], "perfil": resultado[2]}
     return None
-
 
 def verificar_acesso(perfis_permitidos: list[str]) -> None:
     """
@@ -43,7 +42,6 @@ def verificar_acesso(perfis_permitidos: list[str]) -> None:
         st.warning("🚫 Acesso não autorizado.")
         st.stop()
 
-
 def exibir_usuario_logado() -> None:
     """
     Exibe nome e perfil do usuário logado no topo da interface Streamlit.
@@ -52,7 +50,6 @@ def exibir_usuario_logado() -> None:
     if usuario:
         st.markdown(f"👤 **{usuario['nome']}** — Perfil: `{usuario['perfil']}`")
         st.markdown("---")
-
 
 def limpar_todas_as_paginas() -> None:
     """
@@ -67,4 +64,5 @@ def limpar_todas_as_paginas() -> None:
         "mostrar_saldos_bancarios", "mostrar_cadastro_caixa", "mostrar_cadastro_meta"
     ]
     for chave in chaves:
-        st.session_state[chave] = False
+        if chave in st.session_state:
+            st.session_state[chave] = False
