@@ -1,4 +1,3 @@
-# utils.py
 
 import pandas as pd
 import hashlib
@@ -10,17 +9,11 @@ from workalendar.america import BrazilDistritoFederal
 # Funções Auxiliares Gerais
 # =============================
 
-# Formata um valor float no padrão monetário brasileiro.Ex: 1234.56 → 'R$ 1.234,56'
-def formatar_valor(valor: float) -> str:
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
 # Calcula o percentual de um valor em relação à meta. Retorna 0 se a meta for zero.
 def calcular_percentual(valor: float, meta: float) -> float:    
     if meta == 0:
         return 0.0
     return round((valor / meta) * 100, 2)
-
 
 # Adiciona uma coluna com o nome do dia da semana, baseado na coluna de datas fornecida.
 def adicionar_dia_semana(df: pd.DataFrame, coluna_data: str = "Data") -> pd.DataFrame:
@@ -29,8 +22,7 @@ def adicionar_dia_semana(df: pd.DataFrame, coluna_data: str = "Data") -> pd.Data
     df["Dia_Semana"] = df[coluna_data].dt.day_name(locale="pt_BR")
     return df
 
-
-# Retorna o último dia útil anterior à data fornecida,considerando feriados do Distrito Federal.
+# Retorna o último dia útil anterior à data fornecida, considerando feriados do Distrito Federal.
 def ultimo_dia_util(data: datetime) -> datetime:  
     cal = BrazilDistritoFederal()
     data = pd.to_datetime(data)
@@ -38,6 +30,26 @@ def ultimo_dia_util(data: datetime) -> datetime:
         data -= timedelta(days=1)
     return data
 
+# === Formatação de Valores =========================================================================================
+
+# Formata um valor float como moeda brasileira. Ex: 1234.56 → 'R$ 1.234,56'
+def formatar_valor(valor: float) -> str:
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# Formata um valor float como percentual. Ex: 87.5 → '87,5%'
+def formatar_percentual(valor: float) -> str:
+    return f"{valor:.1f}%".replace(".", ",")
+
+# Aplica formatação de moeda e percentual a colunas específicas de um DataFrame
+def formatar_dataframe(df, colunas_monetarias=[], colunas_percentuais=[]):
+    df_formatado = df.copy()
+    for col in colunas_monetarias:
+        if col in df_formatado.columns:
+            df_formatado[col] = df_formatado[col].apply(lambda x: formatar_valor(x) if x is not None else "")
+    for col in colunas_percentuais:
+        if col in df_formatado.columns:
+            df_formatado[col] = df_formatado[col].apply(lambda x: formatar_percentual(x) if x is not None else "")
+    return df_formatado
 
 # =============================
 # Segurança e Autenticação
@@ -46,7 +58,6 @@ def ultimo_dia_util(data: datetime) -> datetime:
 # Gera um hash SHA256 para uma senha.
 def gerar_hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode()).hexdigest()
-
 
 # Verifica se a senha é forte: mínimo de 8 caracteres, com maiúscula, minúscula, número e símbolo.
 def senha_forte(senha: str) -> bool:
