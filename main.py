@@ -10,13 +10,13 @@ Este script é o ponto de entrada do sistema FlowDash. Ele é responsável por:
 - Gerenciar o session_state para navegação e controle de interface
 
 Módulos carregados de forma dinâmica:
-- pages.metas
-- pages.lancamentos
-- pages.dataframes
-- pages.fechamento
-- pages.dashboard
-- pages.dre
-- pages.cadastro
+- flowdash_pages.metas
+- flowdash_pages.lancamentos
+- flowdash_pages.dataframes
+- flowdash_pages.fechamento
+- flowdash_pages.dashboard
+- flowdash_pages.dre
+- flowdash_pages.cadastro
 """
 
 import streamlit as st
@@ -154,25 +154,25 @@ st.title(st.session_state.pagina_atual)
 
 # ===== ROTEAMENTO PARA PÁGINAS ==================================================================
 ROTAS = {
-    "🎯 Metas": "pages.metas.pagina_metas",
-    "🧾 Lançamentos": "pages.lancamentos.pagina_lancamentos",
-    "💼 Fechamento de Caixa": "pages.fechamento.pagina_fechamento",
-    "📊 Dashboard": "pages.dashboard.pagina_dashboard",
-    "📉 DRE": "pages.dre.pagina_dre",
-    "📥 Entradas": "pages.dataframes.pagina_entradas",
-    "📤 Saídas": "pages.dataframes.pagina_saidas",
-    "📦 Mercadorias": "pages.dataframes.pagina_mercadorias",
-    "💳 Fatura Cartão de Crédito": "pages.dataframes.pagina_fatura_cartao",
-    "📄 Contas a Pagar": "pages.dataframes.pagina_contas_pagar",
-    "🏦 Empréstimos/Financiamentos": "pages.dataframes.pagina_emprestimos",
-    "👥 Usuários": "pages.cadastro.pagina_usuarios",
-    "🎯 Cadastro de Metas": "pages.cadastro.pagina_metas_cadastro",
-    "⚙️ Taxas Maquinetas": "pages.cadastro.pagina_taxas_maquinas",
-    "📇 Cartão de Crédito": "pages.cadastro.pagina_cartoes_credito",
-    "💵 Caixa": "pages.cadastro.pagina_caixa",
-    "🛠️ Correção de Caixa": "pages.cadastro.pagina_correcao_caixa",
-    "🏦 Saldos Bancários": "pages.cadastro.pagina_saldos_bancarios",
-    "🏛️ Empréstimos/Financiamentos": "pages.cadastro.pagina_emprestimos_cadastro",
+    "🎯 Metas": "flowdash_pages.metas.pagina_metas",
+    "🧾 Lançamentos": "flowdash_pages.lancamentos.pagina_lancamentos",
+    "💼 Fechamento de Caixa": "flowdash_pages.fechamento.pagina_fechamento",
+    "📊 Dashboard": "flowdash_pages.dashboard.pagina_dashboard",
+    "📉 DRE": "flowdash_pages.dre.pagina_dre",
+    "📥 Entradas": "flowdash_pages.dataframes.pagina_entradas",
+    "📤 Saídas": "flowdash_pages.dataframes.pagina_saidas",
+    "📦 Mercadorias": "flowdash_pages.dataframes.pagina_mercadorias",
+    "💳 Fatura Cartão de Crédito": "flowdash_pages.dataframes.pagina_fatura_cartao",
+    "📄 Contas a Pagar": "flowdash_pages.dataframes.pagina_contas_pagar",
+    "🏦 Empréstimos/Financiamentos": "flowdash_pages.dataframes.pagina_emprestimos",
+    "👥 Usuários": "flowdash_pages.cadastro.pagina_usuarios",
+    "🎯 Cadastro de Metas": "flowdash_pages.cadastro.pagina_metas_cadastro",
+    "⚙️ Taxas Maquinetas": "flowdash_pages.cadastro.pagina_taxas_maquinas",
+    "📇 Cartão de Crédito": "flowdash_pages.cadastro.pagina_cartoes_credito",
+    "💵 Caixa": "flowdash_pages.cadastro.pagina_caixa",
+    "🛠️ Correção de Caixa": "flowdash_pages.cadastro.pagina_correcao_caixa",
+    "🏦 Saldos Bancários": "flowdash_pages.cadastro.pagina_saldos_bancarios",
+    "🏛️ Empréstimos/Financiamentos": "flowdash_pages.cadastro.pagina_emprestimos_cadastro",
 }
 
 pagina = st.session_state.get("pagina_atual", "📊 Dashboard")
