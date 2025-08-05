@@ -165,15 +165,16 @@ ROTAS = {
     "💳 Fatura Cartão de Crédito": "flowdash_pages.dataframes.pagina_fatura_cartao",
     "📄 Contas a Pagar": "flowdash_pages.dataframes.pagina_contas_pagar",
     "🏦 Empréstimos/Financiamentos": "flowdash_pages.dataframes.pagina_emprestimos",
-    "👥 Usuários": "flowdash_pages.cadastro.pagina_usuarios",
-    "🎯 Cadastro de Metas": "flowdash_pages.cadastro.pagina_metas_cadastro",
-    "⚙️ Taxas Maquinetas": "flowdash_pages.cadastro.pagina_taxas_maquinas",
-    "📇 Cartão de Crédito": "flowdash_pages.cadastro.pagina_cartoes_credito",
-    "💵 Caixa": "flowdash_pages.cadastro.pagina_caixa",
-    "🛠️ Correção de Caixa": "flowdash_pages.cadastro.pagina_correcao_caixa",
-    "🏦 Saldos Bancários": "flowdash_pages.cadastro.pagina_saldos_bancarios",
-    "🏛️ Empréstimos/Financiamentos": "flowdash_pages.cadastro.pagina_emprestimos_cadastro",
+    "👥 Usuários": "flowdash_pages.cadastros.pagina_usuarios.pagina_usuarios",
+    "🎯 Cadastro de Metas": "flowdash_pages.cadastros.pagina_metas.pagina_metas_cadastro",
+    "⚙️ Taxas Maquinetas": "flowdash_pages.cadastros.pagina_maquinetas.pagina_taxas_maquinas",
+    "📇 Cartão de Crédito": "flowdash_pages.cadastros.pagina_cartoes.pagina_cartoes_credito",
+    "💵 Caixa": "flowdash_pages.cadastros.pagina_caixa.pagina_caixa",
+    "🛠️ Correção de Caixa": "flowdash_pages.cadastros.pagina_correcao_caixa.pagina_correcao_caixa",
+    "🏦 Saldos Bancários": "flowdash_pages.cadastros.pagina_saldos_bancarios.pagina_saldos_bancarios",
+    "🏛️ Empréstimos/Financiamentos": "flowdash_pages.cadastros.pagina_emprestimos.pagina_emprestimos_cadastro",
 }
+
 
 pagina = st.session_state.get("pagina_atual", "📊 Dashboard")
 
