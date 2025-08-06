@@ -141,3 +141,22 @@ class CaixaRepository:
                 ORDER BY data DESC 
                 LIMIT {limite}
             """, conn)
+        
+
+# === Classe CorrecaoCaixaRepository ============================================================================
+class CorrecaoCaixaRepository:
+    def __init__(self, caminho_banco: str):
+        self.caminho_banco = caminho_banco
+
+    def salvar_ajuste(self, data: str, valor: float, observacao: str) -> None:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("""
+                INSERT INTO correcao_caixa (data, valor, observacao)
+                VALUES (?, ?, ?)
+            """, (data, valor, observacao))
+            conn.commit()
+
+    def listar_ajustes(self) -> pd.DataFrame:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            df = pd.read_sql("SELECT * FROM correcao_caixa ORDER BY data DESC", conn)
+        return df
