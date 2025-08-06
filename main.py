@@ -145,8 +145,8 @@ if perfil == "Administrador":
         if st.button("🏦 Saldos Bancários", use_container_width=True):
             st.session_state.pagina_atual = "🏦 Saldos Bancários"
             st.rerun()
-        if st.button("🏛️ Empréstimos/Financiamentos", use_container_width=True):
-            st.session_state.pagina_atual = "🏛️ Empréstimos/Financiamentos"
+        if st.button("🏛️ Cadastro de Empréstimos", use_container_width=True):
+            st.session_state.pagina_atual = "🏛️ Cadastro de Empréstimos"
             st.rerun()
 
 # ===== TÍTULO PRINCIPAL =========================================================================
@@ -172,7 +172,7 @@ ROTAS = {
     "💵 Caixa": "flowdash_pages.cadastros.pagina_caixa.pagina_caixa",
     "🛠️ Correção de Caixa": "flowdash_pages.cadastros.pagina_correcao_caixa.pagina_correcao_caixa",
     "🏦 Saldos Bancários": "flowdash_pages.cadastros.pagina_saldos_bancarios.pagina_saldos_bancarios",
-    "🏛️ Empréstimos/Financiamentos": "flowdash_pages.cadastros.pagina_emprestimos.pagina_emprestimos_cadastro",
+    "🏛️ Cadastro de Empréstimos": "flowdash_pages.cadastros.pagina_emprestimos.pagina_emprestimos_financiamentos",
 }
 
 
