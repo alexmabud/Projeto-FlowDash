@@ -8,7 +8,7 @@ from .cadastro_classes import CaixaRepository
 
 # === Página de Cadastro de Caixa =======================================================================
 def pagina_caixa(caminho_banco: str):
-    st.subheader("💰 Cadastro de Caixa (Loja e Dinheiro Levado pra Casa)")
+    st.subheader("💰 Cadastro de Caixa")
     repo = CaixaRepository(caminho_banco)
 
     # Seleção da data
@@ -31,16 +31,16 @@ def pagina_caixa(caminho_banco: str):
             f"📌 O valor digitado abaixo será **somado** a esses saldos."
         )
 
-        valor_novo_caixa = st.number_input("Adicionar ao Caixa (dinheiro na loja)", min_value=0.0, step=10.0, format="%.2f")
-        valor_novo_caixa_2 = st.number_input("Adicionar ao Caixa 2 (dinheiro que levou pra casa)", min_value=0.0, step=10.0, format="%.2f")
+        valor_novo_caixa = st.number_input("Adicionar ao Caixa", min_value=0.0, step=10.0, format="%.2f")
+        valor_novo_caixa_2 = st.number_input("Adicionar ao Caixa 2", min_value=0.0, step=10.0, format="%.2f")
 
         valor_final_caixa = caixa_atual + valor_novo_caixa
         valor_final_caixa_2 = caixa2_atual + valor_novo_caixa_2
         atualizar = True
     else:
         st.warning("⚠️ Nenhum valor cadastrado para essa data. Informe o valor inicial.")
-        valor_final_caixa = st.number_input("Caixa (dinheiro na loja)", min_value=0.0, step=10.0, format="%.2f")
-        valor_final_caixa_2 = st.number_input("Caixa 2 (dinheiro que levou pra casa)", min_value=0.0, step=10.0, format="%.2f")
+        valor_final_caixa = st.number_input("Caixa", min_value=0.0, step=10.0, format="%.2f")
+        valor_final_caixa_2 = st.number_input("Caixa 2", min_value=0.0, step=10.0, format="%.2f")
         atualizar = False
 
     # Botão para salvar
