@@ -1,6 +1,6 @@
 import sqlite3
 import pandas as pd
-
+from typing import Optional, Tuple
 from typing import List, Tuple, Optional
 
 # === Classe Usuário ========================================================================================
@@ -160,3 +160,109 @@ class CorrecaoCaixaRepository:
         with sqlite3.connect(self.caminho_banco) as conn:
             df = pd.read_sql("SELECT * FROM correcao_caixa ORDER BY data DESC", conn)
         return df
+    
+
+# === Classe SaldoBancarioRepository ============================================================================
+class SaldoBancarioRepository:
+    def __init__(self, caminho_banco: str):
+        self.caminho_banco = caminho_banco
+
+    def obter_saldo_por_data(self, data: str) -> Optional[Tuple[float, float, float, float]]:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            cursor = conn.execute(
+                "SELECT banco_1, banco_2, banco_3, banco_4 FROM saldos_bancos WHERE data = ?",
+                (data,)
+            )
+            return cursor.fetchone()
+
+    def salvar_saldo(self, data: str, b1: float, b2: float, b3: float, b4: float):
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("""
+                INSERT INTO saldos_bancos (data, banco_1, banco_2, banco_3, banco_4)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(data) DO UPDATE SET
+                    banco_1=excluded.banco_1,
+                    banco_2=excluded.banco_2,
+                    banco_3=excluded.banco_3,
+                    banco_4=excluded.banco_4
+            """, (data, b1, b2, b3, b4))
+            conn.commit()
+
+
+# === Classe EmprestimoRepository ============================================================================
+class EmprestimoRepository:
+    def __init__(self, caminho_banco: str):
+        self.caminho_banco = caminho_banco
+
+    def salvar_emprestimo(self, dados: tuple) -> None:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("""
+                INSERT INTO emprestimos_financiamentos (
+                    data_contratacao, valor_total, tipo, banco, parcelas_total,
+                    parcelas_pagas, valor_parcela, taxa_juros_am, vencimento_dia,
+                    status, usuario, data_quitacao, origem_recursos,
+                    valor_pago, valor_em_aberto, renegociado_de, descricao,
+                    data_inicio_pagamento, data_lancamento
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, dados)
+            conn.commit()
+
+    def listar_emprestimos(self) -> pd.DataFrame:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            return pd.read_sql(
+                "SELECT * FROM emprestimos_financiamentos ORDER BY data_contratacao DESC",
+                conn
+            )
+
+    def excluir_emprestimo(self, id_emprestimo: int) -> None:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("DELETE FROM emprestimos_financiamentos WHERE id = ?", (id_emprestimo,))
+            conn.commit()
+
+    def editar_emprestimo(self, id_emprestimo: int, novos_dados: dict) -> None:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("""
+                UPDATE emprestimos_financiamentos SET
+                    data_contratacao = ?,
+                    valor_total = ?,
+                    tipo = ?,
+                    banco = ?,
+                    parcelas_total = ?,
+                    parcelas_pagas = ?,
+                    valor_parcela = ?,
+                    taxa_juros_am = ?,
+                    vencimento_dia = ?,
+                    status = ?,
+                    usuario = ?,
+                    data_quitacao = ?,
+                    origem_recursos = ?,
+                    valor_pago = ?,
+                    valor_em_aberto = ?,
+                    renegociado_de = ?,
+                    descricao = ?,
+                    data_inicio_pagamento = ?,
+                    data_lancamento = ?
+                WHERE id = ?
+            """, (
+                novos_dados["data_contratacao"],
+                novos_dados["valor_total"],
+                novos_dados["tipo"],
+                novos_dados["banco"],
+                novos_dados["parcelas_total"],
+                novos_dados["parcelas_pagas"],
+                novos_dados["valor_parcela"],
+                novos_dados["taxa_juros_am"],
+                novos_dados["vencimento_dia"],
+                novos_dados["status"],
+                novos_dados["usuario"],
+                novos_dados.get("data_quitacao"),
+                novos_dados["origem_recursos"],
+                novos_dados["valor_pago"],
+                novos_dados["valor_em_aberto"],
+                novos_dados.get("renegociado_de"),
+                novos_dados["descricao"],
+                novos_dados["data_inicio_pagamento"],
+                novos_dados["data_lancamento"],
+                id_emprestimo
+            ))
+            conn.commit()
