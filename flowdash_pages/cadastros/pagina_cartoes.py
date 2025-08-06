@@ -17,7 +17,7 @@ def pagina_cartoes_credito(caminho_banco: str):
 
     # === Formulário de cadastro ===
     with st.form("form_cadastrar_cartao_credito", clear_on_submit=True):
-        nome = st.text_input("Nome do Cartão (Ex: Nubank, Inter, Bradesco)")
+        nome = st.text_input("Nome do Cartão (Ex: Inter, Bradesco)")
         col1, col2 = st.columns(2)
         with col1:
             fechamento = st.number_input("Dia do Fechamento da Fatura", 1, 31, step=1)
