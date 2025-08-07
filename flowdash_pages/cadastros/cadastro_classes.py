@@ -209,10 +209,22 @@ class EmprestimoRepository:
 
     def listar_emprestimos(self) -> pd.DataFrame:
         with sqlite3.connect(self.caminho_banco) as conn:
-            return pd.read_sql(
+            df = pd.read_sql(
                 "SELECT * FROM emprestimos_financiamentos ORDER BY data_contratacao DESC",
                 conn
             )
+            colunas_numericas = [
+                "valor_total",
+                "valor_parcela",
+                "valor_pago",
+                "valor_em_aberto",
+                "taxa_juros_am"
+            ]
+
+            for col in colunas_numericas:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df
 
     def excluir_emprestimo(self, id_emprestimo: int) -> None:
         with sqlite3.connect(self.caminho_banco) as conn:
