@@ -51,6 +51,17 @@ def formatar_dataframe(df, colunas_monetarias=[], colunas_percentuais=[]):
             df_formatado[col] = df_formatado[col].apply(lambda x: formatar_percentual(x) if x is not None else "")
     return df_formatado
 
+# Limpa a formatação de um valor monetário, convertendo de string para float.
+def limpar_valor_formatado(valor_str: str) -> float:
+    if isinstance(valor_str, str):
+        valor_str = valor_str.replace("R$", "").replace(".", "").replace(",", ".").strip()
+        try:
+            return float(valor_str)
+        except ValueError:
+            return 0.0
+    return float(valor_str)
+
+
 # =============================
 # Segurança e Autenticação
 # =============================
