@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import sqlite3
 from services.taxas import TaxaMaquinetaManager
 
 # Página de Cadastro de Taxas por Maquineta =========================================================================
@@ -21,6 +22,17 @@ def pagina_taxas_maquinas(caminho_banco: str):
         else:
             maquineta = maquineta_selecionada
 
+        # === Novo: carregar bancos cadastrados dinamicamente (logo abaixo da maquineta)
+        with sqlite3.connect(caminho_banco) as conn:
+            df_bancos = pd.read_sql("SELECT nome FROM bancos_cadastrados ORDER BY nome", conn)
+            opcoes_bancos = df_bancos["nome"].tolist()
+
+        if not opcoes_bancos:
+            st.warning("⚠️ Nenhum banco cadastrado ainda. Cadastre em 'Cadastro de Bancos'.")
+            banco_destino = None
+        else:
+            banco_destino = st.selectbox("Banco que recebe o valor da maquineta", opcoes_bancos)
+
         forma_pagamento = st.selectbox("Forma de Pagamento", ["Débito", "Crédito", "PIX"], index=1)
 
         if forma_pagamento == "Débito":
@@ -40,8 +52,12 @@ def pagina_taxas_maquinas(caminho_banco: str):
         taxa = st.number_input("Taxa (%)", min_value=0.0, step=0.01, format="%.2f")
 
         if st.button("💾 Salvar Taxa"):
-            manager.salvar_taxa(maquineta, forma_pagamento, bandeira, parcelas, taxa)
-            st.success("✅ Taxa cadastrada com sucesso!")
+            if not banco_destino:
+                st.warning("⚠️ Selecione um banco válido.")
+            else:
+                manager.salvar_taxa(maquineta, forma_pagamento, bandeira, parcelas, taxa, banco_destino)
+                st.success("✅ Taxa cadastrada com sucesso!")
+                st.rerun()
 
     with col_lista:
         st.markdown("### 🧾 Maquinetas Cadastradas")

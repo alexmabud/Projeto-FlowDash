@@ -35,124 +35,172 @@ def pagina_lancamentos(caminho_banco):
 
     # Coluna 1 - Nova Venda e Caixa 2
     with col1:
-        with st.container():
-            if st.button("🟢 Nova Venda", use_container_width=True):
-                st.session_state.form_venda = not st.session_state.get("form_venda", False)
-            if st.session_state.get("form_venda", False):
-                st.markdown("#### 📋 Nova Venda")
-                valor = st.number_input("Valor da Venda", min_value=0.0, step=0.01, key="valor_venda")
-                forma_pagamento = st.selectbox("Forma de Pagamento", ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO"], key="forma_pagamento_venda")
+        # === Formulário de vendas corrigido com PIX atualizado para banco correto ===
 
-                maquineta, bandeira, parcelas = "", "", 1
-                if forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO"]:
+        # with st.container():
+        if st.button("🟢 Nova Venda", use_container_width=True):
+            st.session_state.form_venda = not st.session_state.get("form_venda", False)
+
+        if st.session_state.get("form_venda", False):
+            st.markdown("#### 📋 Nova Venda")
+            valor = st.number_input("Valor da Venda", min_value=0.0, step=0.01, key="valor_venda")
+            forma_pagamento = st.selectbox("Forma de Pagamento", ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO"], key="forma_pagamento_venda")
+
+            # Inicializa variáveis de controle
+            parcelas = 1
+            bandeira = ""
+            maquineta = ""
+            banco_destino_pix = ""
+
+            if forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO"]:
+                with sqlite3.connect(caminho_banco) as conn:
+                    maquinetas = pd.read_sql("SELECT DISTINCT maquineta FROM taxas_maquinas ORDER BY maquineta", conn)["maquineta"].tolist()
+                maquineta = st.selectbox("Maquineta", maquinetas, key="maquineta")
+
+                if forma_pagamento == "PIX":
+                    bancos_opcoes = {
+                        "Banco 1 (Inter)": "banco_1",
+                        "Banco 2 (InfinitePay)": "banco_2",
+                        "Banco 3 (Bradesco)": "banco_3",
+                        "Banco 4 (Outros)": "banco_4"
+                    }
+                    banco_visivel = st.selectbox("Banco que receberá o PIX", list(bancos_opcoes.keys()), key="banco_pix")
+                    banco_destino_pix = bancos_opcoes[banco_visivel]
+
+                if forma_pagamento in ["DÉBITO", "CRÉDITO"]:
                     with sqlite3.connect(caminho_banco) as conn:
-                        maquinetas = pd.read_sql("SELECT DISTINCT maquineta FROM taxas_maquinas ORDER BY maquineta", conn)["maquineta"].tolist()
-                    maquineta = st.selectbox("Maquineta", maquinetas, key="maquineta")
+                        bandeiras = pd.read_sql("""
+                            SELECT DISTINCT bandeira FROM taxas_maquinas
+                            WHERE forma_pagamento = ? AND maquineta = ?
+                            ORDER BY bandeira
+                        """, conn, params=(forma_pagamento, maquineta))["bandeira"].tolist()
+                    bandeira = st.selectbox("Bandeira", bandeiras, key="bandeira")
 
-                    if forma_pagamento in ["DÉBITO", "CRÉDITO"]:
+                    if forma_pagamento == "CRÉDITO":
                         with sqlite3.connect(caminho_banco) as conn:
-                            bandeiras = pd.read_sql("""
-                                SELECT DISTINCT bandeira FROM taxas_maquinas
-                                WHERE forma_pagamento = ? AND maquineta = ?
-                                ORDER BY bandeira
-                            """, conn, params=(forma_pagamento, maquineta))["bandeira"].tolist()
-                        bandeira = st.selectbox("Bandeira", bandeiras, key="bandeira")
+                            parcelas_disp = pd.read_sql("""
+                                SELECT DISTINCT parcelas FROM taxas_maquinas
+                                WHERE forma_pagamento = ? AND bandeira = ? AND maquineta = ?
+                                ORDER BY parcelas
+                            """, conn, params=(forma_pagamento, bandeira, maquineta))["parcelas"].tolist()
+                        parcelas = st.selectbox("Parcelas", parcelas_disp, key="parcelas")
 
-                        if forma_pagamento == "CRÉDITO":
+            confirmar = st.checkbox("Confirmo os dados para salvar a venda", key="confirmar_venda")
+
+            if confirmar:
+                st.info(
+                    f"**Resumo da Venda:**\n\n"
+                    f"- Valor: R$ {valor:,.2f}\n"
+                    f"- Forma de pagamento: {forma_pagamento}\n"
+                    f"{f'- Maquineta: {maquineta}' if maquineta else ''}\n"
+                    f"{f'- Bandeira: {bandeira}' if bandeira else ''}\n"
+                    f"{f'- Parcelas: {parcelas}' if forma_pagamento == 'CRÉDITO' else ''}\n"
+                    f"{f'- Banco PIX: {banco_visivel}' if forma_pagamento == 'PIX' else ''}"
+                )
+
+            if st.button("💾 Salvar Venda", use_container_width=True):
+                if valor <= 0:
+                    st.warning("⚠️ Valor inválido.")
+                elif forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO"] and not maquineta:
+                    st.warning("⚠️ Selecione uma maquineta.")
+                elif forma_pagamento in ["DÉBITO", "CRÉDITO"] and not bandeira:
+                    st.warning("⚠️ Selecione uma bandeira.")
+                elif forma_pagamento == "CRÉDITO" and not parcelas:
+                    st.warning("⚠️ Selecione o número de parcelas.")
+                elif not confirmar:
+                    st.warning("⚠️ Confirme os dados antes de salvar.")
+                else:
+                    try:
+                        valor_liquido = valor
+                        if forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO"]:
                             with sqlite3.connect(caminho_banco) as conn:
-                                parcelas_disp = pd.read_sql("""
-                                    SELECT DISTINCT parcelas FROM taxas_maquinas
-                                    WHERE forma_pagamento = ? AND bandeira = ? AND maquineta = ?
-                                    ORDER BY parcelas
-                                """, conn, params=(forma_pagamento, bandeira, maquineta))["parcelas"].tolist()
-                            parcelas = st.selectbox("Parcelas", parcelas_disp, key="parcelas")
-
-                confirmar = st.checkbox("Confirmo os dados para salvar a venda", key="confirmar_venda")
-
-                # Exibe resumo antes de salvar
-                if confirmar:
-                    st.info(
-                        f"**Resumo da Venda:**\n\n"
-                        f"- Valor: R$ {valor:,.2f}\n"
-                        f"- Forma de pagamento: {forma_pagamento}\n"
-                        f"{f'- Maquineta: {maquineta}' if maquineta else ''}\n"
-                        f"{f'- Bandeira: {bandeira}' if bandeira else ''}\n"
-                        f"{f'- Parcelas: {parcelas}' if forma_pagamento == 'CRÉDITO' else ''}"
-                    )
-
-                if st.button("💾 Salvar Venda", use_container_width=True):
-                    if valor <= 0:
-                        st.warning("⚠️ Valor inválido.")
-                    elif forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO"] and not maquineta:
-                        st.warning("⚠️ Selecione uma maquineta.")
-                    elif forma_pagamento in ["DÉBITO", "CRÉDITO"] and not bandeira:
-                        st.warning("⚠️ Selecione uma bandeira.")
-                    elif forma_pagamento == "CRÉDITO" and not parcelas:
-                        st.warning("⚠️ Selecione o número de parcelas.")
-                    elif not confirmar:
-                        st.warning("⚠️ Confirme os dados antes de salvar.")
-                    else:
-                        try:
-                            valor_liquido = valor
-                            if forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO"]:
-                                with sqlite3.connect(caminho_banco) as conn:
-                                    cursor = conn.execute(
-                                        """
-                                        SELECT taxa_percentual FROM taxas_maquinas
-                                        WHERE forma_pagamento = ? AND maquineta = ? AND bandeira = ? AND parcelas = ?
-                                        """,
-                                        (forma_pagamento, maquineta, bandeira, parcelas)
-                                    )
-                                    row = cursor.fetchone()
-                                    taxa = row[0] if row else 0.0
-                                    valor_liquido = valor * (1 - taxa / 100)
-
-                            with sqlite3.connect(caminho_banco) as conn:
-                                usuario = st.session_state.usuario_logado["nome"]
-                                conn.execute(
+                                cursor = conn.execute(
                                     """
-                                    INSERT INTO entrada (Data, Valor, Forma_de_Pagamento, Parcelas, Bandeira, Usuario, maquineta, valor_liquido, created_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    SELECT taxa_percentual FROM taxas_maquinas
+                                    WHERE forma_pagamento = ? AND maquineta = ? AND bandeira = ? AND parcelas = ?
                                     """,
-                                    (
-                                        str(data_lancamento),
-                                        float(valor),
-                                        forma_pagamento,
-                                        parcelas,
-                                        bandeira,
-                                        usuario,
-                                        maquineta,
-                                        round(valor_liquido, 2),
-                                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    )
+                                    (forma_pagamento, maquineta, bandeira, parcelas)
                                 )
+                                row = cursor.fetchone()
+                                taxa = row[0] if row else 0.0
+                                valor_liquido = valor * (1 - taxa / 100)
 
-                                # Se a venda for em dinheiro, atualiza saldos_caixas
-                                if forma_pagamento == "DINHEIRO":
-                                    df_saldos = pd.read_sql("SELECT * FROM saldos_caixas", conn)
-                                    df_saldos["data"] = pd.to_datetime(df_saldos["data"], errors="coerce").dt.date
-                                    data_dt = pd.to_datetime(data_lancamento).date()
+                        with sqlite3.connect(caminho_banco) as conn:
+                            usuario = st.session_state.usuario_logado["nome"]
+                            conn.execute(
+                                """
+                                INSERT INTO entrada (Data, Valor, Forma_de_Pagamento, Parcelas, Bandeira, Usuario, maquineta, valor_liquido, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    str(data_lancamento),
+                                    float(valor),
+                                    forma_pagamento,
+                                    parcelas,
+                                    bandeira,
+                                    usuario,
+                                    maquineta,
+                                    round(valor_liquido, 2),
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                )
+                            )
 
-                                    if data_dt in df_saldos["data"].values:
-                                        conn.execute("""
-                                            UPDATE saldos_caixas
-                                            SET caixa_vendas = COALESCE(caixa_vendas, 0) + ?
-                                            WHERE DATE(data) = DATE(?)
-                                        """, (valor, data_lancamento))
-                                    else:
-                                        conn.execute("""
-                                            INSERT INTO saldos_caixas (data, caixa_vendas)
-                                            VALUES (?, ?)
-                                        """, (data_lancamento, valor))
+                            if forma_pagamento == "DINHEIRO":
+                                df_saldos = pd.read_sql("SELECT * FROM saldos_caixas", conn)
+                                df_saldos["data"] = pd.to_datetime(df_saldos["data"], errors="coerce").dt.date
+                                data_dt = pd.to_datetime(data_lancamento).date()
 
-                                conn.commit()
+                                if data_dt in df_saldos["data"].values:
+                                    conn.execute("""
+                                        UPDATE saldos_caixas
+                                        SET caixa_vendas = COALESCE(caixa_vendas, 0) + ?
+                                        WHERE DATE(data) = DATE(?)
+                                    """, (valor, data_lancamento))
+                                else:
+                                    conn.execute("""
+                                        INSERT INTO saldos_caixas (data, caixa_vendas)
+                                        VALUES (?, ?)
+                                    """, (data_lancamento, valor))
 
-                            st.success("✅ Venda registrada com sucesso!")
-                            st.session_state.form_venda = False
-                            st.rerun()
+                            if forma_pagamento == "PIX" and banco_destino_pix:
+                                df_saldos = pd.read_sql("SELECT * FROM saldos_bancos", conn)
+                                df_saldos["data"] = pd.to_datetime(df_saldos["data"], errors="coerce").dt.date
+                                data_dt = pd.to_datetime(data_lancamento).date()
 
-                        except Exception as e:
-                            st.error(f"Erro ao salvar venda: {e}")
+                                if data_dt in df_saldos["data"].values:
+                                    conn.execute(f"""
+                                        UPDATE saldos_bancos
+                                        SET {banco_destino_pix} = COALESCE({banco_destino_pix}, 0) + ?
+                                        WHERE DATE(data) = DATE(?)
+                                    """, (valor, data_lancamento))
+                                else:
+                                    campos = {
+                                        "banco_1": 0.0,
+                                        "banco_2": 0.0,
+                                        "banco_3": 0.0,
+                                        "banco_4": 0.0
+                                    }
+                                    campos[banco_destino_pix] = valor
+                                    conn.execute("""
+                                        INSERT INTO saldos_bancos (data, banco_1, banco_2, banco_3, banco_4)
+                                        VALUES (?, ?, ?, ?, ?)
+                                    """, (
+                                        data_lancamento,
+                                        campos["banco_1"],
+                                        campos["banco_2"],
+                                        campos["banco_3"],
+                                        campos["banco_4"]
+                                    ))
+
+                            conn.commit()
+
+                        st.success("✅ Venda registrada com sucesso!")
+                        st.session_state.form_venda = False
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Erro ao salvar venda: {e}")
+
 
 
         with st.container():

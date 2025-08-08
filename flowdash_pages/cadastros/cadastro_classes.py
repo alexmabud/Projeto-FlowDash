@@ -194,9 +194,10 @@ class EmprestimoRepository:
     def __init__(self, caminho_banco: str):
         self.caminho_banco = caminho_banco
 
-    def salvar_emprestimo(self, dados: tuple) -> None:
+    def salvar_emprestimo(self, dados: tuple) -> int:
         with sqlite3.connect(self.caminho_banco) as conn:
-            conn.execute("""
+            cur = conn.cursor()
+            cur.execute("""
                 INSERT INTO emprestimos_financiamentos (
                     data_contratacao, valor_total, tipo, banco, parcelas_total,
                     parcelas_pagas, valor_parcela, taxa_juros_am, vencimento_dia,
@@ -206,75 +207,67 @@ class EmprestimoRepository:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, dados)
             conn.commit()
+            return cur.lastrowid
 
     def listar_emprestimos(self) -> pd.DataFrame:
         with sqlite3.connect(self.caminho_banco) as conn:
-            df = pd.read_sql(
-                "SELECT * FROM emprestimos_financiamentos ORDER BY data_contratacao DESC",
-                conn
-            )
-            colunas_numericas = [
-                "valor_total",
-                "valor_parcela",
-                "valor_pago",
-                "valor_em_aberto",
-                "taxa_juros_am"
-            ]
+            return pd.read_sql("SELECT * FROM emprestimos_financiamentos ORDER BY id DESC", conn)
 
-            for col in colunas_numericas:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df
-
-    def excluir_emprestimo(self, id_emprestimo: int) -> None:
+    def obter_emprestimo(self, id_: int) -> dict | None:
         with sqlite3.connect(self.caminho_banco) as conn:
-            conn.execute("DELETE FROM emprestimos_financiamentos WHERE id = ?", (id_emprestimo,))
-            conn.commit()
+            df = pd.read_sql("SELECT * FROM emprestimos_financiamentos WHERE id = ?", conn, params=(id_,))
+        return df.iloc[0].to_dict() if not df.empty else None
 
-    def editar_emprestimo(self, id_emprestimo: int, novos_dados: dict) -> None:
+    def atualizar_emprestimo(self, id_: int, dados: tuple) -> None:
         with sqlite3.connect(self.caminho_banco) as conn:
             conn.execute("""
                 UPDATE emprestimos_financiamentos SET
-                    data_contratacao = ?,
-                    valor_total = ?,
-                    tipo = ?,
-                    banco = ?,
-                    parcelas_total = ?,
-                    parcelas_pagas = ?,
-                    valor_parcela = ?,
-                    taxa_juros_am = ?,
-                    vencimento_dia = ?,
-                    status = ?,
-                    usuario = ?,
-                    data_quitacao = ?,
-                    origem_recursos = ?,
-                    valor_pago = ?,
-                    valor_em_aberto = ?,
-                    renegociado_de = ?,
-                    descricao = ?,
-                    data_inicio_pagamento = ?,
-                    data_lancamento = ?
+                    data_contratacao = ?, valor_total = ?, tipo = ?, banco = ?, parcelas_total = ?,
+                    parcelas_pagas = ?, valor_parcela = ?, taxa_juros_am = ?, vencimento_dia = ?,
+                    status = ?, usuario = ?, data_quitacao = ?, origem_recursos = ?,
+                    valor_pago = ?, valor_em_aberto = ?, renegociado_de = ?, descricao = ?,
+                    data_inicio_pagamento = ?, data_lancamento = ?
                 WHERE id = ?
-            """, (
-                novos_dados["data_contratacao"],
-                novos_dados["valor_total"],
-                novos_dados["tipo"],
-                novos_dados["banco"],
-                novos_dados["parcelas_total"],
-                novos_dados["parcelas_pagas"],
-                novos_dados["valor_parcela"],
-                novos_dados["taxa_juros_am"],
-                novos_dados["vencimento_dia"],
-                novos_dados["status"],
-                novos_dados["usuario"],
-                novos_dados.get("data_quitacao"),
-                novos_dados["origem_recursos"],
-                novos_dados["valor_pago"],
-                novos_dados["valor_em_aberto"],
-                novos_dados.get("renegociado_de"),
-                novos_dados["descricao"],
-                novos_dados["data_inicio_pagamento"],
-                novos_dados["data_lancamento"],
-                id_emprestimo
-            ))
+            """, dados + (id_,))
+            conn.commit()
+
+    def excluir_emprestimo(self, id_: int) -> None:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("DELETE FROM emprestimos_financiamentos WHERE id = ?", (id_,))
+            conn.commit()
+
+# === Classe: Repositório de Bancos ==========================================================================
+class BancoRepository:
+    def __init__(self, caminho_banco: str):
+        self.caminho_banco = caminho_banco
+        self._criar_tabela_bancos()
+
+    def _criar_tabela_bancos(self):
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bancos_cadastrados (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    nome TEXT UNIQUE NOT NULL
+                );
+            """)
+            conn.commit()
+
+    def salvar_novo_banco(self, nome_banco: str):
+        nome_banco = nome_banco.strip()
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("INSERT OR IGNORE INTO bancos_cadastrados (nome) VALUES (?)", (nome_banco,))
+
+            # Verifica se a coluna já existe em saldos_bancos, se não existir, adiciona
+            colunas_existentes = pd.read_sql("PRAGMA table_info(saldos_bancos);", conn)["name"].tolist()
+            if nome_banco not in colunas_existentes:
+                conn.execute(f"ALTER TABLE saldos_bancos ADD COLUMN '{nome_banco}' REAL DEFAULT 0.0;")
+            conn.commit()
+
+    def carregar_bancos(self) -> pd.DataFrame:
+        with sqlite3.connect(self.caminho_banco) as conn:
+            return pd.read_sql("SELECT * FROM bancos_cadastrados ORDER BY nome", conn)
+
+    def excluir_banco(self, banco_id: int):
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute("DELETE FROM bancos_cadastrados WHERE id = ?", (banco_id,))
             conn.commit()

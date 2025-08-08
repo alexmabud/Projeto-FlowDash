@@ -15,17 +15,18 @@ class TaxaMaquinetaManager:
                     bandeira TEXT NOT NULL,
                     parcelas INTEGER NOT NULL,
                     taxa_percentual REAL NOT NULL,
+                    banco_destino TEXT,  -- NOVA COLUNA
                     PRIMARY KEY (maquineta, forma_pagamento, bandeira, parcelas)
                 )
             """)
-
-    def salvar_taxa(self, maquineta: str, forma: str, bandeira: str, parcelas: int, taxa: float):
+    
+    def salvar_taxa(self, maquineta: str, forma: str, bandeira: str, parcelas: int, taxa: float, banco_destino: str):
         with sqlite3.connect(self.caminho_banco) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO taxas_maquinas 
-                (maquineta, forma_pagamento, bandeira, parcelas, taxa_percentual)
-                VALUES (?, ?, ?, ?, ?)
-            """, (maquineta.upper(), forma.upper(), bandeira.upper(), parcelas, taxa))
+                (maquineta, forma_pagamento, bandeira, parcelas, taxa_percentual, banco_destino)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (maquineta.upper(), forma.upper(), bandeira.upper(), parcelas, taxa, banco_destino))
             conn.commit()
 
     def carregar_taxas(self) -> pd.DataFrame:
