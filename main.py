@@ -22,11 +22,16 @@ Módulos carregados de forma dinâmica:
 import streamlit as st
 import importlib
 from auth.auth import validar_login, verificar_acesso, exibir_usuario_logado, limpar_todas_as_paginas
+from utils.utils import garantir_trigger_totais_saldos_caixas
 
 st.set_page_config(page_title="FlowDash", layout="wide")
 
 # Caminho do banco de dados
 caminho_banco = "data/flowdash_data.db"
+try:
+    garantir_trigger_totais_saldos_caixas(caminho_banco)
+except Exception as e:
+    st.warning(f"Trigger de totais não criada: {e}")
 
 # Inicializa sessão
 if "usuario_logado" not in st.session_state:
