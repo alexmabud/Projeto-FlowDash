@@ -2,6 +2,7 @@
 import pandas as pd
 import hashlib
 import re
+import sqlite3
 from datetime import datetime, timedelta
 from workalendar.america import BrazilDistritoFederal
 
@@ -61,6 +62,54 @@ def limpar_valor_formatado(valor_str: str) -> float:
             return 0.0
     return float(valor_str)
 
+# Soma os valores de colunas em saldos de caixas
+def garantir_trigger_totais_saldos_caixas(caminho_banco: str) -> None:
+    with sqlite3.connect(caminho_banco) as conn:
+        cur = conn.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(saldos_caixas)").fetchall()}
+
+        # Detecta a coluna de vendas
+        if "caixa_vendas" in cols:
+            col_vendas = "caixa_vendas"
+        elif "caixa_venda" in cols:
+            col_vendas = "caixa_venda"
+        else:
+            raise RuntimeError("Tabela 'saldos_caixas' não possui 'caixa_vendas' nem 'caixa_venda'.")
+
+        # Verifica demais colunas
+        required = {"caixa", "caixa_2", "caixa2_dia", "caixa_total", "caixa2_total"}
+        missing = required - cols
+        if missing:
+            raise RuntimeError(f"Faltam colunas em saldos_caixas: {', '.join(sorted(missing))}")
+
+        ddl = f"""
+        DROP TRIGGER IF EXISTS trg_saldos_insert_totais;
+        DROP TRIGGER IF EXISTS trg_saldos_update_totais;
+
+        -- Atualiza totais após INSERT (qualquer insert)
+        CREATE TRIGGER trg_saldos_insert_totais
+        AFTER INSERT ON saldos_caixas
+        BEGIN
+            UPDATE saldos_caixas
+            SET 
+                caixa_total  = COALESCE(NEW.caixa, 0) + COALESCE(NEW.{col_vendas}, 0),
+                caixa2_total = COALESCE(NEW.caixa_2, 0) + COALESCE(NEW.caixa2_dia, 0)
+            WHERE rowid = NEW.rowid;
+        END;
+
+        -- Atualiza totais após UPDATE das colunas relevantes
+        CREATE TRIGGER trg_saldos_update_totais
+        AFTER UPDATE OF caixa, {col_vendas}, caixa_2, caixa2_dia ON saldos_caixas
+        BEGIN
+            UPDATE saldos_caixas
+            SET 
+                caixa_total  = COALESCE(NEW.caixa, 0) + COALESCE(NEW.{col_vendas}, 0),
+                caixa2_total = COALESCE(NEW.caixa_2, 0) + COALESCE(NEW.caixa2_dia, 0)
+            WHERE rowid = NEW.rowid;
+        END;
+        """
+        conn.executescript(ddl)
+        conn.commit()
 
 # =============================
 # Segurança e Autenticação
