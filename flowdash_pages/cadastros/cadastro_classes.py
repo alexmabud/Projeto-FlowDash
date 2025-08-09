@@ -1,7 +1,6 @@
 import sqlite3
 import pandas as pd
-from typing import Optional, Tuple
-from typing import List, Tuple, Optional
+from typing import Optional, Dict, Any, List, Tuple
 
 # === Classe Usuário ========================================================================================
 class Usuario:
@@ -148,18 +147,19 @@ class CorrecaoCaixaRepository:
     def __init__(self, caminho_banco: str):
         self.caminho_banco = caminho_banco
 
-    def salvar_ajuste(self, data: str, valor: float, observacao: str) -> None:
+    def salvar_ajuste(self, data_: str, valor: float, observacao: str) -> int:
         with sqlite3.connect(self.caminho_banco) as conn:
-            conn.execute("""
+            cur = conn.cursor()
+            cur.execute("""
                 INSERT INTO correcao_caixa (data, valor, observacao)
                 VALUES (?, ?, ?)
-            """, (data, valor, observacao))
+            """, (data_, valor, observacao))
             conn.commit()
+            return cur.lastrowid  # <<< retorna o ID do ajuste
 
     def listar_ajustes(self) -> pd.DataFrame:
         with sqlite3.connect(self.caminho_banco) as conn:
-            df = pd.read_sql("SELECT * FROM correcao_caixa ORDER BY data DESC", conn)
-        return df
+            return pd.read_sql("SELECT * FROM correcao_caixa ORDER BY id DESC", conn)
     
 
 # === Classe SaldoBancarioRepository ============================================================================
@@ -189,7 +189,7 @@ class SaldoBancarioRepository:
             conn.commit()
 
 
-# === Classe EmprestimoRepository ============================================================================
+# # === Classe EmprestimoRepository ============================================================================
 class EmprestimoRepository:
     def __init__(self, caminho_banco: str):
         self.caminho_banco = caminho_banco
@@ -211,12 +211,46 @@ class EmprestimoRepository:
 
     def listar_emprestimos(self) -> pd.DataFrame:
         with sqlite3.connect(self.caminho_banco) as conn:
-            return pd.read_sql("SELECT * FROM emprestimos_financiamentos ORDER BY id DESC", conn)
+            return pd.read_sql(
+                "SELECT * FROM emprestimos_financiamentos ORDER BY id DESC",
+                conn
+            )
 
-    def obter_emprestimo(self, id_: int) -> dict | None:
+    def obter_emprestimo(self, id_: int) -> Optional[Dict[str, Any]]:
         with sqlite3.connect(self.caminho_banco) as conn:
-            df = pd.read_sql("SELECT * FROM emprestimos_financiamentos WHERE id = ?", conn, params=(id_,))
+            df = pd.read_sql(
+                "SELECT * FROM emprestimos_financiamentos WHERE id = ?",
+                conn,
+                params=(id_,)
+            )
         return df.iloc[0].to_dict() if not df.empty else None
+
+    def editar_emprestimo(self, id_emp: int, dados: Dict[str, Any]) -> None:
+        """
+        Atualiza um empréstimo recebendo um dict com as chaves == colunas.
+        Campos esperados:
+        data_contratacao, valor_total, tipo, banco, parcelas_total, parcelas_pagas,
+        valor_parcela, taxa_juros_am, vencimento_dia, status, usuario,
+        data_quitacao, origem_recursos, valor_pago, valor_em_aberto,
+        renegociado_de, descricao, data_inicio_pagamento, data_lancamento
+        """
+        campos = [
+            "data_contratacao", "valor_total", "tipo", "banco", "parcelas_total",
+            "parcelas_pagas", "valor_parcela", "taxa_juros_am", "vencimento_dia",
+            "status", "usuario", "data_quitacao", "origem_recursos", "valor_pago",
+            "valor_em_aberto", "renegociado_de", "descricao",
+            "data_inicio_pagamento", "data_lancamento"
+        ]
+        set_clause = ", ".join([f"{c}=?" for c in campos])
+        valores = [dados.get(c) for c in campos]
+        valores.append(id_emp)
+
+        with sqlite3.connect(self.caminho_banco) as conn:
+            conn.execute(
+                f"UPDATE emprestimos_financiamentos SET {set_clause} WHERE id = ?",
+                valores
+            )
+            conn.commit()
 
     def atualizar_emprestimo(self, id_: int, dados: tuple) -> None:
         with sqlite3.connect(self.caminho_banco) as conn:
