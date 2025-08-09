@@ -1,27 +1,25 @@
 import streamlit as st
-import sqlite3
-import pandas as pd
 from .cadastro_classes import BancoRepository
 
-
-# === Página: Cadastro de Bancos ==========================================================================
-
 def pagina_cadastro_bancos(caminho_banco: str):
-    from .cadastro_classes import BancoRepository  # <- Garante que está importando a classe corretamente
-
     st.subheader("🏦 Cadastro de Bancos")
-
     repo = BancoRepository(caminho_banco)
 
-    st.markdown(
-        "Cadastre aqui os bancos para vincular às maquinetas e gerar colunas automáticas na tabela `saldos_bancos`."
-    )
+    st.markdown("Cadastre aqui os bancos para vincular aos lançamentos e relatórios.")
 
-    nome_banco = st.text_input("Nome do novo banco (sem acentos ou espaços)").strip()
+    # --- Cadastro (form) ---
+    with st.form("form_cadastro_banco"):
+        nome_banco = st.text_input(
+            "Nome do novo banco (sem acentos ou espaços no fim/início)",
+            placeholder="Ex.: Inter, Bradesco, InfinitePay",
+        ).strip()
+        submitted = st.form_submit_button("📅 Cadastrar Banco")
 
-    if st.button("📅 Cadastrar Banco"):
+    if submitted:
         if not nome_banco:
             st.warning("⚠️ Informe o nome do banco.")
+        elif "  " in nome_banco:
+            st.warning("⚠️ Remova espaços duplicados.")
         else:
             try:
                 repo.salvar_novo_banco(nome_banco)
@@ -30,26 +28,28 @@ def pagina_cadastro_bancos(caminho_banco: str):
             except Exception as e:
                 st.error(f"Erro ao cadastrar banco: {e}")
 
-    # Listagem com opção de excluir
     st.markdown("---")
     st.markdown("### 📋 Bancos Cadastrados")
     try:
         df_bancos = repo.carregar_bancos()
 
-        if not df_bancos.empty:
-            for _, row in df_bancos.iterrows():
-                col1, col2 = st.columns([5, 1])
-                with col1:
-                    st.markdown(f"- 🏦 **{row['nome']}**")
-                with col2:
-                    if st.button("🗑️", key=f"excluir_{row['id']}"):
-                        try:
-                            repo.excluir_banco(row['id'])
-                            st.success(f"✅ Banco '{row['nome']}' excluído com sucesso!")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Erro ao excluir banco: {e}")
-        else:
+        if df_bancos is None or df_bancos.empty:
             st.info("Nenhum banco cadastrado ainda.")
+            return
+
+        for _, row in df_bancos.iterrows():
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                st.markdown(f"- 🏦 **{row['nome']}**  \n<small>ID: {row['id']}</small>", unsafe_allow_html=True)
+            with col2:
+                if st.button("🗑️ Excluir", key=f"excluir_{row['id']}"):
+                    try:
+                        repo.excluir_banco(int(row["id"]))
+                        st.success(f"✅ Banco '{row['nome']}' excluído com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao excluir banco: {e}")
     except Exception as e:
         st.error(f"Erro ao carregar bancos: {e}")
+
+__all__ = ["pagina_cadastro_bancos"]
