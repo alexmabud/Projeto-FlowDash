@@ -82,12 +82,46 @@ def inserir_mov_liquidacao_venda(caminho_banco: str, data_: str, banco: str, val
         """, (data_, banco, float(valor_liquido), observacao, referencia_id))
         conn.commit()
 
+def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float):
+    """
+    Atualiza a tabela existente saldos_caixas acumulando em caixa_vendas na 'data_'.
+    - Não cria tabela nova.
+    - Tenta primeiro com coluna 'data'; se não existir, tenta 'Data'.
+    """
+    if not valor or valor <= 0:
+        return
+    with sqlite3.connect(caminho_banco) as conn:
+        cur = conn.cursor()
+        try:
+            # esquema com coluna 'data'
+            cur.execute(
+                "UPDATE saldos_caixas SET caixa_vendas = COALESCE(caixa_vendas,0) + ? WHERE data = ?",
+                (float(valor), data_)
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO saldos_caixas (data, caixa_vendas) VALUES (?, ?)",
+                    (data_, float(valor))
+                )
+        except sqlite3.OperationalError:
+            # fallback para esquema com coluna 'Data'
+            cur.execute(
+                "UPDATE saldos_caixas SET caixa_vendas = COALESCE(caixa_vendas,0) + ? WHERE Data = ?",
+                (float(valor), data_)
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO saldos_caixas (Data, caixa_vendas) VALUES (?, ?)",
+                    (data_, float(valor))
+                )
+        conn.commit()
+
 def obter_banco_destino(caminho_banco: str, forma: str, maquineta: str, bandeira: str | None, parcelas: int | None) -> str | None:
     """
     Descobre o banco_destino lendo a tabela taxas_maquinas.
     Estratégia:
       1) Match exato (forma, maquineta, bandeira, parcelas)
-      2) Se forma == LINK_PAGAMENTO, tenta como CRÉDITO também (fallback comum)
+      2) Se forma == LINK_PAGAMENTO, tenta como CRÉDITO também
       3) Match por (forma, maquineta) ignorando bandeira/parcelas
       4) Qualquer registro da maquineta
     """
@@ -197,7 +231,7 @@ def pagina_lancamentos(caminho_banco):
             banco_pix_direto = None
             taxa_pix_direto = 0.0
 
-            # Carrega maquinetas existes na taxa
+            # Carrega maquinetas existentes na taxa
             try:
                 with sqlite3.connect(caminho_banco) as conn:
                     maquinetas_all = pd.read_sql("SELECT DISTINCT maquineta FROM taxas_maquinas ORDER BY maquineta", conn)["maquineta"].tolist()
@@ -215,12 +249,15 @@ def pagina_lancamentos(caminho_banco):
                     # maquineta obrigatória para pix via maquineta
                     try:
                         with sqlite3.connect(caminho_banco) as conn:
-                            maq_pix = pd.read_sql("""
+                            maq_pix = pd.read_sql(
+                                """
                                 SELECT DISTINCT maquineta
                                 FROM taxas_maquinas
                                 WHERE forma_pagamento = 'PIX'
                                 ORDER BY maquineta
-                            """, conn)["maquineta"].tolist()
+                                """,
+                                conn
+                            )["maquineta"].tolist()
                     except Exception:
                         maq_pix = []
                     maquineta = st.selectbox("PSP/Maquineta do PIX", maq_pix, key="maquineta_pix")
@@ -245,11 +282,15 @@ def pagina_lancamentos(caminho_banco):
                 # Bandeira
                 try:
                     with sqlite3.connect(caminho_banco) as conn:
-                        bandeiras = pd.read_sql("""
+                        bandeiras = pd.read_sql(
+                            """
                             SELECT DISTINCT bandeira FROM taxas_maquinas
                             WHERE forma_pagamento = ? AND maquineta = ?
                             ORDER BY bandeira
-                        """, conn, params=(forma_pagamento if forma_pagamento != "LINK_PAGAMENTO" else "CRÉDITO", maquineta))["bandeira"].tolist()
+                            """,
+                            conn,
+                            params=(forma_pagamento if forma_pagamento != "LINK_PAGAMENTO" else "CRÉDITO", maquineta)
+                        )["bandeira"].tolist()
                 except Exception:
                     bandeiras = []
                 bandeira = st.selectbox("Bandeira", bandeiras, key="bandeira_cartao") if bandeiras else ""
@@ -258,11 +299,15 @@ def pagina_lancamentos(caminho_banco):
                 if forma_pagamento in ["CRÉDITO", "LINK_PAGAMENTO"]:
                     try:
                         with sqlite3.connect(caminho_banco) as conn:
-                            parcelas_disp = pd.read_sql("""
+                            parcelas_disp = pd.read_sql(
+                                """
                                 SELECT DISTINCT parcelas FROM taxas_maquinas
                                 WHERE forma_pagamento = ? AND maquineta = ? AND bandeira = ?
                                 ORDER BY parcelas
-                            """, conn, params=(forma_pagamento if forma_pagamento != "LINK_PAGAMENTO" else "CRÉDITO", maquineta, bandeira))["parcelas"].tolist()
+                                """,
+                                conn,
+                                params=(forma_pagamento if forma_pagamento != "LINK_PAGAMENTO" else "CRÉDITO", maquineta, bandeira)
+                            )["parcelas"].tolist()
                     except Exception:
                         parcelas_disp = []
                     parcelas = st.selectbox("Parcelas", parcelas_disp if parcelas_disp else [1], key="parcelas_cartao")
@@ -270,23 +315,11 @@ def pagina_lancamentos(caminho_banco):
                     parcelas = 1
 
             elif forma_pagamento == "DINHEIRO":
-                modo_din = st.radio(
-                    "Como registrar o dinheiro?",
-                    ["Via maquineta", "Direto para banco"],
-                    horizontal=True,
-                    key="modo_dinheiro"
-                )
-                if modo_din == "Via maquineta":
-                    maquineta = st.selectbox("Maquineta (para definir banco de destino)", maquinetas_all, key="maquineta_din")
-                else:
-                    maquineta = ""
-                    try:
-                        with sqlite3.connect(caminho_banco) as conn:
-                            df_bancos = pd.read_sql("SELECT nome FROM bancos_cadastrados ORDER BY nome", conn)
-                        bancos_lista = df_bancos["nome"].tolist()
-                    except Exception:
-                        bancos_lista = []
-                    banco_pix_direto = st.selectbox("Banco que receberá (depósito do caixa)", bancos_lista, key="banco_dinheiro_direto")
+                # Venda em dinheiro sempre vai para o Caixa, sem maquineta e sem banco
+                maquineta = ""
+                bandeira = ""
+                parcelas = 1
+                st.caption("🧾 Venda em dinheiro será registrada no **Caixa** e também no livro de movimentações.")
 
             # Resumo antes de salvar
             confirmar = st.checkbox("Confirmo os dados para salvar a venda", key="confirmar_venda")
@@ -304,8 +337,6 @@ def pagina_lancamentos(caminho_banco):
                     resumo.append(f"- Parcelas: {parcelas}")
                 if forma_pagamento == "PIX" and st.session_state.get("modo_pix") == "Direto para banco" and banco_pix_direto:
                     resumo.append(f"- Banco PIX direto: {banco_pix_direto} (taxa {taxa_pix_direto:.2f}%)")
-                if forma_pagamento == "DINHEIRO" and st.session_state.get("modo_dinheiro") == "Direto para banco" and banco_pix_direto:
-                    resumo.append(f"- Banco destino (dinheiro): {banco_pix_direto}")
 
                 st.info("**Resumo da Venda:**\n\n" + "\n".join(resumo))
 
@@ -324,9 +355,6 @@ def pagina_lancamentos(caminho_banco):
                 if forma_pagamento == "PIX" and st.session_state.get("modo_pix") == "Via maquineta" and not maquineta:
                     st.warning("⚠️ Selecione a maquineta do PIX.")
                     st.stop()
-                if forma_pagamento == "DINHEIRO" and st.session_state.get("modo_dinheiro") == "Via maquineta" and not maquineta:
-                    st.warning("⚠️ Selecione a maquineta para definir o banco.")
-                    st.stop()
 
                 try:
                     # 1) calcular taxa e banco_destino
@@ -336,7 +364,8 @@ def pagina_lancamentos(caminho_banco):
                     if forma_pagamento in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"]:
                         # taxa e banco pela taxa cadastrada
                         with sqlite3.connect(caminho_banco) as conn:
-                            row = conn.execute("""
+                            row = conn.execute(
+                                """
                                 SELECT taxa_percentual, banco_destino
                                 FROM taxas_maquinas
                                 WHERE forma_pagamento = ?
@@ -344,10 +373,12 @@ def pagina_lancamentos(caminho_banco):
                                   AND bandeira        = ?
                                   AND parcelas        = ?
                                 LIMIT 1
-                            """, (
-                                forma_pagamento if forma_pagamento != "LINK_PAGAMENTO" else "CRÉDITO",
-                                maquineta, bandeira, int(parcelas or 1)
-                            )).fetchone()
+                                """,
+                                (
+                                    forma_pagamento if forma_pagamento != "LINK_PAGAMENTO" else "CRÉDITO",
+                                    maquineta, bandeira, int(parcelas or 1)
+                                )
+                            ).fetchone()
                         if row:
                             taxa = float(row[0] or 0.0)
                             banco_destino = row[1] if row[1] else None
@@ -358,7 +389,8 @@ def pagina_lancamentos(caminho_banco):
                     elif forma_pagamento == "PIX":
                         if st.session_state.get("modo_pix") == "Via maquineta":
                             with sqlite3.connect(caminho_banco) as conn:
-                                row = conn.execute("""
+                                row = conn.execute(
+                                    """
                                     SELECT taxa_percentual, banco_destino
                                     FROM taxas_maquinas
                                     WHERE forma_pagamento = 'PIX'
@@ -366,7 +398,9 @@ def pagina_lancamentos(caminho_banco):
                                       AND bandeira        = ''
                                       AND parcelas        = 1
                                     LIMIT 1
-                                """, (maquineta,)).fetchone()
+                                    """,
+                                    (maquineta,)
+                                ).fetchone()
                             taxa = float(row[0] or 0.0) if row else 0.0
                             banco_destino = (row[1] if row and row[1] else None)
                             if not banco_destino:
@@ -380,14 +414,12 @@ def pagina_lancamentos(caminho_banco):
                                 st.stop()
 
                     elif forma_pagamento == "DINHEIRO":
+                        # Sem taxa; registra como entrada no "Caixa"
                         taxa = 0.0
-                        if st.session_state.get("modo_dinheiro") == "Via maquineta":
-                            banco_destino = obter_banco_destino(caminho_banco, "DINHEIRO", maquineta, "", 1)
-                        else:
-                            banco_destino = banco_pix_direto  # aqui reaproveitamos a var como "banco escolhido"
-                        if not banco_destino:
-                            st.warning("⚠️ Não foi possível identificar o banco de destino para o DINHEIRO.")
-                            st.stop()
+                        banco_destino = "Caixa"   # padrão para dinheiro
+                        parcelas = 1
+                        bandeira = ""
+                        maquineta = ""
 
                     # 2) calcula valor líquido
                     valor_liquido = float(valor) * (1 - float(taxa) / 100.0)
@@ -395,29 +427,36 @@ def pagina_lancamentos(caminho_banco):
                     # 3) grava na ENTRADA (com valor_liquido)
                     with sqlite3.connect(caminho_banco) as conn:
                         usuario = st.session_state.usuario_logado["nome"] if "usuario_logado" in st.session_state and st.session_state.usuario_logado else "Sistema"
-                        cur = conn.execute("""
+                        cur = conn.execute(
+                            """
                             INSERT INTO entrada (Data, Valor, Forma_de_Pagamento, Parcelas, Bandeira, Usuario, maquineta, valor_liquido, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (
-                            str(data_lancamento),
-                            float(valor),
-                            forma_pagamento,
-                            int(parcelas or 1),
-                            bandeira,
-                            usuario,
-                            maquineta,
-                            round(valor_liquido, 2),
-                            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        ))
+                            """,
+                            (
+                                str(data_lancamento),
+                                float(valor),
+                                forma_pagamento,
+                                int(parcelas or 1),
+                                bandeira,
+                                usuario,
+                                maquineta,
+                                round(valor_liquido, 2),
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            )
+                        )
                         venda_id = cur.lastrowid
                         conn.commit()
 
-                    # 4) agenda/insere liquidação no banco
-                    dias = DIAS_COMPENSACAO.get(forma_pagamento, 0)
+                    # 4) agenda/insere liquidação no livro de movimentações (inclui DINHEIRO)
                     data_base = pd.to_datetime(data_lancamento).date()
+                    dias = DIAS_COMPENSACAO.get(forma_pagamento, 0)
                     data_liq = proximo_dia_util_br(data_base, dias) if dias > 0 else data_base
 
-                    obs = f"Liquidação {forma_pagamento} {maquineta or ''}{('/' + bandeira) if bandeira else ''} {int(parcelas or 1)}x".strip()
+                    obs = (
+                        f"Liquidação {forma_pagamento} {maquineta or ''}{('/' + bandeira) if bandeira else ''} {int(parcelas or 1)}x"
+                        if forma_pagamento != "DINHEIRO"
+                        else "Venda DINHEIRO - Caixa"
+                    ).strip()
 
                     if not banco_destino:
                         st.warning("⚠️ Não foi possível identificar o banco de destino. A movimentação NÃO foi lançada.")
@@ -426,29 +465,40 @@ def pagina_lancamentos(caminho_banco):
                             caminho_banco=caminho_banco,
                             data_=str(data_liq),
                             banco=banco_destino,
-                            valor_liquido=round(valor_liquido if forma_pagamento in ["PIX", "DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"] else float(valor), 2),
+                            valor_liquido=round(valor_liquido, 2),
                             observacao=obs,
                             referencia_id=venda_id
                         )
 
+                    # ⬇️ Para DINHEIRO, acumula também em saldos_caixa.caixa_vendas
+                    if forma_pagamento == "DINHEIRO":
+                        registrar_caixa_vendas(caminho_banco, str(data_liq), float(valor))
+
                     # Mensagem persistente
-                    st.session_state["msg_ok"] = (
-                        f"✅ Venda registrada! "
-                        f"{'Liquidação' if forma_pagamento!='DINHEIRO' else 'Registro'} de "
-                        f"**{formatar_valor(valor_liquido if forma_pagamento in ['PIX','DÉBITO','CRÉDITO','LINK_PAGAMENTO'] else valor)}** "
-                        f"em **{banco_destino or '—'}** na data **{data_liq.strftime('%d/%m/%Y')}**."
-                    )
+                    if forma_pagamento == "DINHEIRO":
+                        st.session_state["msg_ok"] = (
+                            f"✅ Venda registrada! **{formatar_valor(valor)}** no **Caixa** "
+                            f"({data_liq.strftime('%d/%m/%Y')}) e lançada em movimentações e saldos do caixa."
+                        )
+                    else:
+                        st.session_state["msg_ok"] = (
+                            f"✅ Venda registrada! Liquidação de **{formatar_valor(valor_liquido)}** "
+                            f"em **{banco_destino or '—'}** na data **{data_liq.strftime('%d/%m/%Y')}**."
+                        )
 
                     # Debug rápido das últimas liquidações
                     try:
                         with sqlite3.connect(caminho_banco) as conn:
-                            df_dbg = pd.read_sql("""
+                            df_dbg = pd.read_sql(
+                                """
                                 SELECT id, data, banco, tipo, valor, origem, observacao, referencia_id
                                 FROM movimentacoes_bancarias
                                 WHERE origem = 'vendas'
                                 ORDER BY id DESC
                                 LIMIT 10
-                            """, conn)
+                                """,
+                                conn
+                            )
                         if not df_dbg.empty:
                             st.caption("🔎 Últimos lançamentos de liquidação (origem = vendas):")
                             st.dataframe(df_dbg, use_container_width=True, hide_index=True)
