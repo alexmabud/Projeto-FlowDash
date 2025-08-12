@@ -25,7 +25,7 @@ def pagina_lancamentos(caminho_banco: str):
     total_m = df_m[df_m["Data"].dt.date == data_lanc]["Valor_Mercadoria"].sum() if "Valor_Mercadoria" in df_m.columns else 0.0
 
     bloco_resumo_dia([
-        ("Entradas", formatar_valor(total_e)),
+        ("Vendas", formatar_valor(total_e)),
         ("Saídas", formatar_valor(total_s)),
         ("Mercadorias", formatar_valor(total_m)),
     ])
