@@ -88,11 +88,36 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
         descricao = st.text_input("Descrição (opcional)", key="descricao_saida")
 
-        resumo = (
-            f"Data: {data_lanc} • Valor: R$ {valor_saida:.2f} • Forma: {forma_pagamento} • "
-            f"Categoria: {cat_nome or '—'} • Subcategoria: {subcat_nome or '—'} • Desc: {descricao or 'N/A'}"
-        )
-        st.info(f"✅ Confirme os dados da saída: {resumo}")
+        # -------- Resumo no padrão de Nova Venda (visual apenas) --------
+        data_saida_str = data_lanc.strftime("%d/%m/%Y")
+        linhas_md = [
+            "**Confirme os dados da saída**",
+            f"- **Data:** {data_saida_str}",
+            f"- **Valor:** R$ {valor_saida:.2f}",
+            f"- **Forma de pagamento:** {forma_pagamento}",
+            f"- **Categoria:** {cat_nome or '—'}",
+            f"- **Subcategoria:** {subcat_nome or '—'}",
+            f"- **Descrição:** {descricao or 'N/A'}",
+        ]
+
+        if forma_pagamento == "CRÉDITO":
+            linhas_md += [
+                f"- **Parcelas:** {parcelas}x",
+                f"- **Cartão de Crédito:** {cartao_escolhido or '—'}",
+            ]
+        elif forma_pagamento == "DINHEIRO":
+            linhas_md += [f"- **Origem do Dinheiro:** {origem_dinheiro or '—'}"]
+        elif forma_pagamento in ["PIX", "DÉBITO"]:
+            linhas_md += [f"- **Banco da Saída:** {banco_escolhido or '—'}"]
+        elif forma_pagamento == "BOLETO":
+            linhas_md += [
+                f"- **Parcelas:** {parcelas}x",
+                f"- **Vencimento 1ª Parcela:** {venc_1.strftime('%d/%m/%Y') if venc_1 else '—'}",
+                f"- **Fornecedor:** {fornecedor or '—'}",
+                f"- **Documento:** {documento or '—'}",
+            ]
+
+        st.info("\n".join(linhas_md))
         confirmar = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
 
         # -------- Salvar --------
