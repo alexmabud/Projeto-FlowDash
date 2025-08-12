@@ -1,43 +1,39 @@
-import sqlite3
+import sqlite3, os, sys
 
-# Caminho do banco
-CAMINHO_BANCO = r"C:\Users\User\OneDrive\Documentos\Python\Dev_Python\Abud Python Workspace - GitHub\Projeto FlowDash\data\flowdash_data.db"
+# >>> Caminho padrão do seu banco (ajuste se precisar)
+DB_PATH = r"C:\Users\User\OneDrive\Documentos\Python\Dev_Python\Abud Python Workspace - GitHub\Projeto FlowDash\data\flowdash_data.db"
 
-# Nome da coluna a remover
-COLUNA_REMOVER = "teste"
+def run(db_path: str):
+    if not os.path.isfile(db_path):
+        print(f"Arquivo não encontrado:\n  {db_path}\n\nVerifique o caminho acima.")
+        sys.exit(1)
 
-# Conectar ao banco
-conn = sqlite3.connect(CAMINHO_BANCO)
-cur = conn.cursor()
+    conn = sqlite3.connect(db_path, timeout=30)
+    # boas práticas p/ OneDrive
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    cur = conn.cursor()
 
-# Obter a estrutura atual da tabela
-cur.execute("PRAGMA table_info(saldos_bancos)")
-colunas_info = cur.fetchall()
-colunas_existentes = [c[1] for c in colunas_info]
-
-if COLUNA_REMOVER not in colunas_existentes:
-    print(f"Coluna '{COLUNA_REMOVER}' não encontrada na tabela saldos_bancos.")
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS categorias_saida (
+        id   INTEGER PRIMARY KEY AUTOINCREMENT,
+        nome TEXT UNIQUE NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS subcategorias_saida (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        categoria_id INTEGER NOT NULL,
+        nome         TEXT NOT NULL,
+        UNIQUE(categoria_id, nome),
+        FOREIGN KEY(categoria_id) REFERENCES categorias_saida(id) ON DELETE CASCADE
+    );
+    """)
+    conn.commit()
     conn.close()
-    exit()
+    print(f"OK ✅  Tabelas garantidas em:\n  {db_path}")
 
-# Criar lista de colunas sem a que será removida
-colunas_novas = [c for c in colunas_existentes if c != COLUNA_REMOVER]
-colunas_str = ", ".join(colunas_novas)
-
-# Criar tabela temporária
-cur.execute(f"""
-    CREATE TABLE saldos_bancos_temp AS
-    SELECT {colunas_str}
-    FROM saldos_bancos
-""")
-
-# Apagar tabela original
-cur.execute("DROP TABLE saldos_bancos")
-
-# Renomear tabela temporária para o nome original
-cur.execute("ALTER TABLE saldos_bancos_temp RENAME TO saldos_bancos")
-
-conn.commit()
-conn.close()
-
-print(f"Coluna '{COLUNA_REMOVER}' removida com sucesso da tabela saldos_bancos.")
+if __name__ == "__main__":
+    # Se você quiser, pode passar outro caminho como argumento:
+    #   python nova_tabela.py "C:\...\seu_banco.db"
+    args = [a for a in sys.argv[1:] if not a.startswith('-')]
+    run(args[0] if args else DB_PATH)
