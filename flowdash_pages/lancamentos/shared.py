@@ -3,14 +3,10 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 import streamlit as st
 
-from utils.utils import formatar_valor  # já existe no seu projeto
-
-def get_conn(db_path: str):
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+from utils.utils import formatar_valor
+from shared.db import get_conn                     # ⬅️ usa conexão centralizada
+from shared.ids import uid_venda_liquidacao        # ⬅️ gera trans_uid
+from repository.movimentacoes_repository import MovimentacoesRepository
 
 def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
     try:
@@ -58,16 +54,53 @@ def proximo_dia_util_br(data_base: date, dias: int) -> date:
                 add += 1
         return d
 
-def inserir_mov_liquidacao_venda(caminho_banco: str, data_: str, banco: str, valor_liquido: float,
-                                 observacao: str, referencia_id: int | None):
+def inserir_mov_liquidacao_venda(
+    caminho_banco: str,
+    data_: str,
+    banco: str,
+    valor_liquido: float,
+    observacao: str,
+    referencia_id: int | None
+):
+    """
+    Registra a liquidação da venda em movimentacoes_bancarias com idempotência:
+      - tipo='entrada'
+      - origem='vendas_liquidacao'
+      - referencia_tabela='entrada'
+      - trans_uid (SHA-256) via uid_venda_liquidacao
+    """
     if not valor_liquido or valor_liquido <= 0:
         return
-    with get_conn(caminho_banco) as conn:
-        conn.execute("""
-            INSERT INTO movimentacoes_bancarias (data, banco, tipo, valor, origem, observacao, referencia_id)
-            VALUES (?, ?, 'entrada', ?, 'vendas', ?, ?)
-        """, (data_, banco, float(valor_liquido), observacao, referencia_id))
-        conn.commit()
+
+    # Caso a UI não passe forma/maquineta/bandeira/parcelas/usuario, usamos neutros:
+    forma = "N/A"
+    maquineta = ""
+    bandeira = ""
+    parcelas = 1
+    usuario = "Sistema"
+
+    trans_uid = uid_venda_liquidacao(
+        data_liq=str(data_),
+        valor_liq=float(valor_liquido),
+        forma=forma,
+        maquineta=maquineta,
+        bandeira=bandeira,
+        parcelas=parcelas,
+        banco=banco or "",
+        usuario=usuario
+    )
+
+    mov_repo = MovimentacoesRepository(caminho_banco)
+    mov_repo.registrar_entrada(
+        data=str(data_),
+        banco=str(banco or "").strip(),
+        valor=float(valor_liquido),
+        origem="vendas_liquidacao",
+        observacao=observacao or "",
+        referencia_tabela="entrada",
+        referencia_id=int(referencia_id) if referencia_id else None,
+        trans_uid=trans_uid
+    )
 
 def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float):
     if not valor or valor <= 0:
@@ -90,7 +123,13 @@ def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float):
                 cur.execute("INSERT INTO saldos_caixas (Data, caixa_vendas) VALUES (?, ?)", (data_, float(valor)))
         conn.commit()
 
-def obter_banco_destino(caminho_banco: str, forma: str, maquineta: str, bandeira: str | None, parcelas: int | None) -> str | None:
+def obter_banco_destino(
+    caminho_banco: str,
+    forma: str,
+    maquineta: str,
+    bandeira: str | None,
+    parcelas: int | None
+) -> str | None:
     formas_try = [forma]
     if forma == "LINK_PAGAMENTO":
         formas_try.append("CRÉDITO")
