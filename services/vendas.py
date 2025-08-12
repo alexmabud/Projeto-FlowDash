@@ -1,6 +1,10 @@
+import pandas as pd
 import sqlite3
 from typing import Optional, Tuple
-import pandas as pd
+from datetime import datetime
+
+from shared.db import get_conn
+from shared.ids import uid_venda_liquidacao, sanitize
 from repository.movimentacoes_repository import MovimentacoesRepository
 
 class VendasService:
@@ -14,17 +18,6 @@ class VendasService:
         self.mov_repo = MovimentacoesRepository(db_path)  # garante schema
 
     # ---------- infra ----------
-    def _get_conn(self):
-        # Conexão estável p/ OneDrive: WAL + busy_timeout + FKs
-        conn = sqlite3.connect(self.db_path, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=30000;")
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
-
-    def _sanitize(self, s: Optional[str]) -> str:
-        return (s or "").strip()
-
     def _garantir_linha_saldos_caixas(self, conn, data: str):
         cur = conn.execute("SELECT 1 FROM saldos_caixas WHERE data = ? LIMIT 1", (data,))
         if not cur.fetchone():
@@ -74,26 +67,35 @@ class VendasService:
         # validações
         if float(valor_bruto) <= 0:
             raise ValueError("Valor da venda deve ser maior que zero.")
-        forma = self._sanitize(forma).upper()
+        forma = sanitize(forma).upper()
         if forma not in ("DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"):
             raise ValueError("Forma de pagamento inválida.")
 
         parcelas = int(parcelas or 1)
-        bandeira = self._sanitize(bandeira)
-        maquineta = self._sanitize(maquineta)
-        usuario = self._sanitize(usuario)
-        banco_destino = self._sanitize(banco_destino) if banco_destino else ""
+        bandeira = sanitize(bandeira)
+        maquineta = sanitize(maquineta)
+        usuario = sanitize(usuario)
+        banco_destino = sanitize(banco_destino) if banco_destino else ""
 
         # valor líquido
         valor_liq = round(float(valor_bruto) * (1 - float(taxa_percentual or 0.0)/100.0), 2)
 
         # idempotência (1 único movimento: LIQUIDAÇÃO)
-        uid_banco = "Caixa" if forma == "DINHEIRO" else banco_destino
-        uid_liq = f"VENDA_LIQ|{data_liq}|{valor_liq:.2f}|{forma}|{maquineta}|{bandeira}|{parcelas}|{uid_banco}|{usuario}"
+        banco_uid = "Caixa" if forma == "DINHEIRO" else banco_destino
+        uid_liq = uid_venda_liquidacao(
+            data_liq=str(data_liq),
+            valor_liq=float(valor_liq),
+            forma=forma,
+            maquineta=maquineta,
+            bandeira=bandeira,
+            parcelas=parcelas,
+            banco=banco_uid,
+            usuario=usuario
+        )
         if self.mov_repo.ja_existe_transacao(uid_liq):
             return (-1, -1)
 
-        with self._get_conn() as conn:
+        with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
             # 1) entrada
@@ -102,37 +104,43 @@ class VendasService:
                     (Data, Valor, Forma_de_Pagamento, Parcelas, Bandeira, Usuario, maquineta, valor_liquido, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                data_venda, float(valor_bruto), forma, parcelas, bandeira, usuario, maquineta, valor_liq,
-                pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+                str(data_venda), float(valor_bruto), forma, parcelas, bandeira, usuario, maquineta, valor_liq,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ))
-            venda_id = cur.lastrowid
+            venda_id = int(cur.lastrowid)
 
             # 2) saldos na data_liq
             if forma == "DINHEIRO":
                 # incrementa caixa_vendas (ajuste acordado)
-                self._garantir_linha_saldos_caixas(conn, data_liq)
+                self._garantir_linha_saldos_caixas(conn, str(data_liq))
                 cur.execute("""
                     UPDATE saldos_caixas SET caixa_vendas = COALESCE(caixa_vendas,0) + ?
                     WHERE data = ?
-                """, (float(valor_bruto), data_liq))
+                """, (float(valor_bruto), str(data_liq)))
                 banco_mov = "Caixa"
                 valor_mov = valor_liq  # == bruto, pois taxa 0
             else:
                 if not banco_destino:
                     raise ValueError("Banco de destino obrigatório para formas não-DINHEIRO.")
-                self._ajustar_banco_dynamic(conn, banco_destino, +valor_liq, data_liq)
+                self._ajustar_banco_dynamic(conn, banco_destino, +valor_liq, str(data_liq))
                 banco_mov = banco_destino
                 valor_mov = valor_liq
 
             # 3) log único (mesma conexão)
-            obs = (f"Liquidação {forma} {maquineta}" + (f"/{bandeira}" if bandeira else "") + (f" {parcelas}x" if parcelas > 1 else "")).strip()
+            detalhes = []
+            if maquineta: detalhes.append(maquineta)
+            if bandeira:  detalhes.append(bandeira)
+            if parcelas and parcelas > 1: detalhes.append(f"{parcelas}x")
+            detalhes_txt = " ".join(detalhes).strip()
+            obs = f"Liquidação {forma}" + (f" {detalhes_txt}" if detalhes_txt else "")
+
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (data_liq, banco_mov, "entrada", float(valor_mov),
+            """, (str(data_liq), banco_mov, "entrada", float(valor_mov),
                   "vendas_liquidacao", obs, "entrada", venda_id, uid_liq))
-            mov_id = cur.lastrowid
+            mov_id = int(cur.lastrowid)
 
             conn.commit()
 
