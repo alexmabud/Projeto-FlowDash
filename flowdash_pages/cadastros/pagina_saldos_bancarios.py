@@ -2,42 +2,41 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 from datetime import date
+from repository.movimentacoes_repository import MovimentacoesRepository
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 
-def _inserir_mov_bancaria(caminho_banco, data_, banco, valor):
-    """
-    Insere em movimentacoes_bancarias uma ENTRADA (valor > 0) com origem 'saldos_bancos'.
-    Monta o INSERT conforme as colunas realmente existentes na tabela.
-    """
-    if valor is None or float(valor) <= 0:
-        return
 
-    with sqlite3.connect(caminho_banco) as conn:
-        cols_info = conn.execute("PRAGMA table_info(movimentacoes_bancarias)").fetchall()
-        if not cols_info:
-            # Se não houver tabela, não há o que fazer silenciosamente
+def _inserir_mov_bancaria(caminho_banco, data_, banco, valor, referencia_id=None):
+    """
+    Registra ENTRADA em movimentacoes_bancarias (valor > 0) com origem 'saldos_bancos',
+    usando MovimentacoesRepository (idempotente).
+    """
+    try:
+        if valor is None or float(valor) <= 0:
             return
+        mov_repo = MovimentacoesRepository(caminho_banco)
+        mov_repo.registrar_entrada(
+            data=str(data_),
+            banco=str(banco or ""),
+            valor=float(valor),
+            origem="saldos_bancos",
+            observacao="Registro manual de saldo bancário",
+            referencia_tabela="saldos_bancos",
+            referencia_id=referencia_id
+        )
+    except Exception as e:
+        st.warning(f"Não foi possível registrar movimentação para {banco}: {e}")
 
-        cols_exist = {c[1] for c in cols_info}
-
-        payload = {
-            "data": str(data_),
-            "banco": banco,
-            "tipo": "entrada",
-            "valor": float(valor),
-            "origem": "saldos_bancos",
-            "observacao": "Registro manual de saldo bancário",
-            # "referencia_id": None,  # use se existir
-        }
-
-        cols_use = [k for k in payload if k in cols_exist]
-        vals_use = [payload[k] for k in cols_use]
-
-        placeholders = ",".join(["?"] * len(cols_use))
-        cols_sql = ",".join(f'"{c}"' for c in cols_use)
-
-        conn.execute(f"INSERT INTO movimentacoes_bancarias ({cols_sql}) VALUES ({placeholders})", vals_use)
-        conn.commit()
+def _garantir_colunas_bancos(conn: sqlite3.Connection, bancos: list[str]) -> None:
+    """
+    Garante que todas as colunas referentes aos bancos existam na tabela saldos_bancos.
+    Se faltar alguma, cria com DEFAULT 0.0.
+    """
+    cols_info = conn.execute("PRAGMA table_info(saldos_bancos)").fetchall()
+    existentes = {c[1] for c in cols_info}
+    faltantes = [b for b in bancos if b not in existentes]
+    for b in faltantes:
+        conn.execute(f'ALTER TABLE saldos_bancos ADD COLUMN "{b}" REAL DEFAULT 0.0')
 
 def pagina_saldos_bancarios(caminho_banco: str):
     st.subheader("🏦 Cadastro de Saldos Bancários por Banco (append-only)")
@@ -61,23 +60,41 @@ def pagina_saldos_bancarios(caminho_banco: str):
     bancos = df_bancos["nome"].tolist()
     banco_selecionado = st.selectbox("🏦 Banco", bancos)
     valor_digitado = st.number_input(
-        "💰 Valor do saldo (será adicionado como novo registro)",
+        "💰 Valor do saldo (será adicionado como nova linha)",
         min_value=0.0, step=10.0, format="%.2f"
     )
 
     if st.button("💾 Cadastrar Saldo (nova linha)", use_container_width=True):
         try:
-            # nova linha com 0.0 em todos os bancos e valor no selecionado
-            nova_linha = {b: 0.0 for b in bancos}
-            nova_linha[banco_selecionado] = float(valor_digitado)
-            nova_linha["data"] = data_str
-
             with sqlite3.connect(caminho_banco) as conn:
-                # insere (append-only)
-                pd.DataFrame([nova_linha]).to_sql("saldos_bancos", conn, if_exists="append", index=False)
+                # Garante as colunas para todos os bancos
+                _garantir_colunas_bancos(conn, bancos)
 
-            # também lança em movimentacoes_bancarias como ENTRADA
-            _inserir_mov_bancaria(caminho_banco, data_str, banco_selecionado, valor_digitado)
+                # Monta INSERT dinâmico: data + uma coluna por banco
+                colunas = ["data"] + bancos
+                valores = [data_str] + [
+                    float(valor_digitado) if b == banco_selecionado else 0.0
+                    for b in bancos
+                ]
+                placeholders = ",".join(["?"] * len(colunas))
+                colunas_sql = ",".join([f'"{c}"' for c in colunas])
+
+                cur = conn.cursor()
+                cur.execute(
+                    f'INSERT INTO saldos_bancos ({colunas_sql}) VALUES ({placeholders})',
+                    valores
+                )
+                saldo_id = int(cur.lastrowid)  # funciona mesmo sem coluna 'id'
+                conn.commit()
+
+            # também lança em movimentacoes_bancarias como ENTRADA, com referência amarrada
+            _inserir_mov_bancaria(
+                caminho_banco=caminho_banco,
+                data_=data_str,
+                banco=banco_selecionado,
+                valor=valor_digitado,
+                referencia_id=saldo_id
+            )
 
             valor_fmt = f"R$ {valor_digitado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             st.session_state["mensagem_sucesso"] = (
