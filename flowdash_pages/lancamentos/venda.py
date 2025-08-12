@@ -7,6 +7,13 @@ from .shared import (
 from utils.utils import formatar_valor
 from services.vendas import VendasService
 
+# Mapeia variações de escrita no banco para cada forma
+def _formas_equivalentes(forma: str):
+    forma = (forma or "").upper()
+    if forma == "LINK_PAGAMENTO":
+        return ["LINK_PAGAMENTO", "LINK PAGAMENTO", "LINK-DE-PAGAMENTO", "LINK DE PAGAMENTO"]
+    return [forma]
+
 def render_venda(caminho_banco: str, data_lanc):
     if st.button("🟢 Nova Venda", use_container_width=True, key="btn_venda_toggle"):
         st.session_state.form_venda = not st.session_state.get("form_venda", False)
@@ -16,13 +23,17 @@ def render_venda(caminho_banco: str, data_lanc):
 
     st.markdown("#### 📋 Nova Venda")
 
+    # Exibir data do lançamento logo abaixo do título
+    data_venda_str = pd.to_datetime(data_lanc).strftime("%d/%m/%Y")
+    st.caption(f"Data do lançamento: **{data_venda_str}**")
+
     valor = st.number_input("Valor da Venda", min_value=0.0, step=0.01, key="venda_valor", format="%.2f")
     forma = st.selectbox("Forma de Pagamento", ["DINHEIRO","PIX","DÉBITO","CRÉDITO","LINK_PAGAMENTO"], key="venda_forma")
 
     parcelas, bandeira, maquineta = 1, "", ""
     banco_pix_direto, taxa_pix_direto = None, 0.0
 
-    # maquinetas cadastradas (só leitura)
+    # maquinetas (uso geral para PIX via maquineta)
     try:
         with get_conn(caminho_banco) as conn:
             maq = pd.read_sql("SELECT DISTINCT maquineta FROM taxas_maquinas ORDER BY maquineta", conn)["maquineta"].tolist()
@@ -34,9 +45,12 @@ def render_venda(caminho_banco: str, data_lanc):
         if modo_pix == "Via maquineta":
             with get_conn(caminho_banco) as conn:
                 maq_pix = pd.read_sql(
-                    "SELECT DISTINCT maquineta FROM taxas_maquinas WHERE forma_pagamento='PIX' ORDER BY maquineta",
+                    "SELECT DISTINCT maquineta FROM taxas_maquinas WHERE UPPER(forma_pagamento)='PIX' ORDER BY maquineta",
                     conn
                 )["maquineta"].tolist()
+            if not maq_pix:
+                st.warning("Nenhuma maquineta cadastrada para PIX. Cadastre em Cadastro → Taxas por Maquineta.")
+                return
             maquineta = st.selectbox("PSP/Maquineta do PIX", maq_pix, key="pix_maquineta")
         else:
             with get_conn(caminho_banco) as conn:
@@ -44,39 +58,70 @@ def render_venda(caminho_banco: str, data_lanc):
                     bancos = pd.read_sql("SELECT nome FROM bancos_cadastrados ORDER BY nome", conn)["nome"].tolist()
                 except Exception:
                     bancos = []
+            if not bancos:
+                st.warning("Nenhum banco cadastrado. Cadastre em Cadastro → Bancos.")
+                return
             banco_pix_direto = st.selectbox("Banco que receberá o PIX", bancos, key="pix_banco")
             taxa_pix_direto  = st.number_input("Taxa do PIX direto (%)", min_value=0.0, step=0.01, value=0.0, format="%.2f", key="pix_taxa")
 
     elif forma in ["DÉBITO","CRÉDITO","LINK_PAGAMENTO"]:
-        maquineta = st.selectbox("Maquineta", maq, key="cartao_maquineta")
+        # ===== Maquineta por forma (com equivalências para LINK_PAGAMENTO)
+        formas = _formas_equivalentes(forma)
+        placeholders = ",".join(["?"] * len(formas))
+        with get_conn(caminho_banco) as conn:
+            maq_por_forma = pd.read_sql(
+                f"""
+                SELECT DISTINCT maquineta FROM taxas_maquinas
+                WHERE UPPER(forma_pagamento) IN ({placeholders})
+                ORDER BY maquineta
+                """,
+                conn,
+                params=[f.upper() for f in formas]
+            )["maquineta"].tolist()
+        if not maq_por_forma:
+            st.warning(f"Nenhuma maquineta cadastrada para {forma}. Cadastre em Cadastro → Taxas por Maquineta.")
+            return
+
+        maquineta = st.selectbox("Maquineta", maq_por_forma, key="cartao_maquineta")
+
+        # ===== Bandeiras por (forma, maquineta)
         with get_conn(caminho_banco) as conn:
             bandeiras = pd.read_sql(
-                """
+                f"""
                 SELECT DISTINCT bandeira FROM taxas_maquinas
-                WHERE forma_pagamento=? AND maquineta=?
+                WHERE UPPER(forma_pagamento) IN ({placeholders}) AND maquineta=?
                 ORDER BY bandeira
                 """,
                 conn,
-                params=(forma if forma!="LINK_PAGAMENTO" else "CRÉDITO", maquineta)
+                params=[f.upper() for f in formas] + [maquineta]
             )["bandeira"].tolist()
-        bandeira = st.selectbox("Bandeira", bandeiras, key="cartao_bandeira") if bandeiras else ""
-        if forma in ["CRÉDITO","LINK_PAGAMENTO"]:
-            with get_conn(caminho_banco) as conn:
-                pars = pd.read_sql(
-                    """
-                    SELECT DISTINCT parcelas FROM taxas_maquinas
-                    WHERE forma_pagamento=? AND maquineta=? AND bandeira=?
-                    ORDER BY parcelas
-                    """,
-                    conn,
-                    params=(forma if forma!="LINK_PAGAMENTO" else "CRÉDITO", maquineta, bandeira)
-                )["parcelas"].tolist()
-            parcelas = st.selectbox("Parcelas", pars if pars else [1], key="cartao_parcelas")
+        if not bandeiras:
+            st.warning(f"Nenhuma bandeira cadastrada para {forma} / {maquineta}. Cadastre em Cadastro → Taxas por Maquineta.")
+            return
+
+        bandeira = st.selectbox("Bandeira", bandeiras, key="cartao_bandeira")
+
+        # ===== Parcelas por (forma, maquineta, bandeira)
+        with get_conn(caminho_banco) as conn:
+            pars = pd.read_sql(
+                f"""
+                SELECT DISTINCT parcelas FROM taxas_maquinas
+                WHERE UPPER(forma_pagamento) IN ({placeholders}) AND maquineta=? AND bandeira=?
+                ORDER BY parcelas
+                """,
+                conn,
+                params=[f.upper() for f in formas] + [maquineta, bandeira]
+            )["parcelas"].tolist()
+        if not pars:
+            st.warning(f"Nenhuma parcela cadastrada para {forma} / {maquineta} / {bandeira}. Cadastre em Cadastro → Taxas por Maquineta.")
+            return
+
+        parcelas = st.selectbox("Parcelas", pars, key="cartao_parcelas")
+
     else:
         st.caption("🧾 Venda em dinheiro será registrada no **Caixa**.")
 
-    # ================== RESUMO (apenas o que o usuário preencheu) ==================
-    data_venda_str = pd.to_datetime(data_lanc).strftime("%d/%m/%Y")
+    # ================== RESUMO ==================
     linhas_md = [
         "**Confirme os dados da venda**",
         f"- **Data:** {data_venda_str}",
@@ -98,12 +143,10 @@ def render_venda(caminho_banco: str, data_lanc):
                 f"- **PIX direto ao banco:** {banco_pix_direto or '—'}",
                 f"- **Taxa informada (%):** {float(taxa_pix_direto or 0.0):.2f}"
             ]
-    # Para DINHEIRO não há campos adicionais
 
     st.info("\n".join(linhas_md))
-    # =======================================================================
+    # ============================================
 
-    # Confirmação única do formulário
     confirmar = st.checkbox("Confirmo os dados acima", key="venda_confirmar")
 
     if st.button("💾 Salvar Venda", use_container_width=True, key="venda_salvar"):
@@ -124,17 +167,19 @@ def render_venda(caminho_banco: str, data_lanc):
             st.warning("⚠️ Selecione o banco que receberá o PIX direto.")
             return
 
-        # ===== taxa + banco_destino (da base, sem mostrar no resumo)
+        # ===== taxa + banco_destino
         taxa, banco_destino = 0.0, None
         if forma in ["DÉBITO","CRÉDITO","LINK_PAGAMENTO"]:
+            formas = _formas_equivalentes(forma)
+            placeholders = ",".join(["?"] * len(formas))
             with get_conn(caminho_banco) as conn:
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT taxa_percentual, banco_destino FROM taxas_maquinas
-                    WHERE forma_pagamento=? AND maquineta=? AND bandeira=? AND parcelas=?
+                    WHERE UPPER(forma_pagamento) IN ({placeholders}) AND maquineta=? AND bandeira=? AND parcelas=?
                     LIMIT 1
                     """,
-                    (forma if forma!="LINK_PAGAMENTO" else "CRÉDITO", maquineta, bandeira, int(parcelas or 1))
+                    [f.upper() for f in formas] + [maquineta, bandeira, int(parcelas or 1)]
                 ).fetchone()
             if row:
                 taxa = float(row[0] or 0.0)
@@ -148,7 +193,7 @@ def render_venda(caminho_banco: str, data_lanc):
                     row = conn.execute(
                         """
                         SELECT taxa_percentual, banco_destino FROM taxas_maquinas
-                        WHERE forma_pagamento='PIX' AND maquineta=? AND bandeira='' AND parcelas=1
+                        WHERE UPPER(forma_pagamento)='PIX' AND maquineta=? AND bandeira='' AND parcelas=1
                         LIMIT 1
                         """,
                         (maquineta,)
@@ -162,12 +207,12 @@ def render_venda(caminho_banco: str, data_lanc):
         else:  # DINHEIRO
             banco_destino, taxa, parcelas, bandeira, maquineta = None, 0.0, 1, "", ""
 
-        # ===== calcula data de liquidação (UI decide; não exibimos no resumo)
+        # ===== data de liquidação
         base = pd.to_datetime(data_lanc).date()
         dias = DIAS_COMPENSACAO.get(forma, 0)
         data_liq = proximo_dia_util_br(base, dias) if dias > 0 else base
 
-        # ===== chama o service
+        # ===== service
         usuario = st.session_state.usuario_logado["nome"] if "usuario_logado" in st.session_state and st.session_state.usuario_logado else "Sistema"
         service = VendasService(caminho_banco)
 
@@ -180,7 +225,7 @@ def render_venda(caminho_banco: str, data_lanc):
                 parcelas=int(parcelas or 1),
                 bandeira=bandeira or "",
                 maquineta=maquineta or "",
-                banco_destino=banco_destino,     # None p/ dinheiro; nome p/ demais
+                banco_destino=banco_destino,
                 taxa_percentual=float(taxa or 0.0),
                 usuario=usuario
             )
