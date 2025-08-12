@@ -276,32 +276,45 @@ class BancoRepository:
         self.caminho_banco = caminho_banco
         self._criar_tabela_bancos()
 
+    # Conexão padrão do projeto (estável com OneDrive)
+    def _get_conn(self):
+        conn = sqlite3.connect(self.caminho_banco, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        return conn
+
     def _criar_tabela_bancos(self):
-        with sqlite3.connect(self.caminho_banco) as conn:
+        with self._get_conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS bancos_cadastrados (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id   INTEGER PRIMARY KEY AUTOINCREMENT,
                     nome TEXT UNIQUE NOT NULL
                 );
             """)
             conn.commit()
 
     def salvar_novo_banco(self, nome_banco: str):
-        nome_banco = nome_banco.strip()
-        with sqlite3.connect(self.caminho_banco) as conn:
-            conn.execute("INSERT OR IGNORE INTO bancos_cadastrados (nome) VALUES (?)", (nome_banco,))
-
-            # Verifica se a coluna já existe em saldos_bancos, se não existir, adiciona
-            colunas_existentes = pd.read_sql("PRAGMA table_info(saldos_bancos);", conn)["name"].tolist()
-            if nome_banco not in colunas_existentes:
-                conn.execute(f"ALTER TABLE saldos_bancos ADD COLUMN '{nome_banco}' REAL DEFAULT 0.0;")
+        nome_banco = (nome_banco or "").strip()
+        if not nome_banco:
+            return
+        with self._get_conn() as conn:
+            # cadastra (ignora se já existir)
+            conn.execute(
+                "INSERT OR IGNORE INTO bancos_cadastrados (nome) VALUES (?)",
+                (nome_banco,)
+            )
+            # garante coluna dinâmica em saldos_bancos
+            cols = pd.read_sql("PRAGMA table_info(saldos_bancos);", conn)["name"].tolist()
+            if nome_banco not in cols:
+                conn.execute(f'ALTER TABLE saldos_bancos ADD COLUMN "{nome_banco}" REAL DEFAULT 0.0;')
             conn.commit()
 
     def carregar_bancos(self) -> pd.DataFrame:
-        with sqlite3.connect(self.caminho_banco) as conn:
-            return pd.read_sql("SELECT * FROM bancos_cadastrados ORDER BY nome", conn)
+        with self._get_conn() as conn:
+            return pd.read_sql("SELECT id, nome FROM bancos_cadastrados ORDER BY nome", conn)
 
     def excluir_banco(self, banco_id: int):
-        with sqlite3.connect(self.caminho_banco) as conn:
+        with self._get_conn() as conn:
             conn.execute("DELETE FROM bancos_cadastrados WHERE id = ?", (banco_id,))
             conn.commit()
