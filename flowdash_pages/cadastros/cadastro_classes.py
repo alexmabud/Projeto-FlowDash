@@ -117,20 +117,36 @@ class CaixaRepository:
             cursor = conn.execute("SELECT caixa, caixa_2 FROM saldos_caixas WHERE data = ?", (data,))
             return cursor.fetchone()
 
-    def salvar_saldo(self, data: str, caixa: float, caixa_2: float, atualizar=False):
+    def salvar_saldo(self, data: str, caixa: float, caixa_2: float, atualizar: bool = False) -> int:
+        import sqlite3
         with sqlite3.connect(self.caminho_banco) as conn:
+            cur = conn.cursor()
             if atualizar:
-                conn.execute("""
+                cur.execute(
+                    """
                     UPDATE saldos_caixas
                     SET caixa = ?, caixa_2 = ?
                     WHERE data = ?
-                """, (caixa, caixa_2, data))
+                    """,
+                    (float(caixa), float(caixa_2), data)
+                )
+                # Pega o id do registro existente; funciona mesmo se não houver coluna 'id' (usa rowid)
+                row = cur.execute(
+                    "SELECT COALESCE(id, rowid) AS id FROM saldos_caixas WHERE data = ? LIMIT 1",
+                    (data,)
+                ).fetchone()
+                saldo_id = int(row[0]) if row and row[0] is not None else -1
             else:
-                conn.execute("""
+                cur.execute(
+                    """
                     INSERT INTO saldos_caixas (data, caixa, caixa_2)
                     VALUES (?, ?, ?)
-                """, (data, caixa, caixa_2))
+                    """,
+                    (data, float(caixa), float(caixa_2))
+                )
+                saldo_id = int(cur.lastrowid)
             conn.commit()
+            return saldo_id
 
     def listar_ultimos_saldos(self, limite=15):
         with sqlite3.connect(self.caminho_banco) as conn:
