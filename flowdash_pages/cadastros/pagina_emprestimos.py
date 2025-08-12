@@ -4,6 +4,7 @@ import sqlite3
 from datetime import date, datetime
 from flowdash_pages.cadastros.cadastro_classes import EmprestimoRepository
 from utils.utils import formatar_valor, limpar_valor_formatado
+from repository.movimentacoes_repository import MovimentacoesRepository  # ⬅️ NOVO
 
 TIPOS_EMPRESTIMO = ["Empréstimo", "Financiamento", "Crédito Pessoal", "Outro"]
 STATUS_OPCOES = ["Em aberto", "Quitado", "Renegociado"]
@@ -14,6 +15,7 @@ def carregar_bancos_cadastrados(caminho_banco: str) -> pd.DataFrame:
     with sqlite3.connect(caminho_banco) as conn:
         return pd.read_sql("SELECT id, nome FROM bancos_cadastrados ORDER BY nome", conn)
 
+# ⬇️ SUBSTITUÍDO: agora usa MovimentacoesRepository (idempotente + referência)
 def inserir_movimentacao_bancaria(
     caminho_banco: str,
     data_: str,
@@ -22,24 +24,23 @@ def inserir_movimentacao_bancaria(
     emprestimo_id: int,
     observacao: str = ""
 ):
-    with sqlite3.connect(caminho_banco) as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO movimentacoes_bancarias
-                (data, banco, tipo, valor, origem, observacao, referencia_id)
-            VALUES
-                (?,    ?,     ?,    ?,     ?,      ?,          ?)
-        """, (
-            data_,
-            banco_nome,
-            "entrada",     
-            valor,
-            "emprestimo",   
-            observacao,
-            emprestimo_id
-        ))
-        conn.commit()
-        return cur.lastrowid
+    try:
+        if not banco_nome or valor is None or float(valor) <= 0:
+            return None
+        mov_repo = MovimentacoesRepository(caminho_banco)
+        mov_id = mov_repo.registrar_entrada(
+            data=str(data_),
+            banco=str(banco_nome).strip(),
+            valor=float(valor),
+            origem="emprestimo",
+            observacao=observacao or "Crédito de empréstimo",
+            referencia_tabela="emprestimos",
+            referencia_id=int(emprestimo_id) if emprestimo_id else None
+        )
+        return mov_id
+    except Exception as e:
+        st.warning(f"Não foi possível registrar a movimentação bancária do empréstimo: {e}")
+        return None
 
 
 # Página principal 
@@ -62,7 +63,6 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
             with col2:
                 data_inicio_pagamento = st.date_input("Data de Início do Pagamento", value=date.today(), key="input_inicio_pagamento")
             with col3:
-                # (corrigido parêntese a mais)
                 data_quitacao = st.date_input("Data da Última Parcela", value=None, key="input_data_quitacao")
             with col4:
                 vencimento_dia = st.number_input("Dia do Vencimento", min_value=1, max_value=31, step=1, key="input_vencimento")
