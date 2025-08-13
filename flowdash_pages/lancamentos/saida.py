@@ -1,16 +1,19 @@
 import streamlit as st
+import pandas as pd  # <— novo
 from datetime import date
 from services.ledger import LedgerService
 from repository.cartoes_repository import CartoesRepository
 from repository.categorias_repository import CategoriasRepository
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 
+from shared.db import get_conn
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+
 FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
 ORIGENS_DINHEIRO = ["Caixa", "Caixa 2"]
 
 def render_saida(caminho_banco: str, data_lanc: date):
     with st.container():
-        # Botão toggle do formulário (uma coluna, como você usa)
         if st.button("🔴 Saída", use_container_width=True, key="btn_saida_toggle"):
             st.session_state.form_saida = not st.session_state.get("form_saida", False)
 
@@ -26,6 +29,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
         bancos_repo = BancoRepository(caminho_banco)
         cartoes_repo = CartoesRepository(caminho_banco)
         cats_repo = CategoriasRepository(caminho_banco)
+        cap_repo = ContasAPagarMovRepository(caminho_banco)
 
         # Apoio
         df_bancos = bancos_repo.carregar_bancos()
@@ -33,10 +37,12 @@ def render_saida(caminho_banco: str, data_lanc: date):
         nomes_cartoes = cartoes_repo.listar_nomes()
 
         st.caption(f"Data do lançamento: **{data_lanc}**")
+
+        # ===================== CAMPOS GERAIS =====================
         valor_saida = st.number_input("Valor da Saída", min_value=0.0, step=0.01, format="%.2f", key="valor_saida")
         forma_pagamento = st.selectbox("Forma de Pagamento", FORMAS, key="forma_pagamento_saida")
 
-        # -------- Categoria/Subcategoria dinâmicas (do banco) --------
+        # -------- Categoria/Subcategoria --------
         df_cat = cats_repo.listar_categorias()
         if not df_cat.empty:
             cat_nome = st.selectbox("Categoria", df_cat["nome"].tolist(), key="categoria_saida")
@@ -88,7 +94,73 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
         descricao = st.text_input("Descrição (opcional)", key="descricao_saida")
 
-        # -------- Resumo no padrão de Nova Venda (visual apenas) --------
+        # ===================== VINCULAR (AGORA EMBAIXO) =====================
+        tipo_obrigacao_escolhido = None
+        obrigacao_id_escolhido = None
+        saldo_obrigacao = None
+
+        pode_vincular = forma_pagamento in ["DINHEIRO", "PIX", "DÉBITO"]  # pagar obrigações
+        if pode_vincular:
+            st.write("**Vincular pagamento a uma obrigação (boleto/fatura/empréstimo)?**")
+            vincular = st.checkbox("Vincular a BOLETO / FATURA_CARTAO / EMPRESTIMO", key="saida_vincular")
+
+            if vincular:
+                tipo_label = st.selectbox(
+                    "Tipo de obrigação",
+                    ["Fatura Cartão", "Empréstimo", "Boleto"],
+                    key="saida_tipo_obrig_label"
+                )
+                tipo_map = {"Fatura Cartão": "FATURA_CARTAO", "Empréstimo": "EMPRESTIMO", "Boleto": "BOLETO"}
+                tipo_obrigacao_escolhido = tipo_map[tipo_label]
+
+                # Carrega obrigações em aberto desse tipo
+                with get_conn(caminho_banco) as conn:
+                    df_aberto = cap_repo.listar_em_aberto(conn, tipo_obrigacao_escolhido)
+
+                if df_aberto.empty:
+                    st.info("Nenhuma obrigação em aberto para esse tipo.")
+                else:
+                    # 1) Escolher pelo CREDOR (cartão/fornecedor/contrato) a partir da coluna 'credor'
+                    op_credor = sorted(
+                        [(c if pd.notna(c) and c else "(Sem credor)") for c in df_aberto["credor"].unique().tolist()]
+                    )
+                    credor_sel = st.selectbox("Escolha pelo nome (coluna 'credor')", op_credor, key="saida_credor")
+
+                    df_f = df_aberto.copy()
+                    df_f["credor_fix"] = df_f["credor"].fillna("(Sem credor)").replace("", "(Sem credor)")
+                    df_f = df_f[df_f["credor_fix"] == credor_sel]
+
+                    # 2) Para FATURA_CARTAO, pedir também o Mês (competência)
+                    if tipo_obrigacao_escolhido == "FATURA_CARTAO":
+                        meses = sorted([m for m in df_f["competencia"].dropna().unique().tolist() if m])
+                        mes_atual = date.today().strftime("%Y-%m")
+                        idx_default = meses.index(mes_atual) if mes_atual in meses else 0 if meses else 0
+                        comp_sel = st.selectbox("Mês (competência)", meses, index=idx_default, key="saida_competencia")
+                        df_f = df_f[df_f["competencia"] == comp_sel]
+
+                    # 3) Escolher a obrigação específica
+                    df_f = df_f.sort_values(by=["vencimento", "obrigacao_id"], na_position="last")
+                    opcoes = []
+                    for _, r in df_f.iterrows():
+                        ven = (r.get("vencimento") or "")[:10]
+                        desc = r.get("descricao") or credor_sel
+                        saldo = float(r.get("saldo_aberto") or 0)
+                        pct = float(r.get("perc_quitado") or 0)
+                        label = f"[{int(r['obrigacao_id'])}] {desc}  |  venc {ven}  |  saldo R$ {saldo:,.2f}  |  {pct:.1f}%"
+                        opcoes.append((int(r["obrigacao_id"]), label, saldo))
+
+                    if opcoes:
+                        labels = [o[1] for o in opcoes]
+                        escolha = st.selectbox("Escolha a obrigação", labels, key="saida_obrig_label")
+                        if escolha:
+                            idx = labels.index(escolha)
+                            obrigacao_id_escolhido, _, saldo_obrigacao = opcoes[idx]
+                            # auto-preencher o valor quando a obrigação muda
+                            if st.session_state.get("valor_saida_autofill_id") != obrigacao_id_escolhido:
+                                st.session_state["valor_saida"] = float(saldo_obrigacao)
+                                st.session_state["valor_saida_autofill_id"] = obrigacao_id_escolhido
+
+        # -------- Resumo visual --------
         data_saida_str = data_lanc.strftime("%d/%m/%Y")
         linhas_md = [
             "**Confirme os dados da saída**",
@@ -99,12 +171,10 @@ def render_saida(caminho_banco: str, data_lanc: date):
             f"- **Subcategoria:** {subcat_nome or '—'}",
             f"- **Descrição:** {descricao or 'N/A'}",
         ]
-
+        if pode_vincular and st.session_state.get("saida_vincular") and obrigacao_id_escolhido:
+            linhas_md.append(f"- **Vínculo:** {tipo_obrigacao_escolhido} #{obrigacao_id_escolhido} (saldo R$ {saldo_obrigacao:,.2f})")
         if forma_pagamento == "CRÉDITO":
-            linhas_md += [
-                f"- **Parcelas:** {parcelas}x",
-                f"- **Cartão de Crédito:** {cartao_escolhido or '—'}",
-            ]
+            linhas_md += [f"- **Parcelas:** {parcelas}x", f"- **Cartão de Crédito:** {cartao_escolhido or '—'}"]
         elif forma_pagamento == "DINHEIRO":
             linhas_md += [f"- **Origem do Dinheiro:** {origem_dinheiro or '—'}"]
         elif forma_pagamento in ["PIX", "DÉBITO"]:
@@ -116,8 +186,8 @@ def render_saida(caminho_banco: str, data_lanc: date):
                 f"- **Fornecedor:** {fornecedor or '—'}",
                 f"- **Documento:** {documento or '—'}",
             ]
-
         st.info("\n".join(linhas_md))
+
         confirmar = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
 
         # -------- Salvar --------
@@ -140,12 +210,31 @@ def render_saida(caminho_banco: str, data_lanc: date):
             if forma_pagamento == "BOLETO" and not venc_1:
                 st.warning("Informe o vencimento da 1ª parcela.")
                 return
+            if pode_vincular and st.session_state.get("saida_vincular") and not obrigacao_id_escolhido:
+                st.warning("Selecione a obrigação a vincular.")
+                return
 
             categoria = (cat_nome or "").strip()
             sub_categoria = (subcat_nome or "").strip()
             data_str = str(data_lanc)
 
+            # Validação de saldo quando estiver vinculando
+            if pode_vincular and st.session_state.get("saida_vincular") and obrigacao_id_escolhido:
+                with get_conn(caminho_banco) as conn:
+                    saldo = cap_repo.obter_saldo_obrigacao(conn, obrigacao_id_escolhido)
+                if float(valor_saida) > max(0.0, float(saldo)):
+                    st.warning(f"⚠️ Pagamento (R$ {valor_saida:.2f}) excede o saldo (R$ {float(saldo):.2f}).")
+                    return
+
             try:
+                vinculo = None
+                if pode_vincular and st.session_state.get("saida_vincular") and obrigacao_id_escolhido:
+                    vinculo = {
+                        "obrigacao_id": int(obrigacao_id_escolhido),
+                        "tipo_obrigacao": str(tipo_obrigacao_escolhido),
+                        "valor_pagar": float(valor_saida),
+                    }
+
                 if forma_pagamento == "DINHEIRO":
                     id_saida, id_mov = ledger.registrar_saida_dinheiro(
                         data=data_str,
@@ -155,6 +244,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         sub_categoria=sub_categoria,
                         descricao=descricao,
                         usuario=usuario_nome,
+                        vinculo_pagamento=vinculo,
                     )
                     st.session_state["msg_ok"] = (
                         "⚠️ Transação já registrada (idempotência)." if id_saida == -1
@@ -168,9 +258,10 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         banco_nome=banco_escolhido,
                         forma=forma_pagamento,
                         categoria=categoria,
-                        sub_categoria=sub_categoria,
+                        sub_categoria=subcategoria if (subcategoria := sub_categoria) else sub_categoria,
                         descricao=descricao,
                         usuario=usuario_nome,
+                        vinculo_pagamento=vinculo,
                     )
                     st.session_state["msg_ok"] = (
                         "⚠️ Transação já registrada (idempotência)." if id_saida == -1
