@@ -1,6 +1,6 @@
 import pandas as pd
 import sqlite3
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from datetime import date
 
 from shared.db import get_conn
@@ -12,18 +12,21 @@ from shared.ids import (
     uid_boleto_programado,
 )
 from repository.movimentacoes_repository import MovimentacoesRepository
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository  # <-- NOVO
 
 class LedgerService:
     """
     Serviço para registrar saídas com idempotência:
-      - DINHEIRO  -> ajusta saldos_caixas (caixa / caixa_2) e loga movimentacoes_bancarias
+      - DINHEIRO  -> ajusta saldos_caixas e loga movimentacoes_bancarias
       - PIX/DÉBITO-> ajusta saldos_bancos (coluna dinâmica) e loga movimentacoes_bancarias
-      - CRÉDITO   -> gera parcelas em fatura_cartao e loga movimentacoes_bancarias (sem mexer em saldos agora)
-      - BOLETO    -> gera parcelas em contas_a_pagar e loga movimentacoes_bancarias (sem mexer em saldos agora)
+      - CRÉDITO   -> cria LANCAMENTOS em contas_a_pagar_mov (faturas futuras), loga movimentações (programadas)
+      - BOLETO    -> cria LANCAMENTOS em contas_a_pagar_mov (parcelas futuras), loga movimentações (programadas)
+      - (Opcional) Vincular pagamento de Saída a uma obrigação (BOLETO/FATURA_CARTAO/EMPRESTIMO) na tabela central
     """
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.mov_repo = MovimentacoesRepository(db_path)
+        self.cap_repo = ContasAPagarMovRepository(db_path)  # <-- NOVO
 
     # ---------- infra ----------
     def _garantir_linha_saldos_caixas(self, conn, data: str):
@@ -40,7 +43,7 @@ class LedgerService:
             conn.execute("INSERT OR IGNORE INTO saldos_bancos (data) VALUES (?)", (data,))
 
     def _ajustar_banco_dynamic(self, conn, banco_col: str, delta: float, data: str):
-        cols = pd.read_sql("PRAGMA table_info(saldos_bancos);", conn)["name"].tolist()
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(saldos_bancos)").fetchall()]
         if banco_col not in cols:
             conn.execute(f'ALTER TABLE saldos_bancos ADD COLUMN "{banco_col}" REAL DEFAULT 0.0;')
         self._garantir_linha_saldos_bancos(conn, data)
@@ -69,7 +72,8 @@ class LedgerService:
         sub_categoria: Optional[str],
         descricao: Optional[str],
         usuario: str,
-        trans_uid: Optional[str] = None
+        trans_uid: Optional[str] = None,
+        vinculo_pagamento: Optional[Dict] = None  # <-- NOVO
     ) -> Tuple[int, int]:
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
@@ -91,6 +95,7 @@ class LedgerService:
             cur = conn.cursor()
             self._garantir_linha_saldos_caixas(conn, data)
 
+            # (1) INSERT saída
             cur.execute("""
                 INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
                                    Forma_de_Pagamento, Parcelas, Valor, Usuario,
@@ -99,12 +104,14 @@ class LedgerService:
             """, (data, categoria, sub_categoria, descricao, float(valor), usuario, origem_dinheiro))
             id_saida = int(cur.lastrowid)
 
+            # (2) Ajusta saldos de caixa
             campo = "caixa" if origem_dinheiro == "Caixa" else "caixa_2"
             cur.execute(f"""
                 UPDATE saldos_caixas SET {campo} = COALESCE({campo},0) - ?
                 WHERE data = ?
             """, (float(valor), data))
 
+            # (3) Log em movimentacoes_bancarias
             obs = f"Saída {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
@@ -112,6 +119,20 @@ class LedgerService:
                 VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?)
             """, (data, origem_dinheiro, float(valor), obs, id_saida, trans_uid))
             id_mov = int(cur.lastrowid)
+
+            # (4) Se houver vínculo: registra PAGAMENTO na tabela central
+            if vinculo_pagamento:
+                self.cap_repo.registrar_pagamento(
+                    conn,
+                    obrigacao_id = int(vinculo_pagamento["obrigacao_id"]),
+                    tipo_obrigacao = str(vinculo_pagamento["tipo_obrigacao"]),
+                    valor_pago = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor))),
+                    data_evento = data,
+                    forma_pagamento = "DINHEIRO",
+                    origem = origem_dinheiro,
+                    ledger_id = id_saida,    # referenciando a linha de 'saida'
+                    usuario = usuario
+                )
 
             conn.commit()
             return (id_saida, id_mov)
@@ -128,7 +149,8 @@ class LedgerService:
         sub_categoria: Optional[str],
         descricao: Optional[str],
         usuario: str,
-        trans_uid: Optional[str] = None
+        trans_uid: Optional[str] = None,
+        vinculo_pagamento: Optional[Dict] = None  # <-- NOVO
     ) -> Tuple[int, int]:
         forma_u = sanitize(forma).upper()
         if forma_u == "DEBITO":
@@ -153,6 +175,7 @@ class LedgerService:
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
+            # (1) INSERT saída
             cur.execute("""
                 INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
                                    Forma_de_Pagamento, Parcelas, Valor, Usuario,
@@ -161,9 +184,11 @@ class LedgerService:
             """, (data, categoria, sub_categoria, descricao, forma_u, float(valor), usuario, banco_nome))
             id_saida = int(cur.lastrowid)
 
+            # (2) Ajusta saldos de bancos
             self._garantir_linha_saldos_bancos(conn, data)
             self._ajustar_banco_dynamic(conn, banco_nome, -float(valor), data)
 
+            # (3) Log em movimentacoes_bancarias
             obs = f"Saída {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
@@ -172,10 +197,24 @@ class LedgerService:
             """, (data, banco_nome, float(valor), obs, id_saida, trans_uid))
             id_mov = int(cur.lastrowid)
 
+            # (4) Se houver vínculo: registra PAGAMENTO na tabela central
+            if vinculo_pagamento:
+                self.cap_repo.registrar_pagamento(
+                    conn,
+                    obrigacao_id = int(vinculo_pagamento["obrigacao_id"]),
+                    tipo_obrigacao = str(vinculo_pagamento["tipo_obrigacao"]),
+                    valor_pago = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor))),
+                    data_evento = data,
+                    forma_pagamento = forma_u,
+                    origem = banco_nome,
+                    ledger_id = id_saida,  # referenciando a linha de 'saida'
+                    usuario = usuario
+                )
+
             conn.commit()
             return (id_saida, id_mov)
 
-    # ---------- CRÉDITO ----------
+    # ---------- CRÉDITO (programado em fatura) ----------
     def registrar_saida_credito(
         self,
         *,
@@ -191,6 +230,10 @@ class LedgerService:
         vencimento: int,           # dia do mês
         trans_uid: Optional[str] = None
     ) -> Tuple[List[int], int]:
+        """
+        Agora cria LANCAMENTOS em contas_a_pagar_mov (um por parcela) com tipo_obrigacao='FATURA_CARTAO'.
+        Mantém o log em movimentacoes_bancarias (programação), sem afetar saldos agora.
+        """
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
         if int(parcelas) < 1:
@@ -211,33 +254,49 @@ class LedgerService:
         compra = pd.to_datetime(data_compra)
         base = (compra + pd.DateOffset(months=1)) if compra.day > int(fechamento) else compra
         valor_parc = round(float(valor) / int(parcelas), 2)
+        ajuste = round(float(valor) - valor_parc * int(parcelas), 2)
 
-        ids: List[int] = []
+        ids_mov_cap: List[int] = []
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
+
+            # Gerar um bloco de obrigacao_id exclusivo para as parcelas
+            base_obrig_id = self.cap_repo.proximo_obrigacao_id(conn)
+
             for p in range(1, int(parcelas) + 1):
                 vcto = base.replace(day=int(vencimento)) + pd.DateOffset(months=p-1)
-                cur.execute("""
-                    INSERT INTO fatura_cartao
-                        (data, vencimento, cartao, parcela, total_parcelas, valor,
-                         categoria, sub_categoria, descricao, usuario)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (str(compra.date()), str(vcto.date()), cartao_nome, p, int(parcelas),
-                      valor_parc, categoria, sub_categoria, descricao, usuario))
-                ids.append(int(cur.lastrowid))
+                vparc = valor_parc + (ajuste if p == int(parcelas) else 0.0)
 
+                obrigacao_id = base_obrig_id + (p - 1)  # uma obrigação POR PARCELA
+                lanc_id = self.cap_repo.registrar_lancamento(
+                    conn,
+                    obrigacao_id=obrigacao_id,
+                    tipo_obrigacao="FATURA_CARTAO",
+                    valor_total=float(vparc),
+                    data_evento=str(compra.date()),
+                    vencimento=str(vcto.date()),
+                    descricao=descricao or f"{cartao_nome} {p}/{int(parcelas)} - {categoria}/{sub_categoria}",
+                    credor=cartao_nome,
+                    competencia=str(vcto.date())[:7],  # 'YYYY-MM'
+                    parcela_num=p,
+                    parcelas_total=int(parcelas),
+                    usuario=usuario
+                )
+                ids_mov_cap.append(int(lanc_id))
+
+            # Log único (programação) em movimentacoes_bancarias (sem mexer em saldo)
             obs = f"Despesa CRÉDITO {cartao_nome} {parcelas}x - {categoria}/{sub_categoria}"
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, ?, 'saida', ?, 'saidas_credito_programada', ?, 'fatura_cartao', ?, ?)
-            """, (str(compra.date()), cartao_nome, float(valor), obs, ids[0] if ids else None, trans_uid))
+                VALUES (?, ?, 'saida', ?, 'saidas_credito_programada', ?, 'contas_a_pagar_mov', ?, ?)
+            """, (str(compra.date()), cartao_nome, float(valor), obs, ids_mov_cap[0] if ids_mov_cap else None, trans_uid))
             id_mov = int(cur.lastrowid)
 
             conn.commit()
-            return (ids, id_mov)
+            return (ids_mov_cap, id_mov)
 
-    # ---------- BOLETO ----------
+    # ---------- BOLETO (programado) ----------
     def registrar_saida_boleto(
         self,
         *,
@@ -253,6 +312,10 @@ class LedgerService:
         documento: Optional[str],
         trans_uid: Optional[str] = None
     ) -> Tuple[List[int], int]:
+        """
+        Agora cria LANCAMENTOS em contas_a_pagar_mov (um por parcela) com tipo_obrigacao='BOLETO'.
+        Mantém o log em movimentacoes_bancarias (programação), sem afetar saldos agora.
+        """
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
         if int(parcelas) < 1:
@@ -274,46 +337,42 @@ class LedgerService:
         compra = pd.to_datetime(data_compra)
         venc1  = pd.to_datetime(vencimento_primeira)
         valor_parc = round(float(valor) / int(parcelas), 2)
-        total_calc = round(valor_parc * int(parcelas), 2)
-        ajuste = round(float(valor) - total_calc, 2)
+        ajuste = round(float(valor) - valor_parc * int(parcelas), 2)
 
-        ids: List[int] = []
+        ids_mov_cap: List[int] = []
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
-            # Detecta esquema legado com coluna 'data' (NOT NULL)
-            cols_cap = [r[1] for r in cur.execute("PRAGMA table_info(contas_a_pagar)").fetchall()]
-            has_legacy_data = "data" in cols_cap
+
+            base_obrig_id = self.cap_repo.proximo_obrigacao_id(conn)
 
             for p in range(1, int(parcelas) + 1):
                 vcto = (venc1 + pd.DateOffset(months=p-1)).date()
                 vparc = valor_parc + (ajuste if p == int(parcelas) else 0.0)
 
-                if has_legacy_data:
-                    cur.execute("""
-                        INSERT INTO contas_a_pagar
-                            (data, data_lanc, vencimento, fornecedor, documento,
-                             parcela, total_parcelas, valor, categoria, sub_categoria, descricao, usuario, pago)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                    """, (str(compra.date()), str(compra.date()), str(vcto), fornecedor, documento,
-                          p, int(parcelas), float(vparc), categoria, sub_categoria, descricao, usuario))
-                else:
-                    cur.execute("""
-                        INSERT INTO contas_a_pagar
-                            (data_lanc, vencimento, fornecedor, documento,
-                             parcela, total_parcelas, valor, categoria, sub_categoria, descricao, usuario, pago)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                    """, (str(compra.date()), str(vcto), fornecedor, documento,
-                          p, int(parcelas), float(vparc), categoria, sub_categoria, descricao, usuario))
-
-                ids.append(int(cur.lastrowid))
+                obrigacao_id = base_obrig_id + (p - 1)  # uma obrigação POR PARCELA
+                lanc_id = self.cap_repo.registrar_lancamento(
+                    conn,
+                    obrigacao_id=obrigacao_id,
+                    tipo_obrigacao="BOLETO",
+                    valor_total=float(vparc),
+                    data_evento=str(compra.date()),
+                    vencimento=str(vcto),
+                    descricao=descricao or f"{fornecedor or 'Fornecedor'} {p}/{int(parcelas)} - {categoria}/{sub_categoria}",
+                    credor=fornecedor,
+                    competencia=str(vcto)[:7],  # 'YYYY-MM'
+                    parcela_num=p,
+                    parcelas_total=int(parcelas),
+                    usuario=usuario
+                )
+                ids_mov_cap.append(int(lanc_id))
 
             obs = f"Boleto {parcelas}x - {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, 'Boleto', 'saida', ?, 'saidas_boleto_programada', ?, 'contas_a_pagar', ?, ?)
-            """, (str(compra.date()), float(valor), obs, ids[0] if ids else None, trans_uid))
+                VALUES (?, 'Boleto', 'saida', ?, 'saidas_boleto_programada', ?, 'contas_a_pagar_mov', ?, ?)
+            """, (str(compra.date()), float(valor), obs, ids_mov_cap[0] if ids_mov_cap else None, trans_uid))
             id_mov = int(cur.lastrowid)
 
             conn.commit()
-            return (ids, id_mov)
+            return (ids_mov_cap, id_mov)
