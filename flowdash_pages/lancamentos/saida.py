@@ -1,19 +1,124 @@
 import streamlit as st
-import pandas as pd  # <— novo
+import pandas as pd
 from datetime import date
+from typing import Optional, List
+
 from services.ledger import LedgerService
 from repository.cartoes_repository import CartoesRepository
 from repository.categorias_repository import CategoriasRepository
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
-
 from shared.db import get_conn
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+
+# ======================================================================================
+# Constantes
+# ======================================================================================
 
 FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
 ORIGENS_DINHEIRO = ["Caixa", "Caixa 2"]
 
+# ======================================================================================
+# Helpers gerais
+# ======================================================================================
+
+def _distinct_lower_trim(series: pd.Series) -> list[str]:
+    if series is None or series.empty:
+        return []
+    df = pd.DataFrame({"orig": series.fillna("").astype(str).str.strip()})
+    df["key"] = df["orig"].str.lower().str.strip()
+    df = df[df["key"] != ""].drop_duplicates("key", keep="first")
+    return df["orig"].sort_values().tolist()
+
+
+def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> List[str]:
+    """
+    Retorna destinos para Categoria=Pagamentos, filtrando apenas títulos EM ABERTO.
+      - Fatura Cartão de Crédito: cartões com faturas em aberto (FATURA_CARTAO).
+      - Boletos: credores com boletos em aberto (exclui cartões e empréstimos).
+      - Empréstimos e Financiamentos: como antes.
+    """
+    with get_conn(caminho_banco) as conn:
+        if tipo == "Fatura Cartão de Crédito":
+            df = pd.read_sql("""
+                SELECT DISTINCT cc.nome AS rotulo
+                  FROM cartoes_credito cc
+                  JOIN contas_a_pagar_mov cam
+                    ON LOWER(TRIM(cam.credor)) = LOWER(TRIM(cc.nome))
+                 WHERE (cam.tipo_obrigacao = 'FATURA_CARTAO' OR cam.tipo_origem = 'FATURA_CARTAO')
+                   AND COALESCE(cam.status, 'Em aberto') = 'Em aberto'
+                 ORDER BY rotulo
+            """, conn)
+            return df["rotulo"].tolist() if not df.empty else []
+
+        elif tipo == "Empréstimos e Financiamentos":
+            df_emp = pd.read_sql("""
+                SELECT DISTINCT
+                    TRIM(
+                        COALESCE(
+                            NULLIF(TRIM(banco),''),
+                            NULLIF(TRIM(descricao),''),
+                            NULLIF(TRIM(tipo),'')
+                        )
+                    ) AS rotulo
+                FROM emprestimos_financiamentos
+            """, conn)
+            df_emp = df_emp.dropna()
+            df_emp = df_emp[df_emp["rotulo"] != ""]
+            return _distinct_lower_trim(df_emp["rotulo"]) if not df_emp.empty else []
+
+        elif tipo == "Boletos":
+            # 1) nomes de cartões (para excluir da lista de boletos)
+            df_cart = pd.read_sql("""
+                SELECT DISTINCT TRIM(nome) AS nome
+                  FROM cartoes_credito
+                 WHERE nome IS NOT NULL AND TRIM(nome) <> ''
+            """, conn)
+            cart_set = set(x.strip().lower() for x in (df_cart["nome"].dropna().tolist() if not df_cart.empty else []))
+
+            # 2) rótulos de empréstimos (para excluir da lista de boletos)
+            df_emp = pd.read_sql("""
+                SELECT DISTINCT TRIM(
+                    COALESCE(
+                        NULLIF(TRIM(banco),''),
+                        NULLIF(TRIM(descricao),''),
+                        NULLIF(TRIM(tipo),'')
+                    )
+                ) AS rotulo
+                  FROM emprestimos_financiamentos
+            """, conn)
+            emp_set = set(x.strip().lower() for x in (df_emp["rotulo"].dropna().tolist() if not df_emp.empty else []))
+
+            # 3) credores que possuem títulos EM ABERTO em contas_a_pagar_mov
+            df_cred = pd.read_sql("""
+                SELECT DISTINCT TRIM(credor) AS credor
+                  FROM contas_a_pagar_mov
+                 WHERE credor IS NOT NULL AND TRIM(credor) <> ''
+                   AND COALESCE(status, 'Em aberto') = 'Em aberto'
+                 ORDER BY credor
+            """, conn)
+
+            def eh_boleto_nome(nm: str) -> bool:
+                lx = (nm or "").strip().lower()
+                return bool(lx) and (lx not in cart_set) and (lx not in emp_set)
+
+            candidatos = [c for c in (df_cred["credor"].dropna().tolist() if not df_cred.empty else []) if eh_boleto_nome(c)]
+            if not candidatos:
+                return []
+            df = pd.DataFrame({"rotulo": candidatos})
+            df["key"] = df["rotulo"].str.lower().str.strip()
+            df = df[df["key"] != ""].drop_duplicates("key", keep="first")
+            return df["rotulo"].sort_values().tolist()
+
+    return []
+
+
+# ======================================================================================
+# Página principal
+# ======================================================================================
+
 def render_saida(caminho_banco: str, data_lanc: date):
     with st.container():
+        # Toggle do formulário
         if st.button("🔴 Saída", use_container_width=True, key="btn_saida_toggle"):
             st.session_state.form_saida = not st.session_state.get("form_saida", False)
 
@@ -22,16 +127,18 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
         st.markdown("#### 📤 Lançar Saída")
 
+        # Contexto do usuário
         usuario = st.session_state.get("usuario_logado", {"nome": "Sistema"})
         usuario_nome = usuario.get("nome", "Sistema")
 
+        # Serviços / repos
         ledger = LedgerService(caminho_banco)
         bancos_repo = BancoRepository(caminho_banco)
         cartoes_repo = CartoesRepository(caminho_banco)
         cats_repo = CategoriasRepository(caminho_banco)
-        cap_repo = ContasAPagarMovRepository(caminho_banco)
+        cap_repo = ContasAPagarMovRepository(caminho_banco)  # mantido para futuras integrações
 
-        # Apoio
+        # Dados para selects
         df_bancos = bancos_repo.carregar_bancos()
         nomes_bancos = df_bancos["nome"].tolist() if not df_bancos.empty else []
         nomes_cartoes = cartoes_repo.listar_nomes()
@@ -42,27 +149,51 @@ def render_saida(caminho_banco: str, data_lanc: date):
         valor_saida = st.number_input("Valor da Saída", min_value=0.0, step=0.01, format="%.2f", key="valor_saida")
         forma_pagamento = st.selectbox("Forma de Pagamento", FORMAS, key="forma_pagamento_saida")
 
-        # -------- Categoria/Subcategoria --------
+        # ===================== CATEGORIA / SUBCATEGORIA / PAGAMENTOS =====================
         df_cat = cats_repo.listar_categorias()
         if not df_cat.empty:
             cat_nome = st.selectbox("Categoria", df_cat["nome"].tolist(), key="categoria_saida")
             cat_id = int(df_cat[df_cat["nome"] == cat_nome].iloc[0]["id"])
-            df_sub = cats_repo.listar_subcategorias(cat_id)
-            if not df_sub.empty:
-                subcat_nome = st.selectbox("Subcategoria", df_sub["nome"].tolist(), key="subcategoria_saida")
-            else:
-                subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
         else:
             st.info("Dica: cadastre categorias em **Cadastro → 📂 Cadastro de Saídas**.")
             cat_nome = st.text_input("Categoria (digite)", key="categoria_saida_text")
-            subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
+            cat_id = None
 
-        # -------- Campos condicionais à forma --------
+        # flag case-insensitive para "Pagamentos"
+        is_pagamentos = (cat_nome or "").strip().lower() == "pagamentos"
+
+        subcat_nome = None
+        tipo_pagamento_sel: Optional[str] = None
+        destino_pagamento_sel: Optional[str] = None
+
+        if is_pagamentos:
+            tipo_pagamento_sel = st.selectbox(
+                "Tipo de Pagamento",
+                ["Fatura Cartão de Crédito", "Empréstimos e Financiamentos", "Boletos"],
+                key="tipo_pagamento_pagamentos"
+            )
+            destinos = _opcoes_pagamentos(caminho_banco, tipo_pagamento_sel)
+            destino_pagamento_sel = (
+                st.selectbox("Destino", destinos, key="destino_pagamentos")
+                if destinos else
+                st.text_input("Destino (digite)", key="destino_pagamentos_text")
+            )
+        else:
+            if cat_id:
+                df_sub = cats_repo.listar_subcategorias(cat_id)
+                if not df_sub.empty:
+                    subcat_nome = st.selectbox("Subcategoria", df_sub["nome"].tolist(), key="subcategoria_saida")
+                else:
+                    subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
+            else:
+                subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
+
+        # ===================== CAMPOS CONDICIONAIS À FORMA =====================
         parcelas = 1
         cartao_escolhido = ""
         banco_escolhido = ""
         origem_dinheiro = ""
-        venc_1 = None
+        venc_1: Optional[date] = None
         fornecedor = ""
         documento = ""
 
@@ -94,73 +225,15 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
         descricao = st.text_input("Descrição (opcional)", key="descricao_saida")
 
-        # ===================== VINCULAR (AGORA EMBAIXO) =====================
-        tipo_obrigacao_escolhido = None
-        obrigacao_id_escolhido = None
-        saldo_obrigacao = None
+        # Monta descrição final com meta de Pagamentos
+        meta_tag = ""
+        if is_pagamentos:
+            tipo_txt = tipo_pagamento_sel or "-"
+            dest_txt = (destino_pagamento_sel or "-").strip()
+            meta_tag = f" [PAGAMENTOS: tipo={tipo_txt}; destino={dest_txt}]"
+        descricao_final = (descricao or "").strip() + meta_tag
 
-        pode_vincular = forma_pagamento in ["DINHEIRO", "PIX", "DÉBITO"]  # pagar obrigações
-        if pode_vincular:
-            st.write("**Vincular pagamento a uma obrigação (boleto/fatura/empréstimo)?**")
-            vincular = st.checkbox("Vincular a BOLETO / FATURA_CARTAO / EMPRESTIMO", key="saida_vincular")
-
-            if vincular:
-                tipo_label = st.selectbox(
-                    "Tipo de obrigação",
-                    ["Fatura Cartão", "Empréstimo", "Boleto"],
-                    key="saida_tipo_obrig_label"
-                )
-                tipo_map = {"Fatura Cartão": "FATURA_CARTAO", "Empréstimo": "EMPRESTIMO", "Boleto": "BOLETO"}
-                tipo_obrigacao_escolhido = tipo_map[tipo_label]
-
-                # Carrega obrigações em aberto desse tipo
-                with get_conn(caminho_banco) as conn:
-                    df_aberto = cap_repo.listar_em_aberto(conn, tipo_obrigacao_escolhido)
-
-                if df_aberto.empty:
-                    st.info("Nenhuma obrigação em aberto para esse tipo.")
-                else:
-                    # 1) Escolher pelo CREDOR (cartão/fornecedor/contrato) a partir da coluna 'credor'
-                    op_credor = sorted(
-                        [(c if pd.notna(c) and c else "(Sem credor)") for c in df_aberto["credor"].unique().tolist()]
-                    )
-                    credor_sel = st.selectbox("Escolha pelo nome (coluna 'credor')", op_credor, key="saida_credor")
-
-                    df_f = df_aberto.copy()
-                    df_f["credor_fix"] = df_f["credor"].fillna("(Sem credor)").replace("", "(Sem credor)")
-                    df_f = df_f[df_f["credor_fix"] == credor_sel]
-
-                    # 2) Para FATURA_CARTAO, pedir também o Mês (competência)
-                    if tipo_obrigacao_escolhido == "FATURA_CARTAO":
-                        meses = sorted([m for m in df_f["competencia"].dropna().unique().tolist() if m])
-                        mes_atual = date.today().strftime("%Y-%m")
-                        idx_default = meses.index(mes_atual) if mes_atual in meses else 0 if meses else 0
-                        comp_sel = st.selectbox("Mês (competência)", meses, index=idx_default, key="saida_competencia")
-                        df_f = df_f[df_f["competencia"] == comp_sel]
-
-                    # 3) Escolher a obrigação específica
-                    df_f = df_f.sort_values(by=["vencimento", "obrigacao_id"], na_position="last")
-                    opcoes = []
-                    for _, r in df_f.iterrows():
-                        ven = (r.get("vencimento") or "")[:10]
-                        desc = r.get("descricao") or credor_sel
-                        saldo = float(r.get("saldo_aberto") or 0)
-                        pct = float(r.get("perc_quitado") or 0)
-                        label = f"[{int(r['obrigacao_id'])}] {desc}  |  venc {ven}  |  saldo R$ {saldo:,.2f}  |  {pct:.1f}%"
-                        opcoes.append((int(r["obrigacao_id"]), label, saldo))
-
-                    if opcoes:
-                        labels = [o[1] for o in opcoes]
-                        escolha = st.selectbox("Escolha a obrigação", labels, key="saida_obrig_label")
-                        if escolha:
-                            idx = labels.index(escolha)
-                            obrigacao_id_escolhido, _, saldo_obrigacao = opcoes[idx]
-                            # auto-preencher o valor quando a obrigação muda
-                            if st.session_state.get("valor_saida_autofill_id") != obrigacao_id_escolhido:
-                                st.session_state["valor_saida"] = float(saldo_obrigacao)
-                                st.session_state["valor_saida_autofill_id"] = obrigacao_id_escolhido
-
-        # -------- Resumo visual --------
+        # ===================== RESUMO =====================
         data_saida_str = data_lanc.strftime("%d/%m/%Y")
         linhas_md = [
             "**Confirme os dados da saída**",
@@ -168,11 +241,10 @@ def render_saida(caminho_banco: str, data_lanc: date):
             f"- **Valor:** R$ {valor_saida:.2f}",
             f"- **Forma de pagamento:** {forma_pagamento}",
             f"- **Categoria:** {cat_nome or '—'}",
-            f"- **Subcategoria:** {subcat_nome or '—'}",
-            f"- **Descrição:** {descricao or 'N/A'}",
+            (f"- **Subcategoria:** {subcat_nome or '—'}") if not is_pagamentos else (f"- **Tipo Pagamento:** {tipo_pagamento_sel or '—'}"),
+            (f"- **Destino:** {destino_pagamento_sel or '—'}") if is_pagamentos else "",
+            f"- **Descrição:** {descricao_final or 'N/A'}",
         ]
-        if pode_vincular and st.session_state.get("saida_vincular") and obrigacao_id_escolhido:
-            linhas_md.append(f"- **Vínculo:** {tipo_obrigacao_escolhido} #{obrigacao_id_escolhido} (saldo R$ {saldo_obrigacao:,.2f})")
         if forma_pagamento == "CRÉDITO":
             linhas_md += [f"- **Parcelas:** {parcelas}x", f"- **Cartão de Crédito:** {cartao_escolhido or '—'}"]
         elif forma_pagamento == "DINHEIRO":
@@ -186,12 +258,13 @@ def render_saida(caminho_banco: str, data_lanc: date):
                 f"- **Fornecedor:** {fornecedor or '—'}",
                 f"- **Documento:** {documento or '—'}",
             ]
-        st.info("\n".join(linhas_md))
+        st.info("\n".join([l for l in linhas_md if l != ""]))
 
         confirmar = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
 
-        # -------- Salvar --------
+        # ===================== SALVAR =====================
         if st.button("💾 Salvar Saída", use_container_width=True, key="btn_salvar_saida"):
+            # Validações gerais
             if valor_saida <= 0:
                 st.warning("⚠️ O valor deve ser maior que zero.")
                 return
@@ -210,31 +283,27 @@ def render_saida(caminho_banco: str, data_lanc: date):
             if forma_pagamento == "BOLETO" and not venc_1:
                 st.warning("Informe o vencimento da 1ª parcela.")
                 return
-            if pode_vincular and st.session_state.get("saida_vincular") and not obrigacao_id_escolhido:
-                st.warning("Selecione a obrigação a vincular.")
-                return
+
+            # Validação específica para a categoria Pagamentos
+            if is_pagamentos:
+                if not tipo_pagamento_sel:
+                    st.warning("Selecione o tipo de pagamento (Fatura, Empréstimos ou Boletos).")
+                    return
+                if not destino_pagamento_sel or not str(destino_pagamento_sel).strip():
+                    st.warning("Selecione o destino correspondente ao tipo escolhido.")
+                    return
 
             categoria = (cat_nome or "").strip()
             sub_categoria = (subcat_nome or "").strip()
             data_str = str(data_lanc)
 
-            # Validação de saldo quando estiver vinculando
-            if pode_vincular and st.session_state.get("saida_vincular") and obrigacao_id_escolhido:
-                with get_conn(caminho_banco) as conn:
-                    saldo = cap_repo.obter_saldo_obrigacao(conn, obrigacao_id_escolhido)
-                if float(valor_saida) > max(0.0, float(saldo)):
-                    st.warning(f"⚠️ Pagamento (R$ {valor_saida:.2f}) excede o saldo (R$ {float(saldo):.2f}).")
-                    return
+            # Args extras para o Ledger quando Categoria = Pagamentos
+            extra_args = {}
+            if is_pagamentos:
+                extra_args["pagamento_tipo"] = tipo_pagamento_sel
+                extra_args["pagamento_destino"] = destino_pagamento_sel
 
             try:
-                vinculo = None
-                if pode_vincular and st.session_state.get("saida_vincular") and obrigacao_id_escolhido:
-                    vinculo = {
-                        "obrigacao_id": int(obrigacao_id_escolhido),
-                        "tipo_obrigacao": str(tipo_obrigacao_escolhido),
-                        "valor_pagar": float(valor_saida),
-                    }
-
                 if forma_pagamento == "DINHEIRO":
                     id_saida, id_mov = ledger.registrar_saida_dinheiro(
                         data=data_str,
@@ -242,9 +311,9 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         origem_dinheiro=origem_dinheiro,
                         categoria=categoria,
                         sub_categoria=sub_categoria,
-                        descricao=descricao,
+                        descricao=descricao_final,
                         usuario=usuario_nome,
-                        vinculo_pagamento=vinculo,
+                        **extra_args
                     )
                     st.session_state["msg_ok"] = (
                         "⚠️ Transação já registrada (idempotência)." if id_saida == -1
@@ -258,10 +327,10 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         banco_nome=banco_escolhido,
                         forma=forma_pagamento,
                         categoria=categoria,
-                        sub_categoria=subcategoria if (subcategoria := sub_categoria) else sub_categoria,
-                        descricao=descricao,
+                        sub_categoria=sub_categoria,
+                        descricao=descricao_final,
                         usuario=usuario_nome,
-                        vinculo_pagamento=vinculo,
+                        **extra_args
                     )
                     st.session_state["msg_ok"] = (
                         "⚠️ Transação já registrada (idempotência)." if id_saida == -1
@@ -281,10 +350,10 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         cartao_nome=cartao_escolhido,
                         categoria=categoria,
                         sub_categoria=sub_categoria,
-                        descricao=descricao,
+                        descricao=descricao_final,
                         usuario=usuario_nome,
                         fechamento=int(fechamento),
-                        vencimento=int(vencimento),
+                        vencimento=int(vencimento)
                     )
                     st.session_state["msg_ok"] = (
                         "⚠️ Transação já registrada (idempotência)." if not ids_fatura
@@ -299,16 +368,21 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         vencimento_primeira=str(venc_1),
                         categoria=categoria,
                         sub_categoria=sub_categoria,
-                        descricao=descricao,
+                        descricao=descricao_final,
                         usuario=usuario_nome,
                         fornecedor=fornecedor or None,
-                        documento=documento or None,
+                        documento=documento or None
                     )
                     st.session_state["msg_ok"] = (
                         "⚠️ Transação já registrada (idempotência)." if not ids_cap
                         else f"✅ Boleto programado! Parcelas criadas: {len(ids_cap)} | Log: {id_mov}"
                     )
 
+                # Feedback de classificação quando categoria = Pagamentos
+                if is_pagamentos:
+                    st.info(f"Destino classificado: {tipo_pagamento_sel} → {destino_pagamento_sel}")
+
+                # Fecha o formulário e recarrega
                 st.session_state.form_saida = False
                 st.rerun()
 
