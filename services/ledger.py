@@ -1,7 +1,8 @@
 import pandas as pd
 import sqlite3
+import calendar
 from typing import Optional, Tuple, List, Dict
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from shared.db import get_conn
 from shared.ids import (
@@ -13,24 +14,27 @@ from shared.ids import (
 )
 from repository.movimentacoes_repository import MovimentacoesRepository
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+from repository.cartoes_repository import CartoesRepository
 
 
 class LedgerService:
     """
-    Serviço para registrar saídas com idempotência:
+    Servico para registrar saidas com idempotencia:
       - DINHEIRO  -> ajusta saldos_caixas e loga movimentacoes_bancarias
-      - PIX/DÉBITO-> ajusta saldos_bancos (coluna dinâmica) e loga movimentacoes_bancarias
-      - CRÉDITO   -> cria LANCAMENTOS em contas_a_pagar_mov (faturas futuras), loga movimentações (programadas)
-      - BOLETO    -> cria LANCAMENTOS em contas_a_pagar_mov (parcelas futuras), loga movimentações (programadas)
-      - Classificação opcional de títulos em contas_a_pagar_mov com base em Pagamentos (tipo + destino)
-      - Auto-baixa de FATURA_CARTAO e BOLETO quando Categoria=Pagamentos (atualiza status)
+      - PIX/DEBITO-> ajusta saldos_bancos (coluna dinamica) e loga movimentacoes_bancarias
+      - CREDITO   -> agrega LANCAMENTOS por fatura (cartao+competencia) em contas_a_pagar_mov e loga movimentacoes (programadas)
+      - BOLETO    -> cria LANCAMENTOS em contas_a_pagar_mov (parcelas futuras), loga movimentacoes (programadas)
+      - Classificacao de titulos em contas_a_pagar_mov com base em Pagamentos (tipo + destino)
+      - Auto-baixa de FATURA_CARTAO e BOLETO (atualiza status)
     """
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.mov_repo = MovimentacoesRepository(db_path)
         self.cap_repo = ContasAPagarMovRepository(db_path)
+        self.cartoes_repo = CartoesRepository(db_path)
 
-    # ---------- infra ----------
+    # ================= infra =================
+
     def _garantir_linha_saldos_caixas(self, conn, data: str):
         cur = conn.execute("SELECT 1 FROM saldos_caixas WHERE data = ? LIMIT 1", (data,))
         if not cur.fetchone():
@@ -63,7 +67,117 @@ class LedgerService:
                          31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
         return date(y, m, d)
 
-    # ---------- classificar títulos por destino ----------
+    # ============== helpers CAPM / status ==============
+
+    def _open_predicate_capm(self) -> str:
+        return "COALESCE(status, 'Em aberto') = 'Em aberto'"
+
+    def _expr_valor_documento(self, conn) -> str:
+        return "COALESCE(valor_evento, 0)"
+
+    def _expr_valor_pago(self, conn) -> str:
+        return "COALESCE(valor_evento, 0)"
+
+    def _total_pago_acumulado(self, conn, obrigacao_id: int) -> float:
+        cur = conn.cursor()
+        soma = cur.execute("""
+            SELECT COALESCE(SUM(
+                CASE
+                    WHEN UPPER(COALESCE(categoria_evento,'')) LIKE 'PAGAMENTO%' THEN -valor_evento
+                    ELSE 0
+                END
+            ), 0)
+            FROM contas_a_pagar_mov
+            WHERE obrigacao_id = ?
+        """, (int(obrigacao_id),)).fetchone()[0]
+        return float(soma or 0.0)
+
+    def _atualizar_status_por_id(self, conn, row_id: int, obrigacao_id: int, valor_doc: float) -> None:
+        total_pago = self._total_pago_acumulado(conn, obrigacao_id)
+        eps = 0.005
+        if total_pago >= float(valor_doc) - eps:
+            novo = "Quitado"
+        elif total_pago > 0:
+            novo = "Parcial"
+        else:
+            novo = "Em aberto"
+        conn.execute("UPDATE contas_a_pagar_mov SET status = ? WHERE id = ?", (novo, int(row_id)))
+
+    def _atualizar_status_por_obrigacao(self, conn, obrigacao_id: int) -> None:
+        total_pago = self._total_pago_acumulado(conn, int(obrigacao_id))
+        eps = 0.005
+        cur = conn.cursor()
+        for row_id, valor_doc in cur.execute("""
+            SELECT id, COALESCE(valor_evento,0.0) AS valor_doc
+              FROM contas_a_pagar_mov
+             WHERE obrigacao_id = ?
+               AND categoria_evento = 'LANCAMENTO'
+        """, (int(obrigacao_id),)):
+            valor_doc = float(valor_doc)
+            if total_pago >= valor_doc - eps:
+                novo = "Quitado"
+            elif total_pago > 0:
+                novo = "Parcial"
+            else:
+                novo = "Em aberto"
+            cur.execute("UPDATE contas_a_pagar_mov SET status = ? WHERE id = ?", (novo, int(row_id)))
+
+    # ============== pagamento direto por OBRIGACAO (fatura) ==============
+
+    def _pagar_fatura_por_obrigacao(self, conn, *, obrigacao_id: int, valor: float,
+                                    data_evento: str, forma_pagamento: str,
+                                    origem: str, ledger_id: int, usuario: str) -> float:
+        """
+        Faz pagamento direto em uma fatura (obrigacao_id do LANCAMENTO de FATURA_CARTAO).
+        - Calcula 'falta' = valor_doc - pago_acumulado.
+        - Insere PAGAMENTO com min(valor, falta).
+        - Atualiza status da obrigação.
+        - Retorna 'sobra' (valor - pagar), se houver.
+        """
+        cur = conn.cursor()
+        row = cur.execute("""
+            SELECT id, COALESCE(valor_evento,0) AS valor_doc
+              FROM contas_a_pagar_mov
+             WHERE obrigacao_id = ?
+               AND categoria_evento = 'LANCAMENTO'
+               AND (tipo_obrigacao='FATURA_CARTAO' OR tipo_origem='FATURA_CARTAO')
+             LIMIT 1
+        """, (int(obrigacao_id),)).fetchone()
+        if not row:
+            raise ValueError(f"Fatura (obrigacao_id={obrigacao_id}) não encontrada.")
+
+        lanc_id = int(row[0])
+        valor_doc = float(row[1])
+
+        ja_pago = self._total_pago_acumulado(conn, int(obrigacao_id))
+        falta = max(0.0, round(valor_doc - ja_pago, 2))
+        if falta <= 0:
+            self._atualizar_status_por_obrigacao(conn, int(obrigacao_id))
+            return float(valor)  # tudo vira sobra
+
+        pagar = min(float(valor), falta)
+
+        # grava pagamento
+        self.cap_repo.registrar_pagamento(
+            conn,
+            obrigacao_id=int(obrigacao_id),
+            tipo_obrigacao="FATURA_CARTAO",
+            valor_pago=float(pagar),
+            data_evento=data_evento,
+            forma_pagamento=forma_pagamento,
+            origem=origem,
+            ledger_id=int(ledger_id),
+            usuario=usuario,
+        )
+
+        # atualiza status
+        self._atualizar_status_por_obrigacao(conn, int(obrigacao_id))
+
+        sobra = round(float(valor) - pagar, 2)
+        return sobra
+
+    # ============== classificacao titulos por destino ==============
+
     def _classificar_conta_a_pagar_por_destino(self, conn, pagamento_tipo: Optional[str], pagamento_destino: Optional[str]) -> int:
         if not pagamento_tipo or not pagamento_destino or not str(pagamento_destino).strip():
             return 0
@@ -71,7 +185,7 @@ class LedgerService:
         destino = str(pagamento_destino).strip()
         cur = conn.cursor()
 
-        if pagamento_tipo == "Fatura Cartão de Crédito":
+        if pagamento_tipo in ("Fatura Cartao de Credito", "Fatura Cartão de Crédito"):
             row = cur.execute("""
                 SELECT id FROM cartoes_credito
                 WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?))
@@ -101,7 +215,7 @@ class LedgerService:
             """, (destino,))
             return cur.rowcount
 
-        elif pagamento_tipo == "Empréstimos e Financiamentos":
+        elif pagamento_tipo in ("Emprestimos e Financiamentos", "Empréstimos e Financiamentos"):
             row = cur.execute("""
                 SELECT id
                   FROM emprestimos_financiamentos
@@ -127,12 +241,8 @@ class LedgerService:
 
         return 0
 
-    # ---------- helper "em aberto" ----------
-    def _open_predicate_capm(self) -> str:
-        # Trata NULL como "Em aberto" para compatibilidade retroativa
-        return "COALESCE(status, 'Em aberto') = 'Em aberto'"
+    # ============== auto-baixa (fatura/boletos) + status ==============
 
-    # ---------- auto-baixa de títulos (fatura/boletos) + status ----------
     def _auto_baixar_pagamentos(self, conn, *,
                                 pagamento_tipo: str,
                                 pagamento_destino: str,
@@ -141,60 +251,49 @@ class LedgerService:
                                 forma_pagamento: str,
                                 origem: str,
                                 ledger_id: int,
-                                usuario: str) -> float:
+                                usuario: str,
+                                competencia_pagamento: str | None = None) -> float:
         """
-        Consome 'valor_total' quitando títulos EM ABERTO (FIFO por vencimento) e atualiza status.
-        - Fatura Cartão de Crédito: tenta casar por cartao_id (se houver), senão por credor.
-        - Boletos: casa por credor.
+        Consome 'valor_total' quitando titulos EM ABERTO e atualiza status.
+        - Fatura Cartao de Credito: casa por (cartao + [competencia opcional]) -> sem FIFO quando competencia informada
+        - Boletos: casa por credor (FIFO por vencimento)
         Retorna o valor que SOBROU.
         """
         restante = float(valor_total)
         if restante <= 0 or not pagamento_tipo or not (pagamento_destino or "").strip():
             return restante
 
-        aberto_where = self._open_predicate_capm()
+        conn.row_factory = sqlite3.Row
         cur = conn.cursor()
+        expr_valor_doc = self._expr_valor_documento(conn)
 
-        if pagamento_tipo == "Fatura Cartão de Crédito":
+        aberto_where = (
+            "COALESCE(status, 'Em aberto') = 'Em aberto' "
+            "AND COALESCE(categoria_evento,'') = 'LANCAMENTO'"
+        )
+
+        if pagamento_tipo in ("Fatura Cartao de Credito", "Fatura Cartão de Crédito"):
             tipo_alvo = "FATURA_CARTAO"
-            row = cur.execute("""
-                SELECT id FROM cartoes_credito
-                WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?))
-                LIMIT 1
-            """, (pagamento_destino,)).fetchone()
-            cartao_id = int(row[0]) if row else None
+            comp_sql = " AND competencia = ? " if competencia_pagamento else ""
+            params_tail = ([competencia_pagamento] if competencia_pagamento else [])
 
-            if cartao_id is not None:
-                rows = cur.execute(f"""
-                    SELECT id, obrigacao_id,
-                           COALESCE(valor_total, valor, valor_evento, 0) AS valor_documento,
-                           COALESCE(vencimento, data_evento) AS vcto
-                      FROM contas_a_pagar_mov
-                     WHERE (tipo_obrigacao = ? OR tipo_origem = ?)
-                       AND {aberto_where}
-                       AND (
-                            cartao_id = ?
-                            OR (cartao_id IS NULL AND LOWER(TRIM(credor)) = LOWER(TRIM(?)))
-                       )
-                     ORDER BY DATE(vcto) ASC, id ASC
-                """, (tipo_alvo, tipo_alvo, cartao_id, pagamento_destino)).fetchall()
-            else:
-                rows = cur.execute(f"""
-                    SELECT id, obrigacao_id,
-                           COALESCE(valor_total, valor, valor_evento, 0) AS valor_documento,
-                           COALESCE(vencimento, data_evento) AS vcto
-                      FROM contas_a_pagar_mov
-                     WHERE (tipo_obrigacao = ? OR tipo_origem = ?)
-                       AND {aberto_where}
-                       AND LOWER(TRIM(credor)) = LOWER(TRIM(?))
-                     ORDER BY DATE(vcto) ASC, id ASC
-                """, (tipo_alvo, tipo_alvo, pagamento_destino)).fetchall()
+            rows = cur.execute(f"""
+                SELECT id, obrigacao_id,
+                       {expr_valor_doc} AS valor_documento,
+                       COALESCE(vencimento, data_evento) AS vcto
+                  FROM contas_a_pagar_mov
+                 WHERE (tipo_obrigacao = ? OR tipo_origem = ?)
+                   AND {aberto_where}
+                   AND LOWER(TRIM(credor)) = LOWER(TRIM(?))
+                   {comp_sql}
+                 ORDER BY DATE(vcto) ASC, id ASC
+            """, (tipo_alvo, tipo_alvo, pagamento_destino, *params_tail)).fetchall()
 
         elif pagamento_tipo == "Boletos":
             tipo_alvo = "BOLETO"
             rows = cur.execute(f"""
                 SELECT id, obrigacao_id,
-                       COALESCE(valor_total, valor, valor_evento, 0) AS valor_documento,
+                       {expr_valor_doc} AS valor_documento,
                        COALESCE(vencimento, data_evento) AS vcto
                   FROM contas_a_pagar_mov
                  WHERE (tipo_obrigacao = ? OR tipo_origem = ?)
@@ -204,29 +303,37 @@ class LedgerService:
             """, (tipo_alvo, tipo_alvo, pagamento_destino)).fetchall()
 
         else:
-            # extensão para empréstimos pode ser feita depois
             return restante
 
         if not rows:
-            raise ValueError(
-                f"Nenhum título EM ABERTO encontrado para tipo='{pagamento_tipo}', destino='{pagamento_destino}'. "
-                f"Verifique se há faturas/boletos em aberto e se o destino coincide."
-            )
+            if competencia_pagamento and pagamento_tipo in ("Fatura Cartao de Credito", "Fatura Cartão de Crédito"):
+                raise ValueError(
+                    f"Nenhuma fatura em aberto encontrada para '{pagamento_destino}' em {competencia_pagamento}."
+                )
+            return restante
 
-        for (row_id, obrigacao_id, valor_doc, _vcto) in rows:
+        for row in rows:
             if restante <= 0:
                 break
 
-            valor_doc = float(valor_doc or 0.0)
+            row_id = int(row["id"])
+            obrigacao_id = int(row["obrigacao_id"])
+            valor_doc = float(row["valor_documento"] or 0.0)
             if valor_doc <= 0:
                 continue
 
-            pagar = min(restante, valor_doc)
+            ja_pago = self._total_pago_acumulado(conn, obrigacao_id)
+            falta = max(0.0, round(valor_doc - ja_pago, 2))
+            if falta <= 0:
+                self._atualizar_status_por_id(conn, row_id, obrigacao_id, valor_doc)
+                continue
 
-            # 1) registra pagamento (usa regra de negócio do seu repository)
+            pagar = min(restante, falta)
+
+            # registra pagamento
             self.cap_repo.registrar_pagamento(
                 conn,
-                obrigacao_id=int(obrigacao_id),
+                obrigacao_id=obrigacao_id,
                 tipo_obrigacao=tipo_alvo,
                 valor_pago=float(pagar),
                 data_evento=data_evento,
@@ -236,19 +343,20 @@ class LedgerService:
                 usuario=usuario,
             )
 
-            # 2) marca status por ID (garantido único)
-            marcar = 'Pago' if pagar >= (valor_doc - 0.005) else 'Parcial'
-            cur.execute("""
-                UPDATE contas_a_pagar_mov
-                   SET status = ?
-                 WHERE id = ?
-            """, (marcar, int(row_id)))
+            # recalcula status
+            self._atualizar_status_por_id(conn, row_id, obrigacao_id, valor_doc)
 
+            # reduz restante
             restante = round(restante - pagar, 2)
+
+            # pagando fatura por competencia específica não cascateia
+            if competencia_pagamento:
+                break
 
         return restante
 
-    # ---------- DINHEIRO ----------
+    # =================== DINHEIRO ===================
+
     def registrar_saida_dinheiro(
         self,
         *,
@@ -262,12 +370,14 @@ class LedgerService:
         trans_uid: Optional[str] = None,
         vinculo_pagamento: Optional[Dict] = None,
         pagamento_tipo: Optional[str] = None,
-        pagamento_destino: Optional[str] = None
+        pagamento_destino: Optional[str] = None,
+        competencia_pagamento: Optional[str] = None,
+        obrigacao_id_fatura: Optional[int] = None,
     ) -> Tuple[int, int]:
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
         if origem_dinheiro not in ("Caixa", "Caixa 2"):
-            raise ValueError("Origem do dinheiro inválida (use 'Caixa' ou 'Caixa 2').")
+            raise ValueError("Origem do dinheiro invalida (use 'Caixa' ou 'Caixa 2').")
 
         categoria     = sanitize(categoria)
         sub_categoria = sanitize(sub_categoria)
@@ -284,7 +394,7 @@ class LedgerService:
             cur = conn.cursor()
             self._garantir_linha_saldos_caixas(conn, data)
 
-            # (1) INSERT saída
+            # (1) INSERT saida
             cur.execute("""
                 INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
                                    Forma_de_Pagamento, Parcelas, Valor, Usuario,
@@ -301,7 +411,7 @@ class LedgerService:
             """, (float(valor), data))
 
             # (3) Log
-            obs = f"Saída {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
+            obs = f"Saida {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
@@ -309,24 +419,50 @@ class LedgerService:
             """, (data, origem_dinheiro, float(valor), obs, id_saida, trans_uid))
             id_mov = int(cur.lastrowid)
 
-            # (4) Fluxo antigo (opcional)
+            # --- PRIORITÁRIO: pagamento direto pela fatura escolhida na UI ---
+            if obrigacao_id_fatura:
+                sobra = self._pagar_fatura_por_obrigacao(
+                    conn,
+                    obrigacao_id=int(obrigacao_id_fatura),
+                    valor=float(valor),
+                    data_evento=data,
+                    forma_pagamento="DINHEIRO",
+                    origem=origem_dinheiro,
+                    ledger_id=id_saida,
+                    usuario=usuario
+                )
+                if sobra > 0:
+                    cur.execute("""
+                        UPDATE movimentacoes_bancarias
+                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
+                         WHERE id = ?
+                    """, (float(sobra), id_mov))
+                conn.commit()
+                return (id_saida, id_mov)
+
+            # (4) Vinculo direto com um titulo (opcional)
             if vinculo_pagamento:
+                obrig_id = int(vinculo_pagamento["obrigacao_id"])
+                tipo_obrig = str(vinculo_pagamento["tipo_obrigacao"])
+                val = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor)))
+
                 self.cap_repo.registrar_pagamento(
                     conn,
-                    obrigacao_id = int(vinculo_pagamento["obrigacao_id"]),
-                    tipo_obrigacao = str(vinculo_pagamento["tipo_obrigacao"]),
-                    valor_pago = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor))),
+                    obrigacao_id = obrig_id,
+                    tipo_obrigacao = tipo_obrig,
+                    valor_pago = val,
                     data_evento = data,
                     forma_pagamento = "DINHEIRO",
                     origem = origem_dinheiro,
                     ledger_id = id_saida,
                     usuario = usuario
                 )
+                self._atualizar_status_por_obrigacao(conn, obrig_id)
 
-            # (5) Classificação e auto-baixa
+            # (5) Classificacao + Auto-baixa por destino/tipo (Fatura/Boletos)
             if pagamento_tipo and pagamento_destino:
                 self._classificar_conta_a_pagar_por_destino(conn, pagamento_tipo, pagamento_destino)
-                _ = self._auto_baixar_pagamentos(
+                restante = self._auto_baixar_pagamentos(
                     conn,
                     pagamento_tipo=pagamento_tipo,
                     pagamento_destino=pagamento_destino,
@@ -335,13 +471,21 @@ class LedgerService:
                     forma_pagamento="DINHEIRO",
                     origem=origem_dinheiro,
                     ledger_id=id_saida,
-                    usuario=usuario
+                    usuario=usuario,
+                    competencia_pagamento=competencia_pagamento
                 )
+                if restante > 0:
+                    cur.execute("""
+                        UPDATE movimentacoes_bancarias
+                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
+                         WHERE id = ?
+                    """, (float(restante), id_mov))
 
             conn.commit()
             return (id_saida, id_mov)
 
-    # ---------- PIX / DÉBITO ----------
+    # =================== PIX / DEBITO ===================
+
     def registrar_saida_bancaria(
         self,
         *,
@@ -356,13 +500,15 @@ class LedgerService:
         trans_uid: Optional[str] = None,
         vinculo_pagamento: Optional[Dict] = None,
         pagamento_tipo: Optional[str] = None,
-        pagamento_destino: Optional[str] = None
+        pagamento_destino: Optional[str] = None,
+        competencia_pagamento: Optional[str] = None,
+        obrigacao_id_fatura: Optional[int] = None,
     ) -> Tuple[int, int]:
         forma_u = sanitize(forma).upper()
         if forma_u == "DEBITO":
             forma_u = "DÉBITO"
         if forma_u not in ("PIX", "DÉBITO"):
-            raise ValueError("Forma inválida para saída bancária.")
+            raise ValueError("Forma invalida para saida bancaria.")
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
 
@@ -381,7 +527,7 @@ class LedgerService:
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
-            # (1) INSERT saída
+            # (1) INSERT saida
             cur.execute("""
                 INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
                                    Forma_de_Pagamento, Parcelas, Valor, Usuario,
@@ -395,7 +541,7 @@ class LedgerService:
             self._ajustar_banco_dynamic(conn, banco_nome, -float(valor), data)
 
             # (3) Log
-            obs = f"Saída {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
+            obs = f"Saida {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
@@ -403,24 +549,50 @@ class LedgerService:
             """, (data, banco_nome, float(valor), obs, id_saida, trans_uid))
             id_mov = int(cur.lastrowid)
 
-            # (4) Fluxo antigo (opcional)
+            # --- PRIORITÁRIO: pagamento direto pela fatura escolhida na UI ---
+            if obrigacao_id_fatura:
+                sobra = self._pagar_fatura_por_obrigacao(
+                    conn,
+                    obrigacao_id=int(obrigacao_id_fatura),
+                    valor=float(valor),
+                    data_evento=data,
+                    forma_pagamento=forma_u,
+                    origem=banco_nome,
+                    ledger_id=id_saida,
+                    usuario=usuario
+                )
+                if sobra > 0:
+                    cur.execute("""
+                        UPDATE movimentacoes_bancarias
+                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
+                         WHERE id = ?
+                    """, (float(sobra), id_mov))
+                conn.commit()
+                return (id_saida, id_mov)
+
+            # (4) Vinculo direto com um titulo (opcional)
             if vinculo_pagamento:
+                obrig_id = int(vinculo_pagamento["obrigacao_id"])
+                tipo_obrig = str(vinculo_pagamento["tipo_obrigacao"])
+                val = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor)))
+
                 self.cap_repo.registrar_pagamento(
                     conn,
-                    obrigacao_id = int(vinculo_pagamento["obrigacao_id"]),
-                    tipo_obrigacao = str(vinculo_pagamento["tipo_obrigacao"]),
-                    valor_pago = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor))),
+                    obrigacao_id = obrig_id,
+                    tipo_obrigacao = tipo_obrig,
+                    valor_pago = val,
                     data_evento = data,
                     forma_pagamento = forma_u,
                     origem = banco_nome,
                     ledger_id = id_saida,
                     usuario = usuario
                 )
+                self._atualizar_status_por_obrigacao(conn, obrig_id)
 
-            # (5) Classificação e auto-baixa
+            # (5) Classificacao + Auto-baixa por destino/tipo (Fatura/Boletos)
             if pagamento_tipo and pagamento_destino:
                 self._classificar_conta_a_pagar_por_destino(conn, pagamento_tipo, pagamento_destino)
-                _ = self._auto_baixar_pagamentos(
+                restante = self._auto_baixar_pagamentos(
                     conn,
                     pagamento_tipo=pagamento_tipo,
                     pagamento_destino=pagamento_destino,
@@ -429,13 +601,21 @@ class LedgerService:
                     forma_pagamento=forma_u,
                     origem=banco_nome,
                     ledger_id=id_saida,
-                    usuario=usuario
+                    usuario=usuario,
+                    competencia_pagamento=competencia_pagamento
                 )
+                if restante > 0:
+                    cur.execute("""
+                        UPDATE movimentacoes_bancarias
+                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
+                         WHERE id = ?
+                    """, (float(restante), id_mov))
 
             conn.commit()
             return (id_saida, id_mov)
 
-    # ---------- CRÉDITO (programado em fatura) ----------
+    # =================== CREDITO (programado em fatura) ===================
+
     def registrar_saida_credito(
         self,
         *,
@@ -447,14 +627,14 @@ class LedgerService:
         sub_categoria: Optional[str],
         descricao: Optional[str],
         usuario: str,
-        fechamento: int,
-        vencimento: int,
+        fechamento: int,   # ignorado (usamos do cartão no banco)
+        vencimento: int,   # ignorado (usamos do cartão no banco)
         trans_uid: Optional[str] = None
     ) -> Tuple[List[int], int]:
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
         if int(parcelas) < 1:
-            raise ValueError("Quantidade de parcelas inválida.")
+            raise ValueError("Quantidade de parcelas invalida.")
 
         cartao_nome   = sanitize(cartao_nome)
         categoria     = sanitize(categoria)
@@ -469,58 +649,69 @@ class LedgerService:
             return ([], -1)
 
         compra = pd.to_datetime(data_compra)
-        base = (compra + pd.DateOffset(months=1)) if compra.day > int(fechamento) else compra
-        valor_parc = round(float(valor) / int(parcelas), 2)
-        ajuste = round(float(valor) - valor_parc * int(parcelas), 2)
 
-        ids_mov_cap: List[int] = []
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
-            base_obrig_id = self.cap_repo.proximo_obrigacao_id(conn)
+            # pega config real do cartao (dia de vencimento e dias de fechamento)
+            vencimento_dia, dias_fechamento = self.cartoes_repo.obter_por_nome(cartao_nome)
+
+            # competencia base da compra (fechamento = vencimento - dias_fechamento)
+            comp_base_str = self._competencia_compra(
+                compra_dt=pd.to_datetime(compra).to_pydatetime(),
+                vencimento_dia=vencimento_dia,
+                dias_fechamento=dias_fechamento
+            )
+            comp_base = pd.to_datetime(comp_base_str + "-01")
+
+            # parcelas e ajuste
+            valor_parc = round(float(valor) / int(parcelas), 2)
+            ajuste = round(float(valor) - valor_parc * int(parcelas), 2)
+
+            lanc_ids: List[int] = []
+            total_programado = 0.0
 
             for p in range(1, int(parcelas) + 1):
-                vcto = base.replace(day=int(vencimento)) + pd.DateOffset(months=p-1)
+                comp_dt = (comp_base + pd.DateOffset(months=p-1))
+                y, m = comp_dt.year, comp_dt.month
+                last = calendar.monthrange(y, m)[1]
+                venc_d = min(int(vencimento_dia), last)
+                vcto_date = datetime(y, m, venc_d).date()
+                competencia = f"{y:04d}-{m:02d}"
+
                 vparc = valor_parc + (ajuste if p == int(parcelas) else 0.0)
 
-                obrigacao_id = base_obrig_id + (p - 1)
-                lanc_id = self.cap_repo.registrar_lancamento(
+                # agrega esta parcela NA fatura mensal (cartao + competencia)
+                lanc_id = self._add_valor_fatura(
                     conn,
-                    obrigacao_id=obrigacao_id,
-                    tipo_obrigacao="FATURA_CARTAO",
-                    valor_total=float(vparc),
+                    cartao_nome=cartao_nome,
+                    competencia=competencia,
+                    valor_add=float(vparc),
                     data_evento=str(compra.date()),
-                    vencimento=str(vcto.date()),
-                    descricao=descricao or f"{cartao_nome} {p}/{int(parcelas)} - {categoria}/{sub_categoria}",
-                    credor=cartao_nome,
-                    competencia=str(vcto.date())[:7],
-                    parcela_num=p,
-                    parcelas_total=int(parcelas),
-                    usuario=usuario
+                    vencimento=str(vcto_date),
+                    usuario=usuario,
+                    descricao=descricao or f"Fatura {cartao_nome} {competencia}",
+                    parcela_num=p,                   # <<<<< NOVO
+                    parcelas_total=int(parcelas)     # <<<<< NOVO
                 )
-                ids_mov_cap.append(int(lanc_id))
+                lanc_ids.append(int(lanc_id))
+                total_programado += float(vparc)
 
-            # marca origem/cartão + status 'Em aberto' nas novas parcelas
-            cur.execute("""
-                UPDATE contas_a_pagar_mov
-                   SET tipo_origem='FATURA_CARTAO',
-                       cartao_id = (SELECT id FROM cartoes_credito WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?)) LIMIT 1),
-                       status = COALESCE(NULLIF(status,''), 'Em aberto')
-                 WHERE obrigacao_id BETWEEN ? AND ?
-            """, (cartao_nome, base_obrig_id, base_obrig_id + int(parcelas) - 1))
-
-            obs = f"Despesa CRÉDITO {cartao_nome} {parcelas}x - {categoria}/{sub_categoria}"
+            # log da programacao de credito
+            obs = f"Despesa CREDITO {cartao_nome} {parcelas}x - {categoria}/{sub_categoria}"
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
                 VALUES (?, ?, 'saida', ?, 'saidas_credito_programada', ?, 'contas_a_pagar_mov', ?, ?)
-            """, (str(compra.date()), cartao_nome, float(valor), obs, ids_mov_cap[0] if ids_mov_cap else None, trans_uid))
+            """, (str(compra.date()), cartao_nome, float(total_programado), obs,
+                  lanc_ids[0] if lanc_ids else None, trans_uid))
             id_mov = int(cur.lastrowid)
 
             conn.commit()
-            return (ids_mov_cap, id_mov)
+            return (lanc_ids, id_mov)
 
-    # ---------- BOLETO (programado) ----------
+    # =================== BOLETO (programado) ===================
+
     def registrar_saida_boleto(
         self,
         *,
@@ -539,7 +730,7 @@ class LedgerService:
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
         if int(parcelas) < 1:
-            raise ValueError("Quantidade de parcelas inválida.")
+            raise ValueError("Quantidade de parcelas invalida.")
 
         categoria     = sanitize(categoria)
         sub_categoria = sanitize(sub_categoria)
@@ -586,7 +777,7 @@ class LedgerService:
                 )
                 ids_mov_cap.append(int(lanc_id))
 
-            # marca origem + status 'Em aberto' nas novas parcelas
+            # marca origem + status 'Em aberto'
             cur.execute("""
                 UPDATE contas_a_pagar_mov
                    SET tipo_origem='BOLETO',
@@ -606,3 +797,91 @@ class LedgerService:
 
             conn.commit()
             return (ids_mov_cap, id_mov)
+
+    # =================== fatura mensal (helper interno) ===================
+
+    def _add_valor_fatura(self, conn, *, cartao_nome: str, competencia: str,
+                          valor_add: float, data_evento: str, vencimento: str,
+                          usuario: str, descricao: str | None,
+                          parcela_num: int | None = None,
+                          parcelas_total: int | None = None) -> int:
+        """
+        Garante uma fatura mensal (um LANCAMENTO) por cartao+competencia:
+        - Se já existir, soma valor_add no mesmo LANCAMENTO (não mexe parcela_num/parcelas_total).
+        - Se não existir, cria o LANCAMENTO com valor_add e define parcela_num/parcelas_total.
+        Retorna o id do LANCAMENTO.
+        """
+        cur = conn.cursor()
+
+        row = cur.execute("""
+            SELECT id, obrigacao_id, COALESCE(valor_evento,0.0) AS valor_atual
+              FROM contas_a_pagar_mov
+             WHERE tipo_obrigacao='FATURA_CARTAO'
+               AND categoria_evento='LANCAMENTO'
+               AND LOWER(TRIM(credor)) = LOWER(TRIM(?))
+               AND competencia = ?
+             LIMIT 1
+        """, (cartao_nome, competencia)).fetchone()
+
+        if row:
+            lanc_id = int(row[0])
+            obrigacao_id = int(row[1])
+            # fatura já existente: só soma o valor; mantém n/total
+            cur.execute("""
+                UPDATE contas_a_pagar_mov
+                   SET valor_evento = COALESCE(valor_evento,0) + ?,
+                       descricao = COALESCE(descricao, ?)
+                 WHERE id = ?
+            """, (float(valor_add), descricao, lanc_id))
+        else:
+            obrigacao_id = self.cap_repo.proximo_obrigacao_id(conn)
+            lanc_id = self.cap_repo.registrar_lancamento(
+                conn,
+                obrigacao_id=obrigacao_id,
+                tipo_obrigacao="FATURA_CARTAO",
+                valor_total=float(valor_add),
+                data_evento=data_evento,
+                vencimento=vencimento,
+                descricao=descricao or f"Fatura {cartao_nome} {competencia}",
+                credor=cartao_nome,
+                competencia=competencia,
+                parcela_num=int(parcela_num) if parcela_num is not None else 1,
+                parcelas_total=int(parcelas_total) if parcelas_total is not None else 1,
+                usuario=usuario
+            )
+            cur.execute("""
+                UPDATE contas_a_pagar_mov
+                   SET tipo_origem='FATURA_CARTAO',
+                       cartao_id = (SELECT id FROM cartoes_credito WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?)) LIMIT 1),
+                       status = COALESCE(NULLIF(status,''), 'Em aberto')
+                 WHERE id = ?
+            """, (cartao_nome, lanc_id))
+
+        # Atualiza status da fatura com base no total pago atual (se já existir pagamento)
+        row2 = cur.execute("SELECT id, obrigacao_id, COALESCE(valor_evento,0) FROM contas_a_pagar_mov WHERE id=?",
+                           (lanc_id,)).fetchone()
+        valor_doc = float(row2[2])
+        self._atualizar_status_por_id(conn, lanc_id, obrigacao_id, valor_doc)
+
+        return lanc_id
+
+    # =================== regra de competência do cartão ===================
+
+    def _competencia_compra(self, compra_dt: datetime, vencimento_dia: int, dias_fechamento: int) -> str:
+        """
+        Regra: fechamento = data(vencimento) - dias_fechamento.
+        - Compra NO dia de fechamento fica no MÊS ATUAL.
+        - Compra DEPOIS do fechamento vai para o PRÓXIMO mês.
+        Retorna 'YYYY-MM'.
+        """
+        y, m = compra_dt.year, compra_dt.month
+        last = calendar.monthrange(y, m)[1]
+        venc_d = min(int(vencimento_dia), last)
+        venc_date = datetime(y, m, venc_d)
+        fechamento_date = venc_date - timedelta(days=int(dias_fechamento))
+        if compra_dt > fechamento_date:  # no fechamento fica no mês atual
+            if m == 12:
+                y += 1; m = 1
+            else:
+                m += 1
+        return f"{y:04d}-{m:02d}"
