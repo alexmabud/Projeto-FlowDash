@@ -4,7 +4,7 @@ from datetime import date
 from typing import Optional, List
 
 from services.ledger import LedgerService
-from repository.cartoes_repository import CartoesRepository
+from repository.cartoes_repository import CartoesRepository, listar_destinos_fatura_em_aberto
 from repository.categorias_repository import CategoriasRepository
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 from shared.db import get_conn
@@ -33,22 +33,13 @@ def _distinct_lower_trim(series: pd.Series) -> list[str]:
 def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> List[str]:
     """
     Retorna destinos para Categoria=Pagamentos, filtrando apenas títulos EM ABERTO.
-      - Fatura Cartão de Crédito: cartões com faturas em aberto (FATURA_CARTAO).
+      - Fatura Cartão de Crédito: (NÃO USADO AQUI — usamos listar_destinos_fatura_em_aberto)
       - Boletos: credores com boletos em aberto (exclui cartões e empréstimos).
       - Empréstimos e Financiamentos: como antes.
     """
     with get_conn(caminho_banco) as conn:
         if tipo == "Fatura Cartão de Crédito":
-            df = pd.read_sql("""
-                SELECT DISTINCT cc.nome AS rotulo
-                  FROM cartoes_credito cc
-                  JOIN contas_a_pagar_mov cam
-                    ON LOWER(TRIM(cam.credor)) = LOWER(TRIM(cc.nome))
-                 WHERE (cam.tipo_obrigacao = 'FATURA_CARTAO' OR cam.tipo_origem = 'FATURA_CARTAO')
-                   AND COALESCE(cam.status, 'Em aberto') = 'Em aberto'
-                 ORDER BY rotulo
-            """, conn)
-            return df["rotulo"].tolist() if not df.empty else []
+            return []
 
         elif tipo == "Empréstimos e Financiamentos":
             df_emp = pd.read_sql("""
@@ -165,6 +156,9 @@ def render_saida(caminho_banco: str, data_lanc: date):
         subcat_nome = None
         tipo_pagamento_sel: Optional[str] = None
         destino_pagamento_sel: Optional[str] = None
+        # >>> NOVAS VARS PARA FATURA <<<
+        competencia_fatura_sel: Optional[str] = None
+        obrigacao_id_fatura: Optional[int] = None
 
         if is_pagamentos:
             tipo_pagamento_sel = st.selectbox(
@@ -172,12 +166,28 @@ def render_saida(caminho_banco: str, data_lanc: date):
                 ["Fatura Cartão de Crédito", "Empréstimos e Financiamentos", "Boletos"],
                 key="tipo_pagamento_pagamentos"
             )
-            destinos = _opcoes_pagamentos(caminho_banco, tipo_pagamento_sel)
-            destino_pagamento_sel = (
-                st.selectbox("Destino", destinos, key="destino_pagamentos")
-                if destinos else
-                st.text_input("Destino (digite)", key="destino_pagamentos_text")
-            )
+
+            if tipo_pagamento_sel == "Fatura Cartão de Crédito":
+                # lista faturas (cartão + competência + saldo) com obrigacao_id
+                faturas = listar_destinos_fatura_em_aberto(caminho_banco)  # [{label, cartao, competencia, obrigacao_id, saldo}, ...]
+                opcoes = [f["label"] for f in faturas]
+                escolha = st.selectbox("Fatura (cartão • mês • saldo)", opcoes, key="destino_fatura_comp")
+                if escolha:
+                    f_sel = next(f for f in faturas if f["label"] == escolha)
+                    destino_pagamento_sel = f_sel["cartao"]
+                    competencia_fatura_sel = f_sel["competencia"]
+                    obrigacao_id_fatura = int(f_sel["obrigacao_id"])
+                    st.caption(f"Selecionado: {destino_pagamento_sel} — {competencia_fatura_sel} • obrigação #{obrigacao_id_fatura}")
+                    # (Opcional) auto-preencher o valor com o saldo da fatura:
+                    # st.session_state["valor_saida"] = f_sel["saldo"]
+            else:
+                # mantém lógica anterior para empréstimos/boletos
+                destinos = _opcoes_pagamentos(caminho_banco, tipo_pagamento_sel)
+                destino_pagamento_sel = (
+                    st.selectbox("Destino", destinos, key="destino_pagamentos")
+                    if destinos else
+                    st.text_input("Destino (digite)", key="destino_pagamentos_text")
+                )
         else:
             if cat_id:
                 df_sub = cats_repo.listar_subcategorias(cat_id)
@@ -289,9 +299,14 @@ def render_saida(caminho_banco: str, data_lanc: date):
                 if not tipo_pagamento_sel:
                     st.warning("Selecione o tipo de pagamento (Fatura, Empréstimos ou Boletos).")
                     return
-                if not destino_pagamento_sel or not str(destino_pagamento_sel).strip():
-                    st.warning("Selecione o destino correspondente ao tipo escolhido.")
-                    return
+                if tipo_pagamento_sel != "Fatura Cartão de Crédito":
+                    if not destino_pagamento_sel or not str(destino_pagamento_sel).strip():
+                        st.warning("Selecione o destino correspondente ao tipo escolhido.")
+                        return
+                else:
+                    if not obrigacao_id_fatura:
+                        st.warning("Selecione uma fatura em aberto (cartão • mês • saldo).")
+                        return
 
             categoria = (cat_nome or "").strip()
             sub_categoria = (subcat_nome or "").strip()
@@ -302,6 +317,11 @@ def render_saida(caminho_banco: str, data_lanc: date):
             if is_pagamentos:
                 extra_args["pagamento_tipo"] = tipo_pagamento_sel
                 extra_args["pagamento_destino"] = destino_pagamento_sel
+                # PRIORIDADE: se selecionou uma fatura específica, paga exatamente ela
+                if tipo_pagamento_sel == "Fatura Cartão de Crédito" and obrigacao_id_fatura:
+                    extra_args["obrigacao_id_fatura"] = int(obrigacao_id_fatura)
+                    if competencia_fatura_sel:
+                        extra_args["competencia_pagamento"] = competencia_fatura_sel  # opcional (descritivo/log)
 
             try:
                 if forma_pagamento == "DINHEIRO":
@@ -342,14 +362,15 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     if not fc_vc:
                         st.error("Cartão não encontrado. Cadastre em 📇 Cartão de Crédito.")
                         return
-                    fechamento, vencimento = fc_vc
+                    # CartoesRepository.obter_por_nome => (vencimento, fechamento)
+                    vencimento, fechamento = fc_vc
                     ids_fatura, id_mov = ledger.registrar_saida_credito(
                         data_compra=data_str,
                         valor=float(valor_saida),
                         parcelas=int(parcelas),
                         cartao_nome=cartao_escolhido,
                         categoria=categoria,
-                        sub_categoria=sub_categoria,
+                        sub_categoria=subcat_nome,   # <- corrigido aqui
                         descricao=descricao_final,
                         usuario=usuario_nome,
                         fechamento=int(fechamento),
@@ -380,7 +401,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
                 # Feedback de classificação quando categoria = Pagamentos
                 if is_pagamentos:
-                    st.info(f"Destino classificado: {tipo_pagamento_sel} → {destino_pagamento_sel}")
+                    st.info(f"Destino classificado: {tipo_pagamento_sel} → {destino_pagamento_sel or '—'}")
 
                 # Fecha o formulário e recarrega
                 st.session_state.form_saida = False
