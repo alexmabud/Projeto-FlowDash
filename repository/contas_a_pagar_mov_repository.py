@@ -247,3 +247,194 @@ class ContasAPagarMovRepository:
             (obrigacao_id,)
         ).fetchone()
         return float(row[0]) if row else 0.0
+
+    # ------------------ NOVOS MÉTODOS: ajustes (multa/juros/desconto) ------------------
+
+    def registrar_multa_boleto(self, conn, *, obrigacao_id: int, valor: float, data_evento: str, usuario: str, descricao: str | None = None) -> int:
+        v = float(valor)
+        if v <= 0:
+            return 0
+        self._validar_evento_basico(
+            obrigacao_id=obrigacao_id,
+            tipo_obrigacao="BOLETO",
+            categoria_evento="MULTA",
+            data_evento=data_evento,
+            valor_evento=v,
+            usuario=usuario
+        )
+        return self._inserir_evento(
+            conn,
+            obrigacao_id=obrigacao_id, tipo_obrigacao="BOLETO", categoria_evento="MULTA",
+            data_evento=data_evento, vencimento=None, valor_evento=v, descricao=descricao,
+            credor=None, competencia=None, parcela_num=None, parcelas_total=None,
+            forma_pagamento=None, origem=None, ledger_id=None, usuario=usuario
+        )
+
+    def registrar_juros_boleto(self, conn, *, obrigacao_id: int, valor: float, data_evento: str, usuario: str, descricao: str | None = None) -> int:
+        v = float(valor)
+        if v <= 0:
+            return 0
+        self._validar_evento_basico(
+            obrigacao_id=obrigacao_id,
+            tipo_obrigacao="BOLETO",
+            categoria_evento="JUROS",
+            data_evento=data_evento,
+            valor_evento=v,
+            usuario=usuario
+        )
+        return self._inserir_evento(
+            conn,
+            obrigacao_id=obrigacao_id, tipo_obrigacao="BOLETO", categoria_evento="JUROS",
+            data_evento=data_evento, vencimento=None, valor_evento=v, descricao=descricao,
+            credor=None, competencia=None, parcela_num=None, parcelas_total=None,
+            forma_pagamento=None, origem=None, ledger_id=None, usuario=usuario
+        )
+
+    def registrar_desconto_boleto(self, conn, *, obrigacao_id: int, valor: float, data_evento: str, usuario: str, descricao: str | None = None) -> int:
+        v = float(valor)
+        if v <= 0:
+            return 0
+        # desconto reduz a dívida (evento negativo)
+        self._validar_evento_basico(
+            obrigacao_id=obrigacao_id,
+            tipo_obrigacao="BOLETO",
+            categoria_evento="DESCONTO",
+            data_evento=data_evento,
+            valor_evento=-v,
+            usuario=usuario
+        )
+        return self._inserir_evento(
+            conn,
+            obrigacao_id=obrigacao_id, tipo_obrigacao="BOLETO", categoria_evento="DESCONTO",
+            data_evento=data_evento, vencimento=None, valor_evento=-v, descricao=descricao,
+            credor=None, competencia=None, parcela_num=None, parcelas_total=None,
+            forma_pagamento=None, origem=None, ledger_id=None, usuario=usuario
+        )
+
+    # ------------------ validação de pagamento vs saldo ------------------
+
+    def _validar_pagamento_nao_excede_saldo(
+        self,
+        conn: sqlite3.Connection,
+        obrigacao_id: int,
+        valor_pago: float
+    ) -> float:
+        """
+        Garante que o pagamento não exceda o saldo em aberto.
+        Retorna o saldo atual. Lança ValueError se exceder (com tolerância de centavos).
+        """
+        saldo = float(self.obter_saldo_obrigacao(conn, int(obrigacao_id)))
+        valor_pago = float(valor_pago)
+        if valor_pago <= 0:
+            raise ValueError("O valor do pagamento deve ser positivo.")
+        # Tolerância para arredondamentos
+        eps = 0.005
+        if valor_pago > saldo + eps:
+            raise ValueError(f"Pagamento (R$ {valor_pago:.2f}) maior que o saldo (R$ {saldo:.2f}).")
+        return saldo
+
+    # ------------------ pagamento de parcela: BOLETO ------------------
+
+    def registrar_pagamento_parcela_boleto(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        obrigacao_id: int,
+        valor_pago: float,
+        data_evento: str,          # 'YYYY-MM-DD'
+        forma_pagamento: str,
+        origem: str,               # 'Caixa' / 'Caixa 2' / nome do banco
+        ledger_id: int,
+        usuario: str,
+        descricao_extra: Optional[str] = None
+    ) -> int:
+        """
+        Insere um evento PAGAMENTO (valor_evento negativo) para um boleto (tipo_obrigacao='BOLETO'),
+        vinculado ao obrigacao_id informado. Valida para não exceder o saldo.
+        Retorna o ID do evento inserido.
+        """
+        # 1) valida saldo
+        self._validar_pagamento_nao_excede_saldo(conn, int(obrigacao_id), float(valor_pago))
+
+        # 2) validações básicas do evento (usa tipo BOLETO e categoria PAGAMENTO)
+        self._validar_evento_basico(
+            obrigacao_id=int(obrigacao_id),
+            tipo_obrigacao="BOLETO",
+            categoria_evento="PAGAMENTO",
+            data_evento=data_evento,
+            valor_evento=-abs(float(valor_pago)),
+            usuario=usuario,
+        )
+
+        # 3) insere evento (PAGAMENTO é negativo)
+        return self._inserir_evento(
+            conn,
+            obrigacao_id=int(obrigacao_id),
+            tipo_obrigacao="BOLETO",
+            categoria_evento="PAGAMENTO",
+            data_evento=data_evento,
+            vencimento=None,
+            valor_evento=-abs(float(valor_pago)),
+            descricao=descricao_extra,     # dica: "Parcela 2/5 — Credor X"
+            credor=None,
+            competencia=None,
+            parcela_num=None,
+            parcelas_total=None,
+            forma_pagamento=forma_pagamento,
+            origem=origem,
+            ledger_id=int(ledger_id) if ledger_id is not None else None,
+            usuario=usuario,
+        )
+
+    # ------------------ listagem detalhada de boletos (parcelas) ------------------
+
+    def listar_boletos_em_aberto_detalhado(self, conn: sqlite3.Connection, credor: str | None = None) -> pd.DataFrame:
+        """
+        Retorna lista de parcelas de boletos (obrigacoes) em aberto ou parcial,
+        com saldo atualizado (considerando MULTA/JUROS/DESCONTO/AJUSTE), parcela_num e parcela_total.
+        """
+        base_sql = """
+            WITH pagos AS (
+              SELECT obrigacao_id,
+                     COALESCE(SUM(CASE WHEN categoria_evento='PAGAMENTO' THEN -valor_evento ELSE 0 END),0) AS total_pago
+              FROM contas_a_pagar_mov
+              GROUP BY obrigacao_id
+            ),
+            ajustes AS (
+              SELECT obrigacao_id,
+                     COALESCE(SUM(CASE 
+                         WHEN categoria_evento='MULTA' THEN valor_evento
+                         WHEN categoria_evento='JUROS' THEN valor_evento
+                         WHEN categoria_evento='DESCONTO' THEN valor_evento  -- já negativo
+                         WHEN categoria_evento='AJUSTE' THEN valor_evento    -- legado
+                         ELSE 0 END),0) AS total_ajustes
+              FROM contas_a_pagar_mov
+              GROUP BY obrigacao_id
+            )
+            SELECT
+              cap.id AS lanc_id,
+              cap.obrigacao_id,
+              cap.credor,
+              cap.descricao,
+              cap.parcela_num,
+              cap.parcelas_total,
+              cap.vencimento,
+              ROUND(cap.valor_evento, 2) AS valor_parcela,
+              ROUND(cap.valor_evento + COALESCE(a.total_ajustes,0) - COALESCE(p.total_pago,0), 2) AS saldo,
+              COALESCE(cap.status, 'Em aberto') AS status
+            FROM contas_a_pagar_mov cap
+            LEFT JOIN pagos p   ON p.obrigacao_id = cap.obrigacao_id
+            LEFT JOIN ajustes a ON a.obrigacao_id = cap.obrigacao_id
+            WHERE cap.categoria_evento = 'LANCAMENTO'
+              AND (cap.tipo_obrigacao = 'BOLETO' OR cap.tipo_origem = 'BOLETO')
+              AND COALESCE(cap.status, 'Em aberto') IN ('Em aberto','Parcial')
+              {filtro_credor}
+            ORDER BY DATE(COALESCE(cap.vencimento, cap.data_evento)) ASC, cap.parcela_num ASC
+        """
+        sql = base_sql.format(
+            filtro_credor="AND LOWER(TRIM(cap.credor)) = LOWER(TRIM(?))" if credor else ""
+        )
+        if credor:
+            return pd.read_sql(sql, conn, params=(credor,))
+        else:
+            return pd.read_sql(sql, conn)
