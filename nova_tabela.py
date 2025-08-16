@@ -1,64 +1,108 @@
 import sqlite3
-import os
+from pathlib import Path
+from datetime import datetime
+import shutil
+import sys
 
-def migrate_add_status(caminho_banco: str) -> None:
-    """
-    Adiciona a coluna 'status' em contas_a_pagar_mov (se não existir),
-    faz backfill com 'Em aberto' e cria índices úteis (idempotente).
-    """
-    if not os.path.isfile(caminho_banco):
-        raise FileNotFoundError(f"Arquivo de banco não encontrado: {caminho_banco}")
+# === AJUSTE AQUI: caminho do ARQUIVO .db ===
+# Se o arquivo do banco for "flowdash_data.db" dentro da pasta data, use:
+DB_FILE = Path(r"C:\Users\User\OneDrive\Documentos\Python\Dev_Python\Abud Python Workspace - GitHub\Projeto FlowDash\data\flowdash_data.db")
 
-    conn = sqlite3.connect(caminho_banco, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    cur = conn.cursor()
+SQL_VIEWS = r"""
+-- ============================================================
+-- 1) View de saldos por obrigação
+-- ============================================================
+DROP VIEW IF EXISTS vw_cap_saldos;
 
-    # 0) Garante que a tabela existe
-    tb = cur.execute("""
-        SELECT 1 FROM sqlite_master
-        WHERE type='table' AND name='contas_a_pagar_mov'
-        LIMIT 1
-    """).fetchone()
-    if not tb:
-        conn.close()
-        raise RuntimeError("Tabela 'contas_a_pagar_mov' não encontrada no banco.")
+CREATE VIEW vw_cap_saldos AS
+WITH base AS (
+  SELECT
+    obrigacao_id,
+    SUM(CASE WHEN categoria_evento = 'LANCAMENTO' THEN COALESCE(valor_evento,0) ELSE 0 END)                              AS total_lancado,
+    SUM(CASE WHEN categoria_evento = 'PAGAMENTO'   THEN -COALESCE(valor_evento,0) ELSE 0 END)                             AS total_pago,
+    SUM(CASE WHEN categoria_evento IN ('LANCAMENTO','PAGAMENTO','AJUSTE','JUROS','MULTA','DESCONTO')
+             THEN COALESCE(valor_evento,0) ELSE 0 END)                                                                    AS saldo_aberto
+  FROM contas_a_pagar_mov
+  GROUP BY obrigacao_id
+)
+SELECT
+  obrigacao_id,
+  ROUND(COALESCE(total_lancado,0), 2) AS total_lancado,
+  ROUND(COALESCE(total_pago,0),     2) AS total_pago,
+  ROUND(COALESCE(saldo_aberto,0),   2) AS saldo_aberto,
+  CASE
+    WHEN COALESCE(total_lancado,0) > 0
+      THEN ROUND( (CASE WHEN total_pago / NULLIF(total_lancado,0) > 1.0 THEN 1.0 ELSE total_pago / NULLIF(total_lancado,0) END), 4)
+    ELSE 0.0
+  END AS perc_quitado
+FROM base;
 
-    # 1) Verifica se a coluna já existe
-    cols = [r[1] for r in cur.execute("PRAGMA table_info(contas_a_pagar_mov);").fetchall()]
-    if "status" not in cols:
-        cur.execute("ALTER TABLE contas_a_pagar_mov ADD COLUMN status TEXT;")
+-- ============================================================
+-- 2) View "em aberto" (usada pela UI)
+-- ============================================================
+DROP VIEW IF EXISTS vw_cap_em_aberto;
 
-    # 2) Backfill: define 'Em aberto' onde estiver NULL ou vazio
-    cur.execute("""
-        UPDATE contas_a_pagar_mov
-           SET status = 'Em aberto'
-         WHERE status IS NULL OR TRIM(status) = ''
-    """)
+CREATE VIEW vw_cap_em_aberto AS
+WITH
+  anchor AS (
+    SELECT m.*
+    FROM contas_a_pagar_mov m
+    JOIN (
+      SELECT obrigacao_id, MIN(id) AS min_id
+      FROM contas_a_pagar_mov
+      WHERE categoria_evento = 'LANCAMENTO'
+      GROUP BY obrigacao_id
+    ) a ON a.obrigacao_id = m.obrigacao_id AND a.min_id = m.id
+  ),
+  saldos AS (
+    SELECT * FROM vw_cap_saldos
+  )
+SELECT
+  s.obrigacao_id,
+  a.tipo_obrigacao,
+  a.credor,
+  a.descricao,
+  a.competencia,
+  a.vencimento,
+  s.total_lancado,
+  s.total_pago,
+  s.saldo_aberto,
+  s.perc_quitado
+FROM saldos s
+LEFT JOIN anchor a ON a.obrigacao_id = s.obrigacao_id
+WHERE ROUND(COALESCE(s.saldo_aberto,0), 2) > 0.00;
 
-    # 3) Índices (idempotentes)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_capm_status ON contas_a_pagar_mov(status);")
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_capm_tipo_credor
-        ON contas_a_pagar_mov (tipo_obrigacao, tipo_origem, credor);
-    """)
+-- (Opcional) índices para performance
+CREATE INDEX IF NOT EXISTS idx_capm_obrig ON contas_a_pagar_mov(obrigacao_id);
+CREATE INDEX IF NOT EXISTS idx_capm_cat   ON contas_a_pagar_mov(categoria_evento);
+CREATE INDEX IF NOT EXISTS idx_capm_tipoo ON contas_a_pagar_mov(tipo_origem);
+"""
 
-    conn.commit()
+def backup_db(db_path: Path) -> Path:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak = db_path.with_suffix(f".bak_{ts}.db")
+    shutil.copy2(db_path, bak)
+    return bak
 
-    # 4) (Opcional) Resumo
-    resumo = cur.execute("""
-        SELECT status, COUNT(*) AS qtd
-          FROM contas_a_pagar_mov
-         GROUP BY status
-         ORDER BY qtd DESC
-    """).fetchall()
-    conn.close()
+def main():
+    if not DB_FILE.exists():
+        print(f"❌ Arquivo do banco não encontrado:\n{DB_FILE}")
+        sys.exit(1)
 
-    print("Migração concluída. Distribuição de status:")
-    for s, q in resumo:
-        print(f" - {s!r}: {q}")
+    print(f"🔧 Migrando views em: {DB_FILE}")
+    bak = backup_db(DB_FILE)
+    print(f"🗂️  Backup criado: {bak}")
+
+    try:
+        with sqlite3.connect(str(DB_FILE)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.executescript(SQL_VIEWS)
+            conn.commit()
+        print("✅ Views recriadas com sucesso!")
+    except Exception as e:
+        print(f"❌ Erro ao recriar views: {e}")
+        print("ℹ️  O backup permanece disponível.")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    caminho = r"C:\Users\User\OneDrive\Documentos\Python\Dev_Python\Abud Python Workspace - GitHub\Projeto FlowDash\data\flowdash_data.db"
-    migrate_add_status(caminho)
+    main()
