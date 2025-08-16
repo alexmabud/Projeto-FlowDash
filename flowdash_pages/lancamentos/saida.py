@@ -84,7 +84,7 @@ def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> List[str]:
                 SELECT DISTINCT TRIM(credor) AS credor
                   FROM contas_a_pagar_mov
                  WHERE credor IS NOT NULL AND TRIM(credor) <> ''
-                   AND COALESCE(status, 'Em aberto') = 'Em aberto'
+                   AND COALESCE(status, 'Em aberto') IN ('Em aberto', 'Parcial')
                  ORDER BY credor
             """, conn)
 
@@ -127,7 +127,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
         bancos_repo = BancoRepository(caminho_banco)
         cartoes_repo = CartoesRepository(caminho_banco)
         cats_repo = CategoriasRepository(caminho_banco)
-        cap_repo = ContasAPagarMovRepository(caminho_banco)  # mantido para futuras integrações
+        cap_repo = ContasAPagarMovRepository(caminho_banco)  # mantido para integrações
 
         # Dados para selects
         df_bancos = bancos_repo.carregar_bancos()
@@ -156,9 +156,13 @@ def render_saida(caminho_banco: str, data_lanc: date):
         subcat_nome = None
         tipo_pagamento_sel: Optional[str] = None
         destino_pagamento_sel: Optional[str] = None
-        # >>> NOVAS VARS PARA FATURA <<<
+        # >>> FATURA <<<
         competencia_fatura_sel: Optional[str] = None
         obrigacao_id_fatura: Optional[int] = None
+        # >>> BOLETO (pagamento de parcela) <<<
+        parcela_boleto_escolhida: Optional[dict] = None
+        valor_pagamento_boleto: float = 0.0
+        multa_boleto = juros_boleto = desconto_boleto = 0.0
 
         if is_pagamentos:
             tipo_pagamento_sel = st.selectbox(
@@ -180,8 +184,70 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     st.caption(f"Selecionado: {destino_pagamento_sel} — {competencia_fatura_sel} • obrigação #{obrigacao_id_fatura}")
                     # (Opcional) auto-preencher o valor com o saldo da fatura:
                     # st.session_state["valor_saida"] = f_sel["saldo"]
+
+            elif tipo_pagamento_sel == "Boletos":
+                # 1) Selecionar o CREDOR (destino)
+                destinos = _opcoes_pagamentos(caminho_banco, "Boletos")
+                destino_pagamento_sel = (
+                    st.selectbox("Credor", destinos, key="destino_pagamentos")
+                    if destinos else
+                    st.text_input("Credor (digite)", key="destino_pagamentos_text")
+                )
+
+                if destino_pagamento_sel and str(destino_pagamento_sel).strip():
+                    # 2) Carregar PARCELAS em aberto/parcelial desse credor
+                    with get_conn(caminho_banco) as conn:
+                        df_parc = cap_repo.listar_boletos_em_aberto_detalhado(conn, destino_pagamento_sel)
+
+                    if df_parc.empty:
+                        st.info("Nenhuma parcela em aberto para este credor.")
+                    else:
+                        # Monta opções
+                        def fmt_row(r):
+                            vcto = (r["vencimento"] or "")[:10]
+                            parc = f"{int(r['parcela_num'])}/{int(r['parcelas_total'])}" if pd.notna(r["parcela_num"]) and pd.notna(r["parcelas_total"]) else "-"
+                            saldo = float(r["saldo"] or 0.0)
+                            return f"#{int(r['obrigacao_id'])} • Parcela {parc} • Venc. {vcto} • Saldo R$ {saldo:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+                        df_parc = df_parc.copy()
+                        df_parc["op"] = df_parc.apply(fmt_row, axis=1)
+                        escolha_parc = st.selectbox("Parcela do Boleto", df_parc["op"].tolist(), key="parcela_boleto_op")
+
+                        if escolha_parc:
+                            r = df_parc[df_parc["op"] == escolha_parc].iloc[0]
+                            parcela_boleto_escolhida = {
+                                "obrigacao_id": int(r["obrigacao_id"]),
+                                "saldo": float(r["saldo"] or 0.0),
+                                "parcela_num": int(r["parcela_num"] or 0),
+                                "parcelas_total": int(r["parcelas_total"] or 0),
+                                "vencimento": (r["vencimento"] or "")[:10],
+                                "credor": r["credor"],
+                                "descricao": r["descricao"],
+                            }
+                            st.caption(f"Selecionado: obrigação #{parcela_boleto_escolhida['obrigacao_id']} • Parcela {parcela_boleto_escolhida['parcela_num']}/{parcela_boleto_escolhida['parcelas_total']} • Venc. {parcela_boleto_escolhida['vencimento']}")
+
+                            # 3) Inputs de pagamento desta parcela
+                            valor_pagamento_boleto = st.number_input(
+                                "Valor do pagamento (pode ser parcial)",
+                                min_value=0.0,
+                                step=0.01,
+                                format="%.2f",
+                                value=float(parcela_boleto_escolhida["saldo"]),
+                                key="valor_pagamento_boleto"
+                            )
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                multa_boleto = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_boleto")
+                            with col2:
+                                juros_boleto = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_boleto")
+                            with col3:
+                                desconto_boleto = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_boleto")
+
+                            total_saida_calc = float(valor_pagamento_boleto) + float(multa_boleto) + float(juros_boleto) - float(desconto_boleto)
+                            st.caption(f"Total da saída (caixa/banco): R$ {total_saida_calc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
             else:
-                # mantém lógica anterior para empréstimos/boletos
+                # mantém lógica anterior para empréstimos
                 destinos = _opcoes_pagamentos(caminho_banco, tipo_pagamento_sel)
                 destino_pagamento_sel = (
                     st.selectbox("Destino", destinos, key="destino_pagamentos")
@@ -275,26 +341,70 @@ def render_saida(caminho_banco: str, data_lanc: date):
         # ===================== SALVAR =====================
         if st.button("💾 Salvar Saída", use_container_width=True, key="btn_salvar_saida"):
             # Validações gerais
-            if valor_saida <= 0:
-                st.warning("⚠️ O valor deve ser maior que zero.")
+            if forma_pagamento in ["PIX", "DÉBITO"] and not banco_escolhido:
+                st.warning("⚠️ Selecione ou digite o banco da saída.")
+                return
+            if forma_pagamento == "DINHEIRO" and not origem_dinheiro:
+                st.warning("⚠️ Informe a origem do dinheiro (Caixa/Caixa 2).")
                 return
             if not confirmar:
                 st.warning("⚠️ Confirme os dados antes de salvar.")
                 return
-            if forma_pagamento == "CRÉDITO" and not cartao_escolhido:
-                st.warning("Selecione um cartão de crédito.")
-                return
-            if forma_pagamento in ["PIX", "DÉBITO"] and not banco_escolhido:
-                st.warning("Selecione ou digite o banco da saída.")
-                return
-            if forma_pagamento == "DINHEIRO" and not origem_dinheiro:
-                st.warning("Informe a origem do dinheiro (Caixa/Caixa 2).")
-                return
-            if forma_pagamento == "BOLETO" and not venc_1:
-                st.warning("Informe o vencimento da 1ª parcela.")
+
+            # Branch especial: Categoria=Pagamentos / Tipo=Boletos → pagar parcela
+            if is_pagamentos and tipo_pagamento_sel == "Boletos":
+                if not destino_pagamento_sel or not str(destino_pagamento_sel).strip():
+                    st.warning("Selecione o credor do boleto.")
+                    return
+                if not parcela_boleto_escolhida:
+                    st.warning("Selecione a parcela do boleto para pagar.")
+                    return
+
+                # valores do formulário específico
+                valor_digitado = float(st.session_state.get("valor_pagamento_boleto", 0.0))
+                multa_val = float(st.session_state.get("multa_boleto", 0.0))
+                juros_val = float(st.session_state.get("juros_boleto", 0.0))
+                desc_val = float(st.session_state.get("desconto_boleto", 0.0))
+
+                if valor_digitado <= 0 and (multa_val + juros_val - desc_val) <= 0:
+                    st.warning("Informe um valor de pagamento > 0 ou ajustes (multa/juros/desconto).")
+                    return
+
+                data_str = str(data_lanc)
+                try:
+                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido
+                    id_saida, id_mov, id_cap = ledger.pagar_parcela_boleto(
+                        data=data_str,
+                        valor=valor_digitado,  # principal
+                        forma_pagamento=forma_pagamento,
+                        origem=origem,
+                        obrigacao_id=int(parcela_boleto_escolhida["obrigacao_id"]),
+                        usuario=usuario_nome,
+                        categoria="Boletos",
+                        sub_categoria=subcat_nome,
+                        descricao=descricao_final,
+                        descricao_extra_cap=f"{destino_pagamento_sel} Parcela {parcela_boleto_escolhida['parcela_num']}/{parcela_boleto_escolhida['parcelas_total']}",
+                        multa=multa_val,
+                        juros=juros_val,
+                        desconto=desc_val
+                    )
+                    st.session_state["msg_ok"] = (
+                        f"✅ Pagamento de boleto registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                    )
+                    # Fecha o formulário e recarrega
+                    st.session_state.form_saida = False
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Erro ao pagar boleto: {e}")
+                return  # evita cair nas lógicas padrão abaixo
+
+            # Validações padrão (fora do fluxo especial de boletos)
+            if float(valor_saida) <= 0:
+                st.warning("⚠️ O valor deve ser maior que zero.")
                 return
 
-            # Validação específica para a categoria Pagamentos
+            # Validação específica para a categoria Pagamentos (fatura/emp/boletos padrão)
             if is_pagamentos:
                 if not tipo_pagamento_sel:
                     st.warning("Selecione o tipo de pagamento (Fatura, Empréstimos ou Boletos).")
@@ -362,7 +472,6 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     if not fc_vc:
                         st.error("Cartão não encontrado. Cadastre em 📇 Cartão de Crédito.")
                         return
-                    # CartoesRepository.obter_por_nome => (vencimento, fechamento)
                     vencimento, fechamento = fc_vc
                     ids_fatura, id_mov = ledger.registrar_saida_credito(
                         data_compra=data_str,
@@ -370,7 +479,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         parcelas=int(parcelas),
                         cartao_nome=cartao_escolhido,
                         categoria=categoria,
-                        sub_categoria=subcat_nome,   # <- corrigido aqui
+                        sub_categoria=subcat_nome,   # corrigido
                         descricao=descricao_final,
                         usuario=usuario_nome,
                         fechamento=int(fechamento),
@@ -400,7 +509,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     )
 
                 # Feedback de classificação quando categoria = Pagamentos
-                if is_pagamentos:
+                if is_pagamentos and tipo_pagamento_sel != "Boletos":
                     st.info(f"Destino classificado: {tipo_pagamento_sel} → {destino_pagamento_sel or '—'}")
 
                 # Fecha o formulário e recarrega
