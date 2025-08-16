@@ -67,7 +67,7 @@ class LedgerService:
                          31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
         return date(y, m, d)
 
-    # ============== helpers CAPM / status ==============
+    # ============== helpers CAPM / saldo / status ==============
 
     def _open_predicate_capm(self) -> str:
         return "COALESCE(status, 'Em aberto') = 'Em aberto'"
@@ -92,35 +92,60 @@ class LedgerService:
         """, (int(obrigacao_id),)).fetchone()[0]
         return float(soma or 0.0)
 
-    def _atualizar_status_por_id(self, conn, row_id: int, obrigacao_id: int, valor_doc: float) -> None:
-        total_pago = self._total_pago_acumulado(conn, obrigacao_id)
+    # ===== NOVO: saldo e detecção de pagamento =====
+
+    def _saldo_obrigacao(self, conn, obrigacao_id: int) -> float:
+        cur = conn.cursor()
+        s = cur.execute("""
+            SELECT COALESCE(SUM(COALESCE(valor_evento,0)),0)
+            FROM contas_a_pagar_mov
+            WHERE obrigacao_id = ?
+        """, (int(obrigacao_id),)).fetchone()[0]
+        return float(s or 0.0)
+
+    def _tem_pagamento(self, conn, obrigacao_id: int) -> bool:
+        cur = conn.cursor()
+        n = cur.execute("""
+            SELECT COUNT(1)
+            FROM contas_a_pagar_mov
+            WHERE obrigacao_id = ?
+              AND UPPER(COALESCE(categoria_evento,'')) = 'PAGAMENTO'
+              AND COALESCE(valor_evento,0) <> 0
+        """, (int(obrigacao_id),)).fetchone()[0]
+        return int(n or 0) > 0
+
+    def _atualizar_status_por_id(self, conn, row_id: int, obrigacao_id: int, _valor_doc_ignorado: float = 0.0) -> None:
+        """
+        Define status olhando o SALDO agregado da obrigação:
+         - Quitado: saldo ≈ 0
+         - Parcial: saldo > 0 e já houve algum pagamento
+         - Em aberto: saldo > 0 e ainda não houve pagamento
+        """
         eps = 0.005
-        if total_pago >= float(valor_doc) - eps:
+        saldo = self._saldo_obrigacao(conn, int(obrigacao_id))
+        if abs(saldo) <= eps:
             novo = "Quitado"
-        elif total_pago > 0:
-            novo = "Parcial"
         else:
-            novo = "Em aberto"
+            novo = "Parcial" if self._tem_pagamento(conn, int(obrigacao_id)) else "Em aberto"
         conn.execute("UPDATE contas_a_pagar_mov SET status = ? WHERE id = ?", (novo, int(row_id)))
 
     def _atualizar_status_por_obrigacao(self, conn, obrigacao_id: int) -> None:
-        total_pago = self._total_pago_acumulado(conn, int(obrigacao_id))
+        """
+        Atualiza o status de TODOS os LANCAMENTOS desta obrigação com base no saldo agregado.
+        """
         eps = 0.005
-        cur = conn.cursor()
-        for row_id, valor_doc in cur.execute("""
-            SELECT id, COALESCE(valor_evento,0.0) AS valor_doc
-              FROM contas_a_pagar_mov
+        saldo = self._saldo_obrigacao(conn, int(obrigacao_id))
+        if abs(saldo) <= eps:
+            novo = "Quitado"
+        else:
+            novo = "Parcial" if self._tem_pagamento(conn, int(obrigacao_id)) else "Em aberto"
+
+        conn.execute("""
+            UPDATE contas_a_pagar_mov
+               SET status = ?
              WHERE obrigacao_id = ?
                AND categoria_evento = 'LANCAMENTO'
-        """, (int(obrigacao_id),)):
-            valor_doc = float(valor_doc)
-            if total_pago >= valor_doc - eps:
-                novo = "Quitado"
-            elif total_pago > 0:
-                novo = "Parcial"
-            else:
-                novo = "Em aberto"
-            cur.execute("UPDATE contas_a_pagar_mov SET status = ? WHERE id = ?", (novo, int(row_id)))
+        """, (novo, int(obrigacao_id)))
 
     # ============== pagamento direto por OBRIGACAO (fatura) ==============
 
@@ -129,10 +154,7 @@ class LedgerService:
                                     origem: str, ledger_id: int, usuario: str) -> float:
         """
         Faz pagamento direto em uma fatura (obrigacao_id do LANCAMENTO de FATURA_CARTAO).
-        - Calcula 'falta' = valor_doc - pago_acumulado.
-        - Insere PAGAMENTO com min(valor, falta).
-        - Atualiza status da obrigação.
-        - Retorna 'sobra' (valor - pagar), se houver.
+        Retorna 'sobra' (valor - pagar), se houver.
         """
         cur = conn.cursor()
         row = cur.execute("""
@@ -153,11 +175,10 @@ class LedgerService:
         falta = max(0.0, round(valor_doc - ja_pago, 2))
         if falta <= 0:
             self._atualizar_status_por_obrigacao(conn, int(obrigacao_id))
-            return float(valor)  # tudo vira sobra
+            return float(valor)
 
         pagar = min(float(valor), falta)
 
-        # grava pagamento
         self.cap_repo.registrar_pagamento(
             conn,
             obrigacao_id=int(obrigacao_id),
@@ -170,9 +191,7 @@ class LedgerService:
             usuario=usuario,
         )
 
-        # atualiza status
         self._atualizar_status_por_obrigacao(conn, int(obrigacao_id))
-
         sobra = round(float(valor) - pagar, 2)
         return sobra
 
@@ -330,7 +349,6 @@ class LedgerService:
 
             pagar = min(restante, falta)
 
-            # registra pagamento
             self.cap_repo.registrar_pagamento(
                 conn,
                 obrigacao_id=obrigacao_id,
@@ -343,13 +361,9 @@ class LedgerService:
                 usuario=usuario,
             )
 
-            # recalcula status
             self._atualizar_status_por_id(conn, row_id, obrigacao_id, valor_doc)
-
-            # reduz restante
             restante = round(restante - pagar, 2)
 
-            # pagando fatura por competencia específica não cascateia
             if competencia_pagamento:
                 break
 
@@ -691,8 +705,8 @@ class LedgerService:
                     vencimento=str(vcto_date),
                     usuario=usuario,
                     descricao=descricao or f"Fatura {cartao_nome} {competencia}",
-                    parcela_num=p,                   # <<<<< NOVO
-                    parcelas_total=int(parcelas)     # <<<<< NOVO
+                    parcela_num=p,                   # NOVO
+                    parcelas_total=int(parcelas)     # NOVO
                 )
                 lanc_ids.append(int(lanc_id))
                 total_programado += float(vparc)
@@ -826,7 +840,6 @@ class LedgerService:
         if row:
             lanc_id = int(row[0])
             obrigacao_id = int(row[1])
-            # fatura já existente: só soma o valor; mantém n/total
             cur.execute("""
                 UPDATE contas_a_pagar_mov
                    SET valor_evento = COALESCE(valor_evento,0) + ?,
@@ -857,7 +870,6 @@ class LedgerService:
                  WHERE id = ?
             """, (cartao_nome, lanc_id))
 
-        # Atualiza status da fatura com base no total pago atual (se já existir pagamento)
         row2 = cur.execute("SELECT id, obrigacao_id, COALESCE(valor_evento,0) FROM contas_a_pagar_mov WHERE id=?",
                            (lanc_id,)).fetchone()
         valor_doc = float(row2[2])
@@ -885,3 +897,152 @@ class LedgerService:
             else:
                 m += 1
         return f"{y:04d}-{m:02d}"
+
+    # =================== BOLETO (pagamento de PARCELA) ===================
+    def pagar_parcela_boleto(
+        self,
+        *,
+        data: str,                       # 'YYYY-MM-DD'
+        valor: float,                    # pode ser parcial (<= saldo ajustado)
+        forma_pagamento: str,            # 'DINHEIRO', 'PIX', 'DÉBITO', 'TRANSFERÊNCIA'
+        origem: str,                     # 'Caixa' / 'Caixa 2' (dinheiro) ou nome da coluna do banco (bancário)
+        obrigacao_id: int,               # obrigação (parcela) selecionada na UI
+        usuario: str,
+        categoria: Optional[str] = "Boletos",
+        sub_categoria: Optional[str] = None,
+        descricao: Optional[str] = None,
+        trans_uid: Optional[str] = None,
+        descricao_extra_cap: Optional[str] = None,
+        multa: float = 0.0,
+        juros: float = 0.0,
+        desconto: float = 0.0,
+    ) -> tuple[int, int, int]:
+        """
+        Fluxo:
+          1) Debita do Caixa/Banco (saida + movimentacao) no valor (pagamento + multa + juros - desconto)
+          2) Lança MULTA/JUROS/DESCONTO ANTES do pagamento
+          3) Recalcula saldo e limita o pagamento ao saldo ajustado
+          4) Registra PAGAMENTO (negativo)
+          5) Atualiza status da obrigação
+        """
+        v_pg = float(valor)
+        v_multa = max(0.0, float(multa or 0.0))
+        v_juros = max(0.0, float(juros or 0.0))
+        v_desc  = max(0.0, float(desconto or 0.0))
+
+        if v_pg < 0:
+            raise ValueError("Valor do pagamento não pode ser negativo.")
+
+        cat  = sanitize(categoria)
+        sub  = sanitize(sub_categoria)
+        desc = sanitize(descricao)
+        usu  = sanitize(usuario)
+        org  = sanitize(origem)
+
+        with get_conn(self.db_path) as conn:
+            cur = conn.cursor()
+
+            # ====== 1) Debitar do Caixa/Banco + inserir em 'saida' ======
+            resumo_aj = []
+            if v_multa > 0: resumo_aj.append(f"multa R$ {v_multa:.2f}")
+            if v_juros > 0: resumo_aj.append(f"juros R$ {v_juros:.2f}")
+            if v_desc  > 0: resumo_aj.append(f"desconto R$ {v_desc:.2f}")
+            obs_extra = (" | " + ", ".join(resumo_aj)) if resumo_aj else ""
+
+            total_saida = max(v_pg + v_multa + v_juros - v_desc, 0.0)
+
+            if forma_pagamento == "DINHEIRO":
+                self._garantir_linha_saldos_caixas(conn, data)
+                cur.execute("""
+                    INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
+                                       Forma_de_Pagamento, Parcelas, Valor, Usuario,
+                                       Origem_Dinheiro, Banco_Saida)
+                    VALUES (?, ?, ?, ?, 'DINHEIRO', 1, ?, ?, ?, '')
+                """, (data, cat, sub, desc, total_saida, usu, org))
+                id_saida = int(cur.lastrowid)
+
+                campo = "caixa" if org == "Caixa" else "caixa_2"
+                cur.execute(f"""
+                    UPDATE saldos_caixas SET {campo} = COALESCE({campo},0) - ?
+                    WHERE data = ?
+                """, (total_saida, data))
+
+                obs = (f"Pagamento Boleto {cat}/{sub or ''}".strip()
+                       + (f" - {desc}" if desc else "")
+                       + obs_extra)
+                cur.execute("""
+                    INSERT INTO movimentacoes_bancarias
+                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
+                    VALUES (?, ?, 'saida', ?, 'saidas_boleto_pagamento', ?, 'saida', ?, ?)
+                """, (data, org, total_saida, obs, id_saida, trans_uid))
+                id_mov = int(cur.lastrowid)
+
+            else:
+                self._ajustar_banco_dynamic(conn, banco_col=org, delta=-total_saida, data=data)
+                cur.execute("""
+                    INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
+                                       Forma_de_Pagamento, Parcelas, Valor, Usuario,
+                                       Origem_Dinheiro, Banco_Saida)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', ?)
+                """, (data, cat, sub, desc, forma_pagamento, total_saida, usu, org))
+                id_saida = int(cur.lastrowid)
+
+                obs = (f"Pagamento Boleto {cat}/{sub or ''}".strip()
+                       + (f" - {desc}" if desc else "")
+                       + obs_extra)
+                cur.execute("""
+                    INSERT INTO movimentacoes_bancarias
+                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
+                    VALUES (?, ?, 'saida', ?, 'saidas_boleto_pagamento', ?, 'saida', ?, ?)
+                """, (data, org, total_saida, obs, id_saida, trans_uid))
+                id_mov = int(cur.lastrowid)
+
+            # ====== 2) Lançar AJUSTES (ANTES do pagamento) ======
+            if v_multa > 0:
+                self.cap_repo.registrar_multa_boleto(conn,
+                    obrigacao_id=int(obrigacao_id), valor=v_multa, data_evento=data,
+                    usuario=usu, descricao=descricao_extra_cap)
+
+            if v_juros > 0:
+                self.cap_repo.registrar_juros_boleto(conn,
+                    obrigacao_id=int(obrigacao_id), valor=v_juros, data_evento=data,
+                    usuario=usu, descricao=descricao_extra_cap)
+
+            if v_desc > 0:
+                self.cap_repo.registrar_desconto_boleto(conn,
+                    obrigacao_id=int(obrigacao_id), valor=v_desc, data_evento=data,
+                    usuario=usu, descricao=descricao_extra_cap)
+
+            # ====== 3) Recalcular SALDO e limitar pagamento ======
+            saldo_ajustado = self.cap_repo.obter_saldo_obrigacao(conn, int(obrigacao_id))
+            eps = 0.005
+            valor_a_pagar = min(max(v_pg, 0.0), max(saldo_ajustado, 0.0))
+
+            if v_pg > saldo_ajustado + eps:
+                cur.execute("""
+                    UPDATE movimentacoes_bancarias
+                       SET observacao = COALESCE(observacao,'') || ' [valor ajustado ao saldo: R$ ' || printf('%.2f', ?) || ']'
+                     WHERE id = ?
+                """, (float(valor_a_pagar), id_mov))
+
+            if valor_a_pagar > eps:
+                # ====== 4) Registrar PAGAMENTO ======
+                evento_id = self.cap_repo.registrar_pagamento(
+                    conn,
+                    obrigacao_id=int(obrigacao_id),
+                    tipo_obrigacao="BOLETO",
+                    valor_pago=float(valor_a_pagar),
+                    data_evento=data,
+                    forma_pagamento=forma_pagamento,
+                    origem=org,
+                    ledger_id=id_saida,
+                    usuario=usu,
+                )
+            else:
+                evento_id = 0  # nada a pagar (desconto zerou saldo)
+
+            # ====== 5) Atualizar status ======
+            self._atualizar_status_por_obrigacao(conn, int(obrigacao_id))
+
+            conn.commit()
+            return (id_saida, id_mov, int(evento_id))
