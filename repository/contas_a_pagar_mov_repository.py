@@ -3,7 +3,13 @@ from __future__ import annotations
 import sqlite3
 from typing import Optional, Literal
 import pandas as pd
+from decimal import Decimal, ROUND_HALF_UP
 
+# ========= Helpers de arredondamento (nível de módulo) =========
+def _q2(x) -> Decimal:
+    return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+# ========= Tipos e conjuntos permitidos =========
 TipoObrigacao = Literal["BOLETO", "FATURA_CARTAO", "EMPRESTIMO", "OUTRO"]
 ALLOWED_TIPOS = {"BOLETO", "FATURA_CARTAO", "EMPRESTIMO", "OUTRO"}
 ALLOWED_CATEGORIAS = {"LANCAMENTO", "PAGAMENTO", "JUROS", "MULTA", "DESCONTO", "AJUSTE", "CANCELAMENTO"}
@@ -438,3 +444,80 @@ class ContasAPagarMovRepository:
             return pd.read_sql(sql, conn, params=(credor,))
         else:
             return pd.read_sql(sql, conn)
+
+    # ------------------ NOVO: aplicar pagamento na própria parcela ------------------
+
+    def aplicar_pagamento_parcela(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        parcela_id: int,
+        valor_parcela: float,
+        valor_pago_total: float,   # total desembolsado agora (já com juros/multa/desconto aplicados)
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+    ) -> dict:
+        """
+        Atualiza a própria linha da parcela acumulando pagamento/encargos e define o status.
+        Regra: valor_quitacao = valor_parcela - desconto + juros + multa
+               Quitado se valor_pago_acumulado >= valor_quitacao
+        """
+        vp   = _q2(valor_parcela)
+        pago = _q2(valor_pago_total)
+        j    = _q2(juros)
+        m    = _q2(multa)
+        d    = _q2(desconto)
+
+        valor_quitacao = _q2(vp - d + j + m)
+
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 
+                COALESCE(valor_pago_acumulado,0),
+                COALESCE(juros_pago,0),
+                COALESCE(multa_paga,0),
+                COALESCE(desconto_aplicado,0)
+            FROM contas_a_pagar_mov
+            WHERE id = ?
+        """, (parcela_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Parcela id={parcela_id} não encontrada em contas_a_pagar_mov")
+
+        pago_acum_atual, juros_acum_atual, multa_acum_atual, desc_acum_atual = map(Decimal, map(str, row))
+
+        novo_pago_acum = _q2(pago_acum_atual + pago)
+        novo_juros     = _q2(juros_acum_atual + j)
+        novo_multa     = _q2(multa_acum_atual + m)
+        novo_desc      = _q2(desc_acum_atual + d)
+
+        status = "Quitado" if novo_pago_acum >= valor_quitacao else "Parcial"
+        restante = _q2(max(Decimal("0.00"), valor_quitacao - novo_pago_acum))
+
+        cur.execute("""
+            UPDATE contas_a_pagar_mov
+               SET valor_pago_acumulado = ?,
+                   juros_pago           = ?,
+                   multa_paga           = ?,
+                   desconto_aplicado    = ?,
+                   status               = ?
+             WHERE id = ?
+        """, (
+            float(novo_pago_acum),
+            float(novo_juros),
+            float(novo_multa),
+            float(novo_desc),
+            status,
+            parcela_id
+        ))
+        conn.commit()
+
+        return {
+            "parcela_id": parcela_id,
+            "valor_parcela": float(vp),
+            "valor_quitacao": float(valor_quitacao),
+            "pago_acumulado": float(novo_pago_acum),
+            "status": status,
+            "restante": float(restante)
+        }
