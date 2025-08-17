@@ -159,9 +159,10 @@ def render_saida(caminho_banco: str, data_lanc: date):
         # >>> FATURA <<<
         competencia_fatura_sel: Optional[str] = None
         obrigacao_id_fatura: Optional[int] = None
+        # ajustes de fatura
+        multa_fatura = juros_fatura = desconto_fatura = 0.0
         # >>> BOLETO (pagamento de parcela) <<<
         parcela_boleto_escolhida: Optional[dict] = None
-        valor_pagamento_boleto: float = 0.0
         multa_boleto = juros_boleto = desconto_boleto = 0.0
 
         if is_pagamentos:
@@ -182,8 +183,27 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     competencia_fatura_sel = f_sel["competencia"]
                     obrigacao_id_fatura = int(f_sel["obrigacao_id"])
                     st.caption(f"Selecionado: {destino_pagamento_sel} — {competencia_fatura_sel} • obrigação #{obrigacao_id_fatura}")
-                    # (Opcional) auto-preencher o valor com o saldo da fatura:
-                    # st.session_state["valor_saida"] = f_sel["saldo"]
+
+                    # Campo SOMENTE LEITURA para o valor de pagamento (vem do Valor da Saída)
+                    st.number_input(
+                        "Valor do pagamento (pode ser parcial)",
+                        value=float(valor_saida),
+                        step=0.01,
+                        format="%.2f",
+                        disabled=True,
+                        key="valor_pagamento_fatura_ro",
+                        help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
+                    )
+                    colf1, colf2, colf3 = st.columns(3)
+                    with colf1:
+                        multa_fatura = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_fatura")
+                    with colf2:
+                        juros_fatura = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_fatura")
+                    with colf3:
+                        desconto_fatura = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_fatura")
+
+                    total_saida_fatura = float(valor_saida) + float(multa_fatura) + float(juros_fatura) - float(desconto_fatura)
+                    st.caption(f"Total da saída (caixa/banco): R$ {total_saida_fatura:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
             elif tipo_pagamento_sel == "Boletos":
                 # 1) Selecionar o CREDOR (destino)
@@ -226,14 +246,15 @@ def render_saida(caminho_banco: str, data_lanc: date):
                             }
                             st.caption(f"Selecionado: obrigação #{parcela_boleto_escolhida['obrigacao_id']} • Parcela {parcela_boleto_escolhida['parcela_num']}/{parcela_boleto_escolhida['parcelas_total']} • Venc. {parcela_boleto_escolhida['vencimento']}")
 
-                            # 3) Inputs de pagamento desta parcela
-                            valor_pagamento_boleto = st.number_input(
+                            # CAMPO SOMENTE LEITURA: espelha "Valor da Saída"
+                            st.number_input(
                                 "Valor do pagamento (pode ser parcial)",
-                                min_value=0.0,
+                                value=float(valor_saida),
                                 step=0.01,
                                 format="%.2f",
-                                value=float(parcela_boleto_escolhida["saldo"]),
-                                key="valor_pagamento_boleto"
+                                disabled=True,
+                                key="valor_pagamento_boleto_ro",
+                                help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
                             )
                             col1, col2, col3 = st.columns(3)
                             with col1:
@@ -243,7 +264,8 @@ def render_saida(caminho_banco: str, data_lanc: date):
                             with col3:
                                 desconto_boleto = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_boleto")
 
-                            total_saida_calc = float(valor_pagamento_boleto) + float(multa_boleto) + float(juros_boleto) - float(desconto_boleto)
+                            # TOTAL usa SEMPRE o valor da saída
+                            total_saida_calc = float(valor_saida) + float(multa_boleto) + float(juros_boleto) - float(desconto_boleto)
                             st.caption(f"Total da saída (caixa/banco): R$ {total_saida_calc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
             else:
@@ -360,11 +382,11 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     st.warning("Selecione a parcela do boleto para pagar.")
                     return
 
-                # valores do formulário específico
-                valor_digitado = float(st.session_state.get("valor_pagamento_boleto", 0.0))
+                # valor do pagamento vem SEMPRE do valor da saída
+                valor_digitado = float(valor_saida)
                 multa_val = float(st.session_state.get("multa_boleto", 0.0))
                 juros_val = float(st.session_state.get("juros_boleto", 0.0))
-                desc_val = float(st.session_state.get("desconto_boleto", 0.0))
+                desc_val  = float(st.session_state.get("desconto_boleto", 0.0))
 
                 if valor_digitado <= 0 and (multa_val + juros_val - desc_val) <= 0:
                     st.warning("Informe um valor de pagamento > 0 ou ajustes (multa/juros/desconto).")
@@ -375,7 +397,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido
                     id_saida, id_mov, id_cap = ledger.pagar_parcela_boleto(
                         data=data_str,
-                        valor=valor_digitado,  # principal
+                        valor=valor_digitado,  # principal (vem do campo Valor da Saída)
                         forma_pagamento=forma_pagamento,
                         origem=origem,
                         obrigacao_id=int(parcela_boleto_escolhida["obrigacao_id"]),
@@ -399,7 +421,49 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     st.error(f"Erro ao pagar boleto: {e}")
                 return  # evita cair nas lógicas padrão abaixo
 
-            # Validações padrão (fora do fluxo especial de boletos)
+            # Branch especial: Categoria=Pagamentos / Tipo=Fatura → pagar fatura com ajustes
+            if is_pagamentos and tipo_pagamento_sel == "Fatura Cartão de Crédito":
+                if not obrigacao_id_fatura:
+                    st.warning("Selecione uma fatura em aberto (cartão • mês • saldo).")
+                    return
+
+                valor_digitado = float(valor_saida)  # vem do campo Valor da Saída
+                multa_val = float(st.session_state.get("multa_fatura", 0.0))
+                juros_val = float(st.session_state.get("juros_fatura", 0.0))
+                desc_val  = float(st.session_state.get("desconto_fatura", 0.0))
+
+                if valor_digitado <= 0 and (multa_val + juros_val - desc_val) <= 0:
+                    st.warning("Informe um valor de pagamento > 0 ou ajustes (multa/juros/desconto).")
+                    return
+
+                data_str = str(data_lanc)
+                try:
+                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido
+                    id_saida, id_mov, id_cap = ledger.pagar_fatura_cartao(
+                        data=data_str,
+                        valor=valor_digitado,  # principal (vem do campo Valor da Saída)
+                        forma_pagamento=forma_pagamento,
+                        origem=origem,
+                        obrigacao_id=int(obrigacao_id_fatura),
+                        usuario=usuario_nome,
+                        categoria="Fatura Cartão de Crédito",
+                        sub_categoria=subcat_nome,
+                        descricao=descricao_final,
+                        multa=multa_val,
+                        juros=juros_val,
+                        desconto=desc_val
+                    )
+                    st.session_state["msg_ok"] = (
+                        f"✅ Pagamento de fatura registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                    )
+                    # Fecha o formulário e recarrega
+                    st.session_state.form_saida = False
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Erro ao pagar fatura: {e}")
+                return  # evita cair nas lógicas padrão abaixo
+
+            # Validações padrão (fora dos fluxos especiais acima)
             if float(valor_saida) <= 0:
                 st.warning("⚠️ O valor deve ser maior que zero.")
                 return
@@ -427,7 +491,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
             if is_pagamentos:
                 extra_args["pagamento_tipo"] = tipo_pagamento_sel
                 extra_args["pagamento_destino"] = destino_pagamento_sel
-                # PRIORIDADE: se selecionou uma fatura específica, paga exatamente ela
+                # PRIORIDADE: se selecionou uma fatura específica (sem ajustes), paga exatamente ela
                 if tipo_pagamento_sel == "Fatura Cartão de Crédito" and obrigacao_id_fatura:
                     extra_args["obrigacao_id_fatura"] = int(obrigacao_id_fatura)
                     if competencia_fatura_sel:
@@ -508,7 +572,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         else f"✅ Boleto programado! Parcelas criadas: {len(ids_cap)} | Log: {id_mov}"
                     )
 
-                # Feedback de classificação quando categoria = Pagamentos
+                # Feedback de classificação quando categoria = Pagamentos (somente nos fluxos padrão)
                 if is_pagamentos and tipo_pagamento_sel != "Boletos":
                     st.info(f"Destino classificado: {tipo_pagamento_sel} → {destino_pagamento_sel or '—'}")
 
