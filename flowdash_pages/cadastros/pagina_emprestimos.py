@@ -2,20 +2,22 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import date, datetime
+
 from flowdash_pages.cadastros.cadastro_classes import EmprestimoRepository
 from utils.utils import formatar_valor, limpar_valor_formatado
-from repository.movimentacoes_repository import MovimentacoesRepository  # ⬅️ NOVO
+from repository.movimentacoes_repository import MovimentacoesRepository
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository  # ⬅️ NOVO
+from shared.db import get_conn  # ⬅️ NOVO
 
 TIPOS_EMPRESTIMO = ["Empréstimo", "Financiamento", "Crédito Pessoal", "Outro"]
 STATUS_OPCOES = ["Em aberto", "Quitado", "Renegociado"]
 
 
-# Página de empréstimos e financiamentos =========================================================================
 def carregar_bancos_cadastrados(caminho_banco: str) -> pd.DataFrame:
     with sqlite3.connect(caminho_banco) as conn:
         return pd.read_sql("SELECT id, nome FROM bancos_cadastrados ORDER BY nome", conn)
 
-# ⬇️ SUBSTITUÍDO: agora usa MovimentacoesRepository (idempotente + referência)
+
 def inserir_movimentacao_bancaria(
     caminho_banco: str,
     data_: str,
@@ -43,17 +45,14 @@ def inserir_movimentacao_bancaria(
         return None
 
 
-# Página principal 
 def pagina_emprestimos_financiamentos(caminho_banco: str):
     st.subheader("🏦 Cadastro de Empréstimos e Financiamentos")
     repo = EmprestimoRepository(caminho_banco)
 
-    # Mensagem pós-salvamento
     if st.session_state.get("sucesso_emprestimo"):
         st.success("✅ Empréstimo salvo com sucesso!")
         del st.session_state["sucesso_emprestimo"]
 
-    # FORMULÁRIO DE CADASTRO 
     with st.expander("➕ Cadastrar Novo Empréstimo / Financiamento", expanded=True):
         with st.form("form_emprestimo"):
             # Linha 1 - Datas
@@ -116,11 +115,35 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                         valor_pago, valor_em_aberto, None, descricao,
                         str(data_inicio_pagamento), data_lancamento
                     )
-                    repo.salvar_emprestimo(dados)
 
+                    # 1) Salva o cadastro
+                    repo.salvar_emprestimo(dados)
                     st.success("✅ Empréstimo salvo com sucesso!")
 
-                    # limpa inputs
+                    # 2) Descobre o id recém-inserido e programa as parcelas no CAP (mesma conexão)
+                    cap_repo = ContasAPagarMovRepository(caminho_banco)
+                    with get_conn(caminho_banco) as conn:
+                        row = conn.execute(
+                            "SELECT id FROM emprestimos_financiamentos ORDER BY id DESC LIMIT 1"
+                        ).fetchone()
+                        if not row or row[0] is None:
+                            st.error("Não foi possível obter o ID do empréstimo recém-cadastrado.")
+                        else:
+                            novo_id = int(row[0])
+                            try:
+                                resultado = cap_repo.gerar_parcelas_emprestimo(
+                                    conn,
+                                    emprestimo_id=novo_id,
+                                    usuario=usuario
+                                )
+                                st.success(
+                                    f"🧾 Parcelas programadas no Contas a Pagar: {resultado.get('criadas', 0)} "
+                                    f"(ajustes: {resultado.get('ajustes_quitadas', 0)})"
+                                )
+                            except Exception as e:
+                                st.error(f"Falha ao programar parcelas no Contas a Pagar: {e}")
+
+                    # 3) Limpa inputs
                     for chave in list(st.session_state.keys()):
                         if chave.startswith("input_"):
                             del st.session_state[chave]
@@ -128,13 +151,12 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                 except Exception as e:
                     st.error(f"Erro ao salvar: {e}")
 
-    # LISTAGEM + AÇÕES 
+    # LISTAGEM + AÇÕES
     st.markdown("### 📋 Empréstimos Registrados")
     try:
         df = repo.listar_emprestimos()
 
         if not df.empty:
-            # cálculo e formatação
             df["Situação"] = df.apply(
                 lambda row: "Novo" if row["parcelas_pagas"] == 0 else (
                     "Quitado" if row["parcelas_pagas"] >= row["parcelas_total"] else "Em andamento"
@@ -176,7 +198,7 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                     st.session_state["emprestimo_editando"] = id_selecionado
                     st.rerun()
 
-            # Registrar Depósito (usa id_selecionado) 
+            # Registrar Depósito (usa id_selecionado)
             with st.expander("🏦 Registrar depósito deste empréstimo em um banco", expanded=False):
                 try:
                     df_bancos = carregar_bancos_cadastrados(caminho_banco)
@@ -219,14 +241,12 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                                         observacao=observacao
                                     )
                                     st.success("✅ Depósito registrado em `movimentacoes_bancarias`!")
-                                    # st.rerun()  # opcional
                                 except Exception as e:
                                     st.error(f"Erro ao registrar depósito: {e}")
                 except Exception as e:
                     st.error(f"Erro ao carregar bancos: {e}")
-        
 
-        # MODO EDIÇÃO 
+        # MODO EDIÇÃO
         if "emprestimo_editando" in st.session_state and not df.empty:
             id_edit = st.session_state["emprestimo_editando"]
             emprestimo = df[df["id"] == id_edit].iloc[0]
