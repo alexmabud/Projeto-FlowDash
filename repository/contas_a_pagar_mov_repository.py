@@ -4,6 +4,8 @@ import sqlite3
 from typing import Optional, Literal
 import pandas as pd
 from decimal import Decimal, ROUND_HALF_UP
+from datetime import date, datetime
+import calendar
 
 # ========= Helpers de arredondamento (nível de módulo) =========
 def _q2(x) -> Decimal:
@@ -254,7 +256,7 @@ class ContasAPagarMovRepository:
         ).fetchone()
         return float(row[0]) if row else 0.0
 
-    # ------------------ NOVOS MÉTODOS: ajustes (multa/juros/desconto) ------------------
+    # ------------------ ajustes (multa/juros/desconto) p/ BOLETO ------------------
 
     def registrar_multa_boleto(self, conn, *, obrigacao_id: int, valor: float, data_evento: str, usuario: str, descricao: str | None = None) -> int:
         v = float(valor)
@@ -396,49 +398,55 @@ class ContasAPagarMovRepository:
 
     def listar_boletos_em_aberto_detalhado(self, conn: sqlite3.Connection, credor: str | None = None) -> pd.DataFrame:
         """
-        Retorna lista de parcelas de boletos (obrigacoes) em aberto ou parcial,
-        com saldo atualizado (considerando MULTA/JUROS/DESCONTO/AJUSTE), parcela_num e parcela_total.
+        Lista parcelas (LANCAMENTOS) de BOLETO em aberto/parcial, calculando saldo pela própria tabela de eventos.
+        Não depende de colunas extras (status/valor_pago_acumulado). Status é derivado:
+          - Quitado: saldo <= 0
+          - Parcial: saldo > 0 e total_pago > 0
+          - Em aberto: saldo > 0 e total_pago = 0
         """
         base_sql = """
-            WITH pagos AS (
-              SELECT obrigacao_id,
-                     COALESCE(SUM(CASE WHEN categoria_evento='PAGAMENTO' THEN -valor_evento ELSE 0 END),0) AS total_pago
-              FROM contas_a_pagar_mov
-              GROUP BY obrigacao_id
-            ),
-            ajustes AS (
-              SELECT obrigacao_id,
-                     COALESCE(SUM(CASE 
-                         WHEN categoria_evento='MULTA' THEN valor_evento
-                         WHEN categoria_evento='JUROS' THEN valor_evento
-                         WHEN categoria_evento='DESCONTO' THEN valor_evento  -- já negativo
-                         WHEN categoria_evento='AJUSTE' THEN valor_evento    -- legado
-                         ELSE 0 END),0) AS total_ajustes
-              FROM contas_a_pagar_mov
-              GROUP BY obrigacao_id
+            WITH base AS (
+              SELECT
+                cap.obrigacao_id,
+                MIN(COALESCE(cap.credor, '')) AS credor,
+                MIN(COALESCE(cap.descricao, '')) AS descricao,
+                MIN(cap.parcela_num) AS parcela_num,
+                MIN(cap.parcelas_total) AS parcelas_total,
+                MIN(cap.vencimento) AS vencimento,
+                SUM(CASE WHEN cap.categoria_evento='LANCAMENTO' THEN cap.valor_evento ELSE 0 END) AS total_lancado,
+                SUM(CASE WHEN cap.categoria_evento='PAGAMENTO'  THEN -cap.valor_evento ELSE 0 END) AS total_pago,
+                SUM(CASE 
+                      WHEN cap.categoria_evento='MULTA'    THEN cap.valor_evento
+                      WHEN cap.categoria_evento='JUROS'    THEN cap.valor_evento
+                      WHEN cap.categoria_evento='DESCONTO' THEN cap.valor_evento  -- já negativo
+                      WHEN cap.categoria_evento='AJUSTE'   THEN cap.valor_evento  -- legado (pode ser negativo)
+                      ELSE 0 END
+                ) AS total_ajustes
+              FROM contas_a_pagar_mov cap
+              WHERE cap.tipo_obrigacao='BOLETO'
+              GROUP BY cap.obrigacao_id
             )
             SELECT
-              cap.id AS lanc_id,
-              cap.obrigacao_id,
-              cap.credor,
-              cap.descricao,
-              cap.parcela_num,
-              cap.parcelas_total,
-              cap.vencimento,
-              ROUND(cap.valor_evento, 2) AS valor_parcela,
-              ROUND(cap.valor_evento + COALESCE(a.total_ajustes,0) - COALESCE(p.total_pago,0), 2) AS saldo,
-              COALESCE(cap.status, 'Em aberto') AS status
-            FROM contas_a_pagar_mov cap
-            LEFT JOIN pagos p   ON p.obrigacao_id = cap.obrigacao_id
-            LEFT JOIN ajustes a ON a.obrigacao_id = cap.obrigacao_id
-            WHERE cap.categoria_evento = 'LANCAMENTO'
-              AND (cap.tipo_obrigacao = 'BOLETO' OR cap.tipo_origem = 'BOLETO')
-              AND COALESCE(cap.status, 'Em aberto') IN ('Em aberto','Parcial')
-              {filtro_credor}
-            ORDER BY DATE(COALESCE(cap.vencimento, cap.data_evento)) ASC, cap.parcela_num ASC
+              obrigacao_id,
+              credor,
+              descricao,
+              parcela_num,
+              parcelas_total,
+              vencimento,
+              ROUND(total_lancado, 2) AS valor_parcela,
+              ROUND(total_lancado + COALESCE(total_ajustes,0) - COALESCE(total_pago,0), 2) AS saldo,
+              CASE
+                WHEN (total_lancado + COALESCE(total_ajustes,0) - COALESCE(total_pago,0)) <= 0.00001 THEN 'Quitado'
+                WHEN COALESCE(total_pago,0) > 0 THEN 'Parcial'
+                ELSE 'Em aberto'
+              END AS status
+            FROM base
+            WHERE (total_lancado + COALESCE(total_ajustes,0) - COALESCE(total_pago,0)) > 0.00001
+            {filtro_credor}
+            ORDER BY DATE(COALESCE(vencimento, DATE('now'))) ASC, parcela_num ASC, obrigacao_id ASC;
         """
         sql = base_sql.format(
-            filtro_credor="AND LOWER(TRIM(cap.credor)) = LOWER(TRIM(?))" if credor else ""
+            filtro_credor="AND LOWER(TRIM(credor)) = LOWER(TRIM(?))" if credor else ""
         )
         if credor:
             return pd.read_sql(sql, conn, params=(credor,))
@@ -460,6 +468,7 @@ class ContasAPagarMovRepository:
     ) -> dict:
         """
         Atualiza a própria linha da parcela acumulando pagamento/encargos e define o status.
+        (Use somente se sua tabela possuir essas colunas extras; caso contrário, prefira o modelo de eventos+views.)
         Regra: valor_quitacao = valor_parcela - desconto + juros + multa
                Quitado se valor_pago_acumulado >= valor_quitacao
         """
@@ -520,4 +529,157 @@ class ContasAPagarMovRepository:
             "pago_acumulado": float(novo_pago_acum),
             "status": status,
             "restante": float(restante)
+        }
+
+    # ------------------ helpers de empréstimo ------------------
+
+    def _label_emprestimo(self, row) -> str:
+        """
+        Define o 'credor' que aparecerá em contas_a_pagar_mov:
+        prioriza banco; cai para descricao; depois tipo.
+        """
+        for k in ("banco", "descricao", "tipo"):
+            v = (row.get(k) or "").strip()
+            if v:
+                return v
+        return "Empréstimo"
+
+    def _add_months(self, d: date, months: int) -> date:
+        y = d.year + (d.month - 1 + months) // 12
+        m = (d.month - 1 + months) % 12 + 1
+        last = calendar.monthrange(y, m)[1]
+        day = min(d.day, last)
+        return date(y, m, day)
+
+    # ------------------ geração de parcelas de EMPRESTIMO ------------------
+
+    def gerar_parcelas_emprestimo(
+    self,
+    conn: sqlite3.Connection,
+    *,
+    emprestimo_id: int,
+    usuario: str
+    ) -> dict:
+        """
+        Cria LANCAMENTOS (tipo_obrigacao='EMPRESTIMO') para todas as parcelas do empréstimo.
+        Para as primeiras 'parcelas_pagas', NÃO cria evento extra: aplica o pagamento
+        diretamente na própria linha do LANCAMENTO (acumuladores + status=Quitado).
+        Nas demais, força status='Em aberto'.
+        Em TODAS as parcelas, define tipo_origem='EMPRESTIMO' e emprestimo_id (quando houver).
+        Não movimenta caixa.
+        """
+        # Carrega dados do empréstimo
+        row = conn.execute("""
+            SELECT
+                id, banco, descricao, tipo,
+                COALESCE(parcelas_total, 0) AS parcelas_total,
+                COALESCE(parcelas_pagas, 0) AS parcelas_pagas,
+                COALESCE(valor_parcela, 0)  AS valor_parcela,
+                data_inicio_pagamento,
+                data_contratacao,
+                COALESCE(vencimento_dia, 0) AS vencimento_dia
+            FROM emprestimos_financiamentos
+            WHERE id = ?
+            LIMIT 1
+        """, (int(emprestimo_id),)).fetchone()
+        if not row:
+            raise ValueError(f"Empréstimo id={emprestimo_id} não encontrado.")
+
+        colunas = [
+            "id", "banco", "descricao", "tipo",
+            "parcelas_total", "parcelas_pagas", "valor_parcela",
+            "data_inicio_pagamento", "data_contratacao", "vencimento_dia"
+        ]
+        d = dict(zip(colunas, row))
+
+        total_parc = int(d.get("parcelas_total") or 0)
+        ja_pagas   = max(0, min(total_parc, int(d.get("parcelas_pagas") or 0)))
+        vparc      = float(d.get("valor_parcela") or 0.0)
+        credor     = self._label_emprestimo(d)
+
+        if total_parc <= 0 or vparc <= 0:
+            raise ValueError("Empréstimo sem 'parcelas_total' ou 'valor_parcela' válido.")
+
+        base_str = d.get("data_inicio_pagamento") or d.get("data_contratacao")
+        if not base_str:
+            base = date.today()
+        else:
+            base = datetime.strptime(base_str[:10], "%Y-%m-%d").date()
+
+        venc_dia = int(d.get("vencimento_dia") or 0)
+        if venc_dia <= 0:
+            venc_dia = base.day  # fallback
+
+        criadas = 0
+        marcadas_quitadas = 0
+        obrigacoes_ids = []
+
+        for p in range(1, total_parc + 1):
+            # calcula vencimento da parcela p
+            vcto_mes = self._add_months(base.replace(day=1), p - 1)
+            last_day = calendar.monthrange(vcto_mes.year, vcto_mes.month)[1]
+            venc_dt  = date(vcto_mes.year, vcto_mes.month, min(venc_dia, last_day))
+            venc_str = venc_dt.strftime("%Y-%m-%d")
+
+            # gera um novo obrigacao_id para esta parcela
+            obrig_id = self.proximo_obrigacao_id(conn)
+
+            # cria o LANCAMENTO (retorna o 'id' da linha criada)
+            lancamento_id = self.registrar_lancamento(
+                conn,
+                obrigacao_id=obrig_id,
+                tipo_obrigacao="EMPRESTIMO",
+                valor_total=float(vparc),
+                data_evento=base.strftime("%Y-%m-%d"),
+                vencimento=venc_str,
+                descricao=f"Parcela {p}/{total_parc}",
+                credor=credor,
+                competencia=venc_str[:7],
+                parcela_num=p,
+                parcelas_total=total_parc,
+                usuario=usuario
+            )
+            criadas += 1
+            obrigacoes_ids.append(obrig_id)
+
+            # 🔹 SEMPRE: tipar origem e vincular o emprestimo_id
+            if emprestimo_id is not None:
+                conn.execute("""
+                    UPDATE contas_a_pagar_mov
+                    SET tipo_origem = 'EMPRESTIMO',
+                        emprestimo_id = ?
+                    WHERE id = ?
+                """, (int(emprestimo_id), int(lancamento_id)))
+            else:
+                conn.execute("""
+                    UPDATE contas_a_pagar_mov
+                    SET tipo_origem = 'EMPRESTIMO',
+                        emprestimo_id = NULL
+                    WHERE id = ?
+                """, (int(lancamento_id),))
+
+            if p <= ja_pagas:
+                # quitada: aplica pagamento “dentro” do próprio lançamento (status vira Quitado)
+                self.aplicar_pagamento_parcela(
+                    conn,
+                    parcela_id=int(lancamento_id),
+                    valor_parcela=float(vparc),
+                    valor_pago_total=float(vparc),
+                    juros=0.0,
+                    multa=0.0,
+                    desconto=0.0
+                )
+                marcadas_quitadas += 1
+            else:
+                # NÃO quitada: força status = 'Em aberto'
+                conn.execute("""
+                    UPDATE contas_a_pagar_mov
+                    SET status = 'Em aberto'
+                    WHERE id = ?
+                """, (int(lancamento_id),))
+
+        return {
+            "criadas": criadas,
+            "ajustes_quitadas": marcadas_quitadas,
+            "obrigacoes": obrigacoes_ids
         }
