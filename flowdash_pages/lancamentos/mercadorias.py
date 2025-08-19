@@ -1,6 +1,6 @@
 import streamlit as st
 from datetime import date
-from .shared import get_conn
+from shared.db import get_conn
 from utils.utils import formatar_valor
 
 
@@ -69,11 +69,21 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
         with c5:
             frete = st.number_input("Frete (R$)", min_value=0.0, step=0.01, key="merc_compra_frete")
         with c6:
-            forma_opts = ["PIX", "Boleto", "Crédito", "Débito", "Dinheiro", "Outro"]
+            # ✅ Padronização de formas de pagamento
+            forma_opts = ["PIX", "BOLETO", "CRÉDITO", "DÉBITO", "DINHEIRO", "OUTRO"]
             forma_sel = st.selectbox("Forma de Pagamento", forma_opts, key="merc_compra_forma_sel")
         with c7:
             parcelas = st.number_input("Parcelas", min_value=1, max_value=360, step=1, value=1, key="merc_compra_parcelas")
-        forma_pagamento = st.text_input("Informe a forma de pagamento (Outro)", key="merc_compra_forma_outro") if forma_sel == "Outro" else forma_sel
+
+        # Quando OUTRO, captura texto e normaliza; caso contrário usa o label padronizado
+        forma_pagamento = (
+            st.text_input("Informe a forma de pagamento (OUTRO)", key="merc_compra_forma_outro").strip().upper()
+            if forma_sel == "OUTRO" else forma_sel
+        )
+
+        # Feedback visual amigável
+        if forma_pagamento == "CRÉDITO":
+            st.caption(f"Parcelas: **{int(parcelas)}×**")
 
         # Linha 3 — APENAS Previsões (calendário) — efetivos ficam NO RECEBIMENTO
         st.markdown("###### Previsões")
@@ -91,7 +101,7 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
             numero_nf_str = st.text_input("Número da Nota Fiscal", key="merc_compra_num_nf")
 
         confirmar = st.checkbox("Confirmo os dados", key="merc_compra_confirma")
-        submitted = st.form_submit_button("💾 Salvar Compra", use_container_width=True)
+        submitted = st.form_submit_button("💾 Salvar Compra", use_container_width=True, disabled=not confirmar)
 
     if not submitted:
         return
@@ -100,13 +110,24 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
     if not fornecedor or valor_mercadoria <= 0:
         st.warning("⚠️ Informe fornecedor e um valor de mercadoria maior que zero.")
         return
-    if not confirmar:
-        st.warning("⚠️ Confirme os dados antes de salvar.")
-        return
 
     # Conversões
     frete_f = float(frete) if frete is not None else None
-    parcelas_f = float(parcelas) if parcelas is not None else None
+
+    # ✅ Validação explícita para CRÉDITO (server-side)
+    try:
+        parcelas_int = int(parcelas)
+    except Exception:
+        parcelas_int = 1
+    if forma_pagamento == "CRÉDITO" and parcelas_int < 1:
+        st.warning("⚠️ Em CRÉDITO, defina Parcelas ≥ 1.")
+        return
+    if parcelas_int < 1:
+        parcelas_int = 1
+        st.info("ℹ️ Parcelas ajustadas para 1.")
+
+    parcelas_f = int(parcelas_int)
+
     numero_pedido = _to_float_or_none(numero_pedido_str)
     numero_nf = _to_float_or_none(numero_nf_str)
 
@@ -127,14 +148,14 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
             """, (
                 data_txt, colecao, fornecedor, float(valor_mercadoria), frete_f,
                 forma_pagamento, parcelas_f,
-                previsao_faturamento, None,                # Faturamento efetivo só no recebimento
-                previsao_recebimento, None,                # Recebimento efetivo só no recebimento
+                previsao_faturamento, None,
+                previsao_recebimento, None,
                 numero_pedido, numero_nf
             ))
             conn.commit()
 
         st.session_state["msg_ok"] = "✅ Compra registrada com sucesso!"
-        st.session_state["show_merc_compra"] = False  # fecha o bloco
+        st.session_state["show_merc_compra"] = False
         st.rerun()
 
     except Exception as e:
@@ -166,7 +187,7 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
                        Previsao_Faturamento, Previsao_Recebimento, Numero_Pedido,
                        Recebimento,
                        Valor_Mercadoria, Frete,
-                       Numero_Pedido, Numero_NF
+                       Numero_NF
                   FROM mercadorias
             """
             where_clause = "" if mostrar_todas else "WHERE Recebimento IS NULL OR TRIM(Recebimento) = ''"
@@ -174,7 +195,7 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
             rows = cur.execute(f"""
                 {base_select}
                 {where_clause}
-                ORDER BY date(Data) DESC, id DESC
+                ORDER BY date(Data) DESC, rowid DESC
                 LIMIT 200
             """).fetchall()
 
@@ -190,8 +211,8 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
                     "Recebimento": r[7],
                     "Valor_Mercadoria": float(r[8]) if r[8] is not None else 0.0,
                     "Frete": float(r[9]) if r[9] is not None else 0.0,
-                    "Numero_Pedido": "" if r[10] is None else str(r[10]),
-                    "Numero_NF": "" if r[11] is None else str(r[11]),
+                    "Numero_Pedido": "" if r[6] is None else str(r[6]),
+                    "Numero_NF": "" if r[10] is None else str(r[10]),
                 } for r in rows
             ]
     except Exception as e:
@@ -206,8 +227,12 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
         c["id"]: f"#{c['id']} • {c['Data']} • {c['Fornecedor']} • {c['Colecao']} • Pedido:{c['Pedido']}"
         for c in compras
     }
-    selected_id = st.selectbox("Selecione a compra", options=list(label_map.keys()),
-                               format_func=lambda k: label_map[k], key="merc_receb_sel")
+    selected_id = st.selectbox(
+        "Selecione a compra",
+        options=list(label_map.keys()),
+        format_func=lambda k: label_map[k],
+        key="merc_receb_sel"
+    )
     sel = next((c for c in compras if c["id"] == selected_id), None)
     if not sel:
         st.warning("Seleção inválida.")
@@ -237,7 +262,7 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
         with v2:
             st.text_input("Frete (pedido)", value=formatar_valor(sel["Frete"]), disabled=True)
 
-        # NOVO: Linha 4 — permitir editar Nº Pedido e Nº NF
+        # Linha 4 — permitir editar Nº Pedido e Nº NF
         n1, n2 = st.columns(2)
         with n1:
             numero_pedido_txt = st.text_input("Número do Pedido (editável)", value=sel["Numero_Pedido"], key="merc_receb_edit_pedido")
@@ -257,16 +282,16 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
         with d2:
             frete_cobrado = st.number_input("Frete Cobrado (R$)", min_value=0.0, step=0.01, key="merc_receb_frete_cobrado")
 
-        obs = st.text_area("Observações (divergências, avarias, diferenças de quantidade etc.)",
-                           key="merc_receb_obs", placeholder="Opcional")
+        obs = st.text_area(
+            "Observações (divergências, avarias, diferenças de quantidade etc.)",
+            key="merc_receb_obs",
+            placeholder="Opcional"
+        )
 
         confirmar = st.checkbox("Confirmo os dados", key="merc_receb_confirma")
-        submitted = st.form_submit_button("💾 Salvar Recebimento", use_container_width=True)
+        submitted = st.form_submit_button("💾 Salvar Recebimento", use_container_width=True, disabled=not confirmar)
 
     if not submitted:
-        return
-    if not confirmar:
-        st.warning("⚠️ Confirme os dados antes de salvar.")
         return
 
     try:
