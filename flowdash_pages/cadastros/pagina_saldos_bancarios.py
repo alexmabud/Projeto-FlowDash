@@ -71,10 +71,6 @@ def pagina_saldos_bancarios(caminho_banco: str):
             with sqlite3.connect(caminho_banco) as conn:
                 cur = conn.cursor()
 
-                # (Opcional) garanta data única para evitar linhas duplicadas de data:
-                # ATENÇÃO: só habilite se já não houver duplicatas, senão vai falhar.
-                # cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_saldos_bancos_data ON saldos_bancos(data);")
-
                 # Garante as colunas para todos os bancos
                 _garantir_colunas_bancos(conn, bancos)
 
