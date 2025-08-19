@@ -7,6 +7,7 @@ from services.ledger import LedgerService
 from repository.cartoes_repository import CartoesRepository, listar_destinos_fatura_em_aberto
 from repository.categorias_repository import CategoriasRepository
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
+from .shared_ui import carregar_tabela, bloco_resumo_dia, canonicalizar_banco  # ⬅️ incluí canonicalizar_banco
 from shared.db import get_conn
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
 
@@ -112,9 +113,16 @@ def render_saida(caminho_banco: str, data_lanc: date):
         # Toggle do formulário
         if st.button("🔴 Saída", use_container_width=True, key="btn_saida_toggle"):
             st.session_state.form_saida = not st.session_state.get("form_saida", False)
+            if st.session_state.form_saida:
+                # sempre recomeça desmarcado ao abrir
+                st.session_state["confirmar_saida"] = False
 
         if not st.session_state.get("form_saida", False):
             return
+
+        # callback para invalidar confirmação ao alterar campos críticos
+        def _invalidate_confirm():
+            st.session_state["confirmar_saida"] = False
 
         st.markdown("#### 📤 Lançar Saída")
 
@@ -137,13 +145,23 @@ def render_saida(caminho_banco: str, data_lanc: date):
         st.caption(f"Data do lançamento: **{data_lanc}**")
 
         # ===================== CAMPOS GERAIS =====================
-        valor_saida = st.number_input("Valor da Saída", min_value=0.0, step=0.01, format="%.2f", key="valor_saida")
-        forma_pagamento = st.selectbox("Forma de Pagamento", FORMAS, key="forma_pagamento_saida")
+        valor_saida = st.number_input(
+            "Valor da Saída",
+            min_value=0.0, step=0.01, format="%.2f",
+            key="valor_saida", on_change=_invalidate_confirm
+        )
+        forma_pagamento = st.selectbox(
+            "Forma de Pagamento", FORMAS,
+            key="forma_pagamento_saida", on_change=_invalidate_confirm
+        )
 
         # ===================== CATEGORIA / SUBCATEGORIA / PAGAMENTOS =====================
         df_cat = cats_repo.listar_categorias()
         if not df_cat.empty:
-            cat_nome = st.selectbox("Categoria", df_cat["nome"].tolist(), key="categoria_saida")
+            cat_nome = st.selectbox(
+                "Categoria", df_cat["nome"].tolist(),
+                key="categoria_saida", on_change=_invalidate_confirm
+            )
             cat_id = int(df_cat[df_cat["nome"] == cat_nome].iloc[0]["id"])
         else:
             st.info("Dica: cadastre categorias em **Cadastro → 📂 Cadastro de Saídas**.")
@@ -172,14 +190,14 @@ def render_saida(caminho_banco: str, data_lanc: date):
             tipo_pagamento_sel = st.selectbox(
                 "Tipo de Pagamento",
                 ["Fatura Cartão de Crédito", "Empréstimos e Financiamentos", "Boletos"],
-                key="tipo_pagamento_pagamentos"
+                key="tipo_pagamento_pagamentos", on_change=_invalidate_confirm
             )
 
             # ===== Fatura Cartão =====
             if tipo_pagamento_sel == "Fatura Cartão de Crédito":
                 faturas = listar_destinos_fatura_em_aberto(caminho_banco)  # [{label, cartao, competencia, obrigacao_id, saldo}, ...]
                 opcoes = [f["label"] for f in faturas]
-                escolha = st.selectbox("Fatura (cartão • mês • saldo)", opcoes, key="destino_fatura_comp")
+                escolha = st.selectbox("Fatura (cartão • mês • saldo)", opcoes, key="destino_fatura_comp", on_change=_invalidate_confirm)
                 if escolha:
                     f_sel = next(f for f in faturas if f["label"] == escolha)
                     destino_pagamento_sel = f_sel["cartao"]
@@ -212,7 +230,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                 # 1) Selecionar o CREDOR (destino)
                 destinos = _opcoes_pagamentos(caminho_banco, "Boletos")
                 destino_pagamento_sel = (
-                    st.selectbox("Credor", destinos, key="destino_pagamentos")
+                    st.selectbox("Credor", destinos, key="destino_pagamentos", on_change=_invalidate_confirm)
                     if destinos else
                     st.text_input("Credor (digite)", key="destino_pagamentos_text")
                 )
@@ -234,7 +252,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
                         df_parc = df_parc.copy()
                         df_parc["op"] = df_parc.apply(fmt_row, axis=1)
-                        escolha_parc = st.selectbox("Parcela do Boleto", df_parc["op"].tolist(), key="parcela_boleto_op")
+                        escolha_parc = st.selectbox("Parcela do Boleto", df_parc["op"].tolist(), key="parcela_boleto_op", on_change=_invalidate_confirm)
 
                         if escolha_parc:
                             r = df_parc[df_parc["op"] == escolha_parc].iloc[0]
@@ -266,7 +284,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                             with col3:
                                 desconto_boleto = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_boleto")
 
-                            total_saida_calc = float(valor_saida) + float(multa_boleto) + float(juros_boleto) - float(desconto_boleto)
+                            total_saida_calc = float(valor_saida) + float(juros_boleto) + float(multa_boleto) - float(desconto_boleto)
                             st.caption(f"Total da saída (caixa/banco): R$ {total_saida_calc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
             # ===== Empréstimos e Financiamentos =====
@@ -277,7 +295,8 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     "Selecione o Banco/Descrição do Empréstimo",
                     options=destinos,
                     index=0 if destinos else None,
-                    key="destino_pagamentos_emprestimo"
+                    key="destino_pagamentos_emprestimo",
+                    on_change=_invalidate_confirm
                 )
 
                 # 2) Listar parcelas com saldo em aberto (cada parcela = um obrigacao_id)
@@ -346,7 +365,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                             return lab.replace(",", "X").replace(".", ",").replace("X", ".")
 
                         opcoes = {fmt_row_e(r): int(r["obrigacao_id"]) for _, r in df_emp.iterrows()}
-                        escolha = st.selectbox("Escolha a parcela do empréstimo", list(opcoes.keys()), key="parcela_emp_op")
+                        escolha = st.selectbox("Escolha a parcela do empréstimo", list(opcoes.keys()), key="parcela_emp_op", on_change=_invalidate_confirm)
                         if escolha:
                             parcela_emp_escolhida = {"obrigacao_id": opcoes[escolha], "rotulo": escolha}
 
@@ -372,7 +391,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
             if cat_id:
                 df_sub = cats_repo.listar_subcategorias(cat_id)
                 if not df_sub.empty:
-                    subcat_nome = st.selectbox("Subcategoria", df_sub["nome"].tolist(), key="subcategoria_saida")
+                    subcat_nome = st.selectbox("Subcategoria", df_sub["nome"].tolist(), key="subcategoria_saida", on_change=_invalidate_confirm)
                 else:
                     subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
             else:
@@ -388,24 +407,24 @@ def render_saida(caminho_banco: str, data_lanc: date):
         documento = ""
 
         if forma_pagamento == "CRÉDITO":
-            parcelas = st.selectbox("Parcelas", list(range(1, 13)), key="parcelas_saida")
+            parcelas = st.selectbox("Parcelas", list(range(1, 13)), key="parcelas_saida", on_change=_invalidate_confirm)
             if nomes_cartoes:
-                cartao_escolhido = st.selectbox("Cartão de Crédito", nomes_cartoes, key="cartao_credito")
+                cartao_escolhido = st.selectbox("Cartão de Crédito", nomes_cartoes, key="cartao_credito", on_change=_invalidate_confirm)
             else:
                 st.warning("⚠️ Nenhum cartão de crédito cadastrado.")
                 return
 
         elif forma_pagamento == "DINHEIRO":
-            origem_dinheiro = st.selectbox("Origem do Dinheiro", ORIGENS_DINHEIRO, key="origem_dinheiro")
+            origem_dinheiro = st.selectbox("Origem do Dinheiro", ORIGENS_DINHEIRO, key="origem_dinheiro", on_change=_invalidate_confirm)
 
         elif forma_pagamento in ["PIX", "DÉBITO"]:
             if nomes_bancos:
-                banco_escolhido = st.selectbox("Banco da Saída", nomes_bancos, key="banco_saida")
+                banco_escolhido = st.selectbox("Banco da Saída", nomes_bancos, key="banco_saida", on_change=_invalidate_confirm)
             else:
                 banco_escolhido = st.text_input("Banco da Saída (digite)", key="banco_saida_text")
 
         elif forma_pagamento == "BOLETO":
-            parcelas = st.selectbox("Parcelas", list(range(1, 37)), index=0, key="parcelas_boleto")
+            parcelas = st.selectbox("Parcelas", list(range(1, 37)), index=0, key="parcelas_boleto", on_change=_invalidate_confirm)
             venc_1 = st.date_input("Vencimento da 1ª parcela", value=date.today(), key="venc1_boleto")
             col_a, col_b = st.columns(2)
             with col_a:
@@ -415,13 +434,13 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
         descricao = st.text_input("Descrição (opcional)", key="descricao_saida")
 
-        # Monta descrição final com meta de Pagamentos
+        # Monta descrição final com meta de Pagamentos (evita espaço duplo)
         meta_tag = ""
         if is_pagamentos:
             tipo_txt = tipo_pagamento_sel or "-"
             dest_txt = (destino_pagamento_sel or "-").strip()
-            meta_tag = f" [PAGAMENTOS: tipo={tipo_txt}; destino={dest_txt}]"
-        descricao_final = (descricao or "").strip() + meta_tag
+            meta_tag = f"[PAGAMENTOS: tipo={tipo_txt}; destino={dest_txt}]"
+        descricao_final = " ".join([(descricao or "").strip(), meta_tag]).strip()
 
         # ===================== RESUMO =====================
         data_saida_str = data_lanc.strftime("%d/%m/%Y")
@@ -440,7 +459,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
         elif forma_pagamento == "DINHEIRO":
             linhas_md += [f"- **Origem do Dinheiro:** {origem_dinheiro or '—'}"]
         elif forma_pagamento in ["PIX", "DÉBITO"]:
-            linhas_md += [f"- **Banco da Saída:** {banco_escolhido or '—'}"]
+            linhas_md += [f"- **Banco da Saída:** {(banco_escolhido or '').strip() or '—'}"]
         elif forma_pagamento == "BOLETO":
             linhas_md += [
                 f"- **Parcelas:** {parcelas}x",
@@ -450,12 +469,29 @@ def render_saida(caminho_banco: str, data_lanc: date):
             ]
         st.info("\n".join([l for l in linhas_md if l != ""]))
 
+        # ✅ Check de confirmação
         confirmar = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
 
         # ===================== SALVAR =====================
-        if st.button("💾 Salvar Saída", use_container_width=True, key="btn_salvar_saida"):
+        # botão só habilita quando o check estiver marcado
+        save_disabled = not st.session_state.get("confirmar_saida", False)
+        if st.button("💾 Salvar Saída", use_container_width=True, key="btn_salvar_saida", disabled=save_disabled):
+            # segurança no servidor (mesmo se alguém tentar burlar no front)
+            if not st.session_state.get("confirmar_saida", False):
+                st.warning("⚠️ Confirme os dados antes de salvar.")
+                return
+
+            # Normalizações rápidas
+            banco_escolhido_norm_in = (banco_escolhido or "").strip()
+
+            # ⬅️ Canonicaliza o banco (seguro, não quebra se não achar)
+            try:
+                banco_escolhido_norm = canonicalizar_banco(caminho_banco, banco_escolhido_norm_in) or banco_escolhido_norm_in
+            except Exception:
+                banco_escolhido_norm = banco_escolhido_norm_in
+
             # Validações gerais
-            if forma_pagamento in ["PIX", "DÉBITO"] and not banco_escolhido:
+            if forma_pagamento in ["PIX", "DÉBITO"] and not banco_escolhido_norm:
                 st.warning("⚠️ Selecione ou digite o banco da saída.")
                 return
             if forma_pagamento == "DINHEIRO" and not origem_dinheiro:
@@ -485,7 +521,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
                 data_str = str(data_lanc)
                 try:
-                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido
+                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido_norm
                     id_saida, id_mov, id_cap = ledger.pagar_parcela_boleto(
                         data=data_str,
                         valor=valor_digitado,
@@ -502,7 +538,9 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         desconto=desc_val
                     )
                     st.session_state["msg_ok"] = (
-                        f"✅ Pagamento de boleto registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if id_saida == -1 or id_mov == -1 or id_cap == -1
+                        else f"✅ Pagamento de boleto registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
                     )
                     st.session_state.form_saida = False
                     st.rerun()
@@ -528,7 +566,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
                 data_str = str(data_lanc)
                 try:
-                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido
+                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido_norm
                     id_saida, id_mov, id_cap = ledger.pagar_fatura_cartao(
                         data=data_str,
                         valor=valor_digitado,
@@ -544,7 +582,9 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         desconto=desc_val
                     )
                     st.session_state["msg_ok"] = (
-                        f"✅ Pagamento de fatura registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if id_saida == -1 or id_mov == -1 or id_cap == -1
+                        else f"✅ Pagamento de fatura registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
                     )
                     st.session_state.form_saida = False
                     st.rerun()
@@ -572,7 +612,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
 
                 data_str = str(data_lanc)
                 try:
-                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido
+                    origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else banco_escolhido_norm
                     id_saida, id_mov, id_cap = ledger.pagar_parcela_emprestimo(
                         data=data_str,
                         valor=valor_digitado,
@@ -588,7 +628,9 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         desconto=desc_val,
                     )
                     st.session_state["msg_ok"] = (
-                        f"✅ Parcela de Empréstimo paga! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if id_saida == -1 or id_mov == -1 or id_cap == -1
+                        else f"✅ Parcela de Empréstimo paga! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
                     )
                     st.info(f"Destino classificado: {tipo_pagamento_sel} → {destino_pagamento_sel or '—'}")
                     st.session_state.form_saida = False
@@ -644,7 +686,8 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         **extra_args
                     )
                     st.session_state["msg_ok"] = (
-                        "⚠️ Transação já registrada (idempotência)." if id_saida == -1
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if id_saida == -1
                         else f"✅ Saída em dinheiro registrada! ID saída: {id_saida} | Log: {id_mov}"
                     )
 
@@ -652,7 +695,7 @@ def render_saida(caminho_banco: str, data_lanc: date):
                     id_saida, id_mov = ledger.registrar_saida_bancaria(
                         data=data_str,
                         valor=float(valor_saida),
-                        banco_nome=banco_escolhido,
+                        banco_nome=banco_escolhido_norm,  # ⬅️ já canonicalizado
                         forma=forma_pagamento,
                         categoria=categoria,
                         sub_categoria=sub_categoria,
@@ -661,16 +704,18 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         **extra_args
                     )
                     st.session_state["msg_ok"] = (
-                        "⚠️ Transação já registrada (idempotência)." if id_saida == -1
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if id_saida == -1
                         else f"✅ Saída bancária ({forma_pagamento}) registrada! ID saída: {id_saida} | Log: {id_mov}"
                     )
 
                 elif forma_pagamento == "CRÉDITO":
+                    # Repo deve retornar (vencimento, fechamento)
                     fc_vc = cartoes_repo.obter_por_nome(cartao_escolhido)
                     if not fc_vc:
                         st.error("Cartão não encontrado. Cadastre em 📇 Cartão de Crédito.")
                         return
-                    vencimento, fechamento = fc_vc
+                    vencimento, fechamento = fc_vc  # manter esta ordem: (vencimento, fechamento)
                     ids_fatura, id_mov = ledger.registrar_saida_credito(
                         data_compra=data_str,
                         valor=float(valor_saida),
@@ -684,7 +729,8 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         vencimento=int(vencimento)
                     )
                     st.session_state["msg_ok"] = (
-                        "⚠️ Transação já registrada (idempotência)." if not ids_fatura
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if not ids_fatura
                         else f"✅ Despesa em CRÉDITO programada! Parcelas criadas: {len(ids_fatura)} | Log: {id_mov}"
                     )
 
@@ -702,7 +748,8 @@ def render_saida(caminho_banco: str, data_lanc: date):
                         documento=documento or None
                     )
                     st.session_state["msg_ok"] = (
-                        "⚠️ Transação já registrada (idempotência)." if not ids_cap
+                        "ℹ️ Transação já registrada (idempotência)."
+                        if not ids_cap
                         else f"✅ Boleto programado! Parcelas criadas: {len(ids_cap)} | Log: {id_mov}"
                     )
 
