@@ -20,12 +20,13 @@ def _inserir_mov_bancaria(caminho_banco, data_, banco, valor, referencia_id=None
             banco=str(banco or ""),
             valor=float(valor),
             origem="saldos_bancos",
-            observacao="Registro manual de saldo bancário",
+            observacao="Registro/ajuste de saldo bancário",
             referencia_tabela="saldos_bancos",
             referencia_id=referencia_id
         )
     except Exception as e:
         st.warning(f"Não foi possível registrar movimentação para {banco}: {e}")
+
 
 def _garantir_colunas_bancos(conn: sqlite3.Connection, bancos: list[str]) -> None:
     """
@@ -38,8 +39,9 @@ def _garantir_colunas_bancos(conn: sqlite3.Connection, bancos: list[str]) -> Non
     for b in faltantes:
         conn.execute(f'ALTER TABLE saldos_bancos ADD COLUMN "{b}" REAL DEFAULT 0.0')
 
+
 def pagina_saldos_bancarios(caminho_banco: str):
-    st.subheader("🏦 Cadastro de Saldos Bancários por Banco (append-only)")
+    st.subheader("🏦 Cadastro de Saldos Bancários por Banco (soma na mesma data)")
 
     # Mensagem persistente pós-rerun
     if "mensagem_sucesso" in st.session_state:
@@ -60,31 +62,58 @@ def pagina_saldos_bancarios(caminho_banco: str):
     bancos = df_bancos["nome"].tolist()
     banco_selecionado = st.selectbox("🏦 Banco", bancos)
     valor_digitado = st.number_input(
-        "💰 Valor do saldo (será adicionado como nova linha)",
+        "💰 Valor a somar no saldo do banco na data selecionada",
         min_value=0.0, step=10.0, format="%.2f"
     )
 
-    if st.button("💾 Cadastrar Saldo (nova linha)", use_container_width=True):
+    if st.button("💾 Lançar Saldo (somar na mesma data)", use_container_width=True):
         try:
             with sqlite3.connect(caminho_banco) as conn:
+                cur = conn.cursor()
+
+                # (Opcional) garanta data única para evitar linhas duplicadas de data:
+                # ATENÇÃO: só habilite se já não houver duplicatas, senão vai falhar.
+                # cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_saldos_bancos_data ON saldos_bancos(data);")
+
                 # Garante as colunas para todos os bancos
                 _garantir_colunas_bancos(conn, bancos)
 
-                # Monta INSERT dinâmico: data + uma coluna por banco
-                colunas = ["data"] + bancos
-                valores = [data_str] + [
-                    float(valor_digitado) if b == banco_selecionado else 0.0
-                    for b in bancos
-                ]
-                placeholders = ",".join(["?"] * len(colunas))
-                colunas_sql = ",".join([f'"{c}"' for c in colunas])
+                # Verifica se já existe linha para a data
+                row = cur.execute(
+                    "SELECT rowid FROM saldos_bancos WHERE data = ? LIMIT 1;",
+                    (data_str,)
+                ).fetchone()
 
-                cur = conn.cursor()
-                cur.execute(
-                    f'INSERT INTO saldos_bancos ({colunas_sql}) VALUES ({placeholders})',
-                    valores
-                )
-                saldo_id = int(cur.lastrowid)  # funciona mesmo sem coluna 'id'
+                if row:
+                    # UPDATE acumulando na coluna do banco
+                    cur.execute(
+                        f'UPDATE saldos_bancos '
+                        f'SET "{banco_selecionado}" = COALESCE("{banco_selecionado}", 0) + ? '
+                        f'WHERE data = ?;',
+                        (float(valor_digitado), data_str)
+                    )
+                    # Para referência, buscamos o rowid atualizado
+                    referencia_id = cur.execute(
+                        "SELECT rowid FROM saldos_bancos WHERE data = ? LIMIT 1;",
+                        (data_str,)
+                    ).fetchone()
+                    referencia_id = int(referencia_id[0]) if referencia_id else None
+                else:
+                    # INSERT de nova linha com a data; somente a coluna do banco recebe o valor
+                    colunas = ["data"] + bancos
+                    valores = [data_str] + [
+                        float(valor_digitado) if b == banco_selecionado else 0.0
+                        for b in bancos
+                    ]
+                    placeholders = ",".join(["?"] * len(colunas))
+                    colunas_sql = ",".join([f'"{c}"' for c in colunas])
+
+                    cur.execute(
+                        f'INSERT INTO saldos_bancos ({colunas_sql}) VALUES ({placeholders})',
+                        valores
+                    )
+                    referencia_id = int(cur.lastrowid)  # funciona mesmo sem coluna 'id'
+
                 conn.commit()
 
             # também lança em movimentacoes_bancarias como ENTRADA, com referência amarrada
@@ -93,20 +122,20 @@ def pagina_saldos_bancarios(caminho_banco: str):
                 data_=data_str,
                 banco=banco_selecionado,
                 valor=valor_digitado,
-                referencia_id=saldo_id
+                referencia_id=referencia_id
             )
 
             valor_fmt = f"R$ {valor_digitado:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             st.session_state["mensagem_sucesso"] = (
-                f"✅ Valor {valor_fmt} foi cadastrado em **{banco_selecionado}** "
-                f"(data {pd.to_datetime(data_str).strftime('%d/%m/%Y')})."
+                f"✅ Somado {valor_fmt} em **{banco_selecionado}** "
+                f"na data {pd.to_datetime(data_str).strftime('%d/%m/%Y')}."
             )
             st.rerun()
 
         except Exception as e:
-            st.error(f"❌ Erro ao cadastrar saldo: {e}")
+            st.error(f"❌ Erro ao lançar saldo: {e}")
 
-    # --- Últimos lançamentos (append-only) ---
+    # --- Últimos lançamentos (append + updates por data) ---
     st.markdown("---")
     st.markdown("### 📋 Últimos Lançamentos (saldos_bancos)")
 
@@ -169,16 +198,7 @@ def pagina_saldos_bancarios(caminho_banco: str):
                 lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             )
 
-        st.markdown("**Visão Resumida (largura por banco):**")
         st.dataframe(df_fmt, use_container_width=True, hide_index=True)
-
-        st.markdown("**Visão Detalhada (uma linha por banco/dia):**")
-        df_long = df_resumo.melt(id_vars=["Data"], value_vars=col_bancos_existentes,
-                                 var_name="Banco", value_name="Total do Dia")
-        df_long["Total do Dia"] = df_long["Total do Dia"].apply(
-            lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        )
-        st.dataframe(df_long.sort_values(["Data", "Banco"]), use_container_width=True, hide_index=True)
 
     except Exception as e:
         st.error(f"Erro ao calcular o resumo diário: {e}")
