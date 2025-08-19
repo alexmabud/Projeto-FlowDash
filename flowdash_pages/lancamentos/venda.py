@@ -1,11 +1,19 @@
 import streamlit as st
 import pandas as pd
-from .shared import (
-    get_conn, DIAS_COMPENSACAO, proximo_dia_util_br,
-    obter_banco_destino
+from shared.db import get_conn  # ✅ conexão padronizada
+from .shared_ui import (        # ✅ utilitários comuns
+    DIAS_COMPENSACAO,
+    proximo_dia_util_br,
+    obter_banco_destino,
 )
 from utils.utils import formatar_valor
 from services.vendas import VendasService
+
+
+def _r2(x) -> float:
+    """Arredonda em 2 casas para evitar ruídos (ex.: -0,00)."""
+    return round(float(x or 0.0), 2)
+
 
 # Mapeia variações de escrita no banco para cada forma
 def _formas_equivalentes(forma: str):
@@ -14,7 +22,9 @@ def _formas_equivalentes(forma: str):
         return ["LINK_PAGAMENTO", "LINK PAGAMENTO", "LINK-DE-PAGAMENTO", "LINK DE PAGAMENTO"]
     return [forma]
 
+
 def render_venda(caminho_banco: str, data_lanc):
+    # Toggle do formulário
     if st.button("🟢 Nova Venda", use_container_width=True, key="btn_venda_toggle"):
         st.session_state.form_venda = not st.session_state.get("form_venda", False)
 
@@ -23,25 +33,27 @@ def render_venda(caminho_banco: str, data_lanc):
 
     st.markdown("#### 📋 Nova Venda")
 
-    # Exibir data do lançamento logo abaixo do título
+    # Data do lançamento
     data_venda_str = pd.to_datetime(data_lanc).strftime("%d/%m/%Y")
     st.caption(f"Data do lançamento: **{data_venda_str}**")
 
+    # Inputs básicos
     valor = st.number_input("Valor da Venda", min_value=0.0, step=0.01, key="venda_valor", format="%.2f")
-    forma = st.selectbox("Forma de Pagamento", ["DINHEIRO","PIX","DÉBITO","CRÉDITO","LINK_PAGAMENTO"], key="venda_forma")
+    forma = st.selectbox("Forma de Pagamento", ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"], key="venda_forma")
 
     parcelas, bandeira, maquineta = 1, "", ""
     banco_pix_direto, taxa_pix_direto = None, 0.0
 
-    # maquinetas (uso geral para PIX via maquineta)
+    # Carregar maquinetas
     try:
         with get_conn(caminho_banco) as conn:
             maq = pd.read_sql("SELECT DISTINCT maquineta FROM taxas_maquinas ORDER BY maquineta", conn)["maquineta"].tolist()
     except Exception:
         maq = []
 
+    # PIX
     if forma == "PIX":
-        modo_pix = st.radio("Como será o PIX?", ["Via maquineta","Direto para banco"], horizontal=True, key="pix_modo")
+        modo_pix = st.radio("Como será o PIX?", ["Via maquineta", "Direto para banco"], horizontal=True, key="pix_modo")
         if modo_pix == "Via maquineta":
             with get_conn(caminho_banco) as conn:
                 maq_pix = pd.read_sql(
@@ -64,8 +76,8 @@ def render_venda(caminho_banco: str, data_lanc):
             banco_pix_direto = st.selectbox("Banco que receberá o PIX", bancos, key="pix_banco")
             taxa_pix_direto  = st.number_input("Taxa do PIX direto (%)", min_value=0.0, step=0.01, value=0.0, format="%.2f", key="pix_taxa")
 
-    elif forma in ["DÉBITO","CRÉDITO","LINK_PAGAMENTO"]:
-        # ===== Maquineta por forma (com equivalências para LINK_PAGAMENTO)
+    # Cartões e Link de Pagamento
+    elif forma in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"]:
         formas = _formas_equivalentes(forma)
         placeholders = ",".join(["?"] * len(formas))
         with get_conn(caminho_banco) as conn:
@@ -84,7 +96,7 @@ def render_venda(caminho_banco: str, data_lanc):
 
         maquineta = st.selectbox("Maquineta", maq_por_forma, key="cartao_maquineta")
 
-        # ===== Bandeiras por (forma, maquineta)
+        # Bandeiras
         with get_conn(caminho_banco) as conn:
             bandeiras = pd.read_sql(
                 f"""
@@ -101,7 +113,7 @@ def render_venda(caminho_banco: str, data_lanc):
 
         bandeira = st.selectbox("Bandeira", bandeiras, key="cartao_bandeira")
 
-        # ===== Parcelas por (forma, maquineta, bandeira)
+        # Parcelas
         with get_conn(caminho_banco) as conn:
             pars = pd.read_sql(
                 f"""
@@ -117,6 +129,7 @@ def render_venda(caminho_banco: str, data_lanc):
             return
 
         parcelas = st.selectbox("Parcelas", pars, key="cartao_parcelas")
+        st.caption(f"Parcelas: **{int(parcelas or 1)}×**")
 
     else:
         st.caption("🧾 Venda em dinheiro será registrada no **Caixa**.")
@@ -129,7 +142,7 @@ def render_venda(caminho_banco: str, data_lanc):
         f"- **Forma de pagamento:** {forma}",
     ]
 
-    if forma in ["DÉBITO","CRÉDITO","LINK_PAGAMENTO"]:
+    if forma in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"]:
         linhas_md += [
             f"- **Maquineta:** {maquineta or '—'}",
             f"- **Bandeira:** {bandeira or '—'}",
@@ -147,17 +160,18 @@ def render_venda(caminho_banco: str, data_lanc):
     st.info("\n".join(linhas_md))
     # ============================================
 
+    # ✅ Check obrigatório
     confirmar = st.checkbox("Confirmo os dados acima", key="venda_confirmar")
 
-    if st.button("💾 Salvar Venda", use_container_width=True, key="venda_salvar"):
-        # validações básicas
+    # ✅ Botão só habilita se confirmar
+    salvar_btn = st.button("💾 Salvar Venda", use_container_width=True, key="venda_salvar", disabled=not confirmar)
+
+    if salvar_btn:
+        # Validações
         if valor <= 0:
             st.warning("⚠️ Valor inválido.")
             return
-        if not confirmar:
-            st.warning("⚠️ Confirme os dados antes de salvar.")
-            return
-        if forma in ["DÉBITO","CRÉDITO","LINK_PAGAMENTO"] and (not maquineta or not bandeira):
+        if forma in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"] and (not maquineta or not bandeira):
             st.warning("⚠️ Selecione maquineta e bandeira.")
             return
         if forma == "PIX" and st.session_state.get("pix_modo") == "Via maquineta" and not maquineta:
@@ -169,7 +183,7 @@ def render_venda(caminho_banco: str, data_lanc):
 
         # ===== taxa + banco_destino
         taxa, banco_destino = 0.0, None
-        if forma in ["DÉBITO","CRÉDITO","LINK_PAGAMENTO"]:
+        if forma in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"]:
             formas = _formas_equivalentes(forma)
             placeholders = ",".join(["?"] * len(formas))
             with get_conn(caminho_banco) as conn:
@@ -213,27 +227,28 @@ def render_venda(caminho_banco: str, data_lanc):
         data_liq = proximo_dia_util_br(base, dias) if dias > 0 else base
 
         # ===== service
-        usuario = st.session_state.usuario_logado["nome"] if "usuario_logado" in st.session_state and st.session_state.usuario_logado else "Sistema"
+        usuario = (st.session_state.usuario_logado["nome"]
+                   if "usuario_logado" in st.session_state and st.session_state.usuario_logado else "Sistema")
         service = VendasService(caminho_banco)
 
         try:
             venda_id, mov_id = service.registrar_venda(
                 data_venda=str(data_lanc),
                 data_liq=str(data_liq),
-                valor_bruto=float(valor),
+                valor_bruto=_r2(valor),
                 forma=forma,
                 parcelas=int(parcelas or 1),
                 bandeira=bandeira or "",
                 maquineta=maquineta or "",
                 banco_destino=banco_destino,
-                taxa_percentual=float(taxa or 0.0),
+                taxa_percentual=_r2(taxa or 0.0),
                 usuario=usuario
             )
 
             if venda_id == -1:
                 st.session_state["msg_ok"] = "⚠️ Venda já registrada (idempotência)."
             else:
-                valor_liq = float(valor) * (1 - float(taxa or 0.0)/100.0)
+                valor_liq = _r2(float(valor) * (1 - float(taxa or 0.0) / 100.0))
                 msg_liq = (
                     f"Liquidação de {formatar_valor(valor_liq)} em {(banco_destino or 'Caixa')} "
                     f"em {pd.to_datetime(data_liq).strftime('%d/%m/%Y')}"
