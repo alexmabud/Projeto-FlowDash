@@ -162,39 +162,3 @@ def pagina_saldos_bancarios(caminho_banco: str):
             st.info("ℹ️ Nenhum lançamento registrado ainda.")
     except Exception as e:
         st.error(f"Erro ao carregar os lançamentos: {e}")
-
-    # --- Resumo diário por banco (somatório do dia) ---
-    st.markdown("---")
-    st.markdown("### 📆 Resumo Diário por Banco (somatório do dia)")
-
-    try:
-        with sqlite3.connect(caminho_banco) as conn:
-            df_raw = pd.read_sql("SELECT * FROM saldos_bancos", conn)
-
-        if df_raw.empty or "data" not in df_raw.columns:
-            st.info("Ainda não há lançamentos para resumir.")
-            return
-
-        df_raw["data"] = pd.to_datetime(df_raw["data"], errors="coerce")
-        if df_raw["data"].isna().all():
-            st.warning("Não foi possível interpretar datas em saldos_bancos.")
-            return
-
-        col_bancos_existentes = [b for b in bancos if b in df_raw.columns]
-        for b in col_bancos_existentes:
-            df_raw[b] = pd.to_numeric(df_raw[b], errors="coerce").fillna(0.0)
-
-        df_resumo = df_raw.groupby(df_raw["data"].dt.date)[col_bancos_existentes].sum().reset_index()
-        df_resumo = df_resumo.rename(columns={"data": "Data"})
-        df_resumo["Data"] = pd.to_datetime(df_resumo["Data"]).dt.strftime("%d/%m/%Y")
-
-        df_fmt = df_resumo.copy()
-        for b in col_bancos_existentes:
-            df_fmt[b] = df_fmt[b].apply(
-                lambda x: f"R$ {x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            )
-
-        st.dataframe(df_fmt, use_container_width=True, hide_index=True)
-
-    except Exception as e:
-        st.error(f"Erro ao calcular o resumo diário: {e}")
