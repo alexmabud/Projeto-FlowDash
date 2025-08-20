@@ -80,13 +80,19 @@ def _subtrair_saldo_banco(caminho_banco: str, data_str: str, banco_nome: str, va
 def render_transferencia_bancaria(caminho_banco: str, data_lanc):
     """
     Transfere saldo entre dois bancos (banco → banco).
+
     Efeitos:
       - movimentacoes_bancarias: cria 2 linhas
-          * SAÍDA no banco de origem com origem='transf_bancos_saida'
-          * ENTRADA no banco de destino com origem='transf_bancos'
-        (o seu resumo diário soma apenas 'origem = transf_bancos', então contará só a ENTRADA)
+          * SAÍDA no banco de origem (origem='transf_bancos_saida')
+          * ENTRADA no banco de destino (origem='transf_bancos')
+        (o card de resumo soma apenas 'origem = transf_bancos', então contará só a ENTRADA)
       - saldos_bancos: subtrai no banco de origem e soma no destino (na mesma data)
+
+    As DUAS linhas recebem o MESMO `referencia_id` (id da SAÍDA).
+    `trans_uid` é único por linha (UNIQUE no schema).
+    Observações automáticas incluem o valor e REF.
     """
+
     # Toggle do formulário
     if st.button("🔁 Transferência entre Bancos", use_container_width=True, key="btn_transf_bancos_toggle"):
         st.session_state.form_transf_bancos = not st.session_state.get("form_transf_bancos", False)
@@ -119,28 +125,20 @@ def render_transferencia_bancaria(caminho_banco: str, data_lanc):
         )
 
     valor = st.number_input("Valor da Transferência", min_value=0.0, step=0.01, format="%.2f", key="transf_bancos_valor")
-    observacao = st.text_input("Observação (opcional)", key="transf_bancos_obs")
 
-    # Resumo
     st.info("\n".join([
         "**Confirme os dados da transferência**",
         f"- **Data:** {pd.to_datetime(data_lanc).strftime('%d/%m/%Y')}",
         f"- **Valor:** {formatar_valor(valor or 0.0)}",
         f"- **Origem:** {(banco_origem or '—')}",
         f"- **Destino:** {(banco_destino or '—')}",
-        f"- **Observação:** {(observacao or '—')}",
+        "- Serão criadas 2 linhas com o MESMO referencia_id (id da SAÍDA).",
     ]))
 
-    # Confirmação obrigatória
     confirmar = st.checkbox("Confirmo os dados acima", key="transf_bancos_confirmar")
-
-    # Botão só habilita se confirmar
     salvar_btn = st.button("💾 Registrar Transferência", use_container_width=True, key="transf_bancos_salvar", disabled=not confirmar)
-
     if not salvar_btn:
         return
-
-    # 🔒 trava no servidor também
     if not st.session_state.get("transf_bancos_confirmar", False):
         st.warning("⚠️ Confirme os dados antes de salvar.")
         return
@@ -160,7 +158,7 @@ def render_transferencia_bancaria(caminho_banco: str, data_lanc):
         st.warning("⚠️ Origem e destino não podem ser o mesmo banco.")
         return
 
-    # Canonicalizar nomes (não quebra se não achar)
+    # Canonicalizar nomes
     try:
         b_origem = canonicalizar_banco(caminho_banco, b_origem_in) or b_origem_in
     except Exception:
@@ -176,37 +174,60 @@ def render_transferencia_bancaria(caminho_banco: str, data_lanc):
         with get_conn(caminho_banco) as conn:
             cur = conn.cursor()
 
-            # Lançamentos no "livro" (movimentacoes_bancarias)
-            uid_saida = str(uuid.uuid4())
-            uid_entrada = str(uuid.uuid4())
-
-            # 1) SAÍDA no banco de origem (origem ≠ 'transf_bancos' para não poluir seu resumo diário)
+            # 1) SAÍDA no banco de origem (inserimos primeiro para obter o id da SAÍDA)
+            saida_uid = str(uuid.uuid4())  # trans_uid único por linha (UNIQUE no schema)
+            saida_obs = (
+                f"Transferência: {b_origem} → {b_dest} | Saída | "
+                f"Valor={formatar_valor(valor_f)}"
+            )
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco,    tipo,   valor,  origem,                observacao, referencia_id, referencia_tabela, trans_uid)
-                VALUES (?,   ?,       ?,      ?,      ?,                     ?,          ?,             ?,                 ?)
+                    (data, banco,  tipo,   valor,  origem,                observacao,
+                     referencia_id, referencia_tabela, trans_uid)
+                VALUES (?,   ?,     ?,      ?,      ?,                     ?,
+                        ?,             ?,                 ?)
             """, (
-                data_str, b_origem, "saida", valor_f,
-                "transf_bancos_saida",
-                (observacao or "").strip(),
-                None, None, uid_saida
+                data_str, b_origem, "saida", valor_f, "transf_bancos_saida",
+                saida_obs,
+                None, "movimentacoes_bancarias", saida_uid
             ))
+            saida_id = cur.lastrowid
 
-            # 2) ENTRADA no banco de destino (origem = 'transf_bancos' → aparece no seu Resumo do Dia)
+            # 2) ENTRADA no banco de destino (MESMO referencia_id = id da SAÍDA)
+            entrada_uid = str(uuid.uuid4())  # outro trans_uid único
+            entrada_obs = (
+                f"Transferência: {b_origem} → {b_dest} | Entrada | "
+                f"Valor={formatar_valor(valor_f)} | REF={saida_id}"
+            )
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco,    tipo,     valor,  origem,         observacao, referencia_id, referencia_tabela, trans_uid)
-                VALUES (?,   ?,       ?,        ?,      ?,              ?,          ?,             ?,                 ?)
+                    (data, banco,   tipo,     valor,  origem,         observacao,
+                     referencia_id, referencia_tabela, trans_uid)
+                VALUES (?,   ?,      ?,        ?,      ?,              ?,
+                        ?,             ?,                 ?)
             """, (
-                data_str, b_dest, "entrada", valor_f,
-                "transf_bancos",
-                (observacao or "").strip(),
-                None, None, uid_entrada
+                data_str, b_dest, "entrada", valor_f, "transf_bancos",
+                entrada_obs,
+                saida_id, "movimentacoes_bancarias", entrada_uid
             ))
+            entrada_id = cur.lastrowid
+
+            # 3) Atualiza a SAÍDA para também ter referencia_id = id da SAÍDA e REF na observação
+            saida_obs_final = (
+                f"Transferência: {b_origem} → {b_dest} | Saída | "
+                f"Valor={formatar_valor(valor_f)} | REF={saida_id}"
+            )
+            cur.execute("""
+                UPDATE movimentacoes_bancarias
+                   SET referencia_id = ?,
+                       referencia_tabela = ?,
+                       observacao = ?
+                 WHERE id = ?
+            """, (saida_id, "movimentacoes_bancarias", saida_obs_final, saida_id))
 
             conn.commit()
 
-        # 3) Atualiza saldos_bancos (mesma data)
+        # 4) Atualiza saldos_bancos (mesma data)
         #    - soma no DESTINO
         try:
             upsert_saldos_bancos(caminho_banco, data_str, b_dest, valor_f)
@@ -221,7 +242,8 @@ def render_transferencia_bancaria(caminho_banco: str, data_lanc):
 
         st.session_state["msg_ok"] = (
             f"✅ Transferência registrada: {formatar_valor(valor_f)} "
-            f"de **{b_origem}** → **{b_dest}**."
+            f"de **{b_origem}** → **{b_dest}**. "
+            f"(IDs: saída #{saida_id}, entrada #{entrada_id} • ref_id comum={saida_id})"
         )
         st.session_state.form_transf_bancos = False
         st.rerun()
