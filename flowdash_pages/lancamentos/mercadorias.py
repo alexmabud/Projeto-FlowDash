@@ -46,12 +46,18 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
     # Toggle de visibilidade — use chave DIFERENTE da do st.form
     if st.button("🧾 Compra de Mercadorias", use_container_width=True, key="btn_merc_compra_toggle"):
         st.session_state["show_merc_compra"] = not st.session_state.get("show_merc_compra", False)
+        # Ao abrir, limpe o checkbox ANTES dele ser criado neste run
+        if st.session_state["show_merc_compra"]:
+            if "merc_compra_confirma_out" in st.session_state:
+                del st.session_state["merc_compra_confirma_out"]
+        st.rerun()
+
     if not st.session_state.get("show_merc_compra", False):
         return
 
     st.markdown("#### 🧾 Compra de Mercadorias")
 
-    with st.form("form_merc_compra"):  # NÃO escrever em st.session_state["form_merc_compra"]
+    with st.form("form_merc_compra"):
         # Linha 1 — Data (do topo), Coleção, Fornecedor
         c1, c2, c3 = st.columns([1, 1, 1.4])
         with c1:
@@ -69,23 +75,19 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
         with c5:
             frete = st.number_input("Frete (R$)", min_value=0.0, step=0.01, key="merc_compra_frete")
         with c6:
-            # ✅ Padronização de formas de pagamento
             forma_opts = ["PIX", "BOLETO", "CRÉDITO", "DÉBITO", "DINHEIRO", "OUTRO"]
             forma_sel = st.selectbox("Forma de Pagamento", forma_opts, key="merc_compra_forma_sel")
         with c7:
             parcelas = st.number_input("Parcelas", min_value=1, max_value=360, step=1, value=1, key="merc_compra_parcelas")
 
-        # Quando OUTRO, captura texto e normaliza; caso contrário usa o label padronizado
         forma_pagamento = (
             st.text_input("Informe a forma de pagamento (OUTRO)", key="merc_compra_forma_outro").strip().upper()
             if forma_sel == "OUTRO" else forma_sel
         )
-
-        # Feedback visual amigável
         if forma_pagamento == "CRÉDITO":
             st.caption(f"Parcelas: **{int(parcelas)}×**")
 
-        # Linha 3 — APENAS Previsões (calendário) — efetivos ficam NO RECEBIMENTO
+        # Linha 3 — Previsões (somente calendário)
         st.markdown("###### Previsões")
         p1, p2 = st.columns(2)
         with p1:
@@ -100,21 +102,32 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
         with n2:
             numero_nf_str = st.text_input("Número da Nota Fiscal", key="merc_compra_num_nf")
 
-        confirmar = st.checkbox("Confirmo os dados", key="merc_compra_confirma")
-        submitted = st.form_submit_button("💾 Salvar Compra", use_container_width=True, disabled=not confirmar)
+        submitted = st.form_submit_button(
+            "💾 Salvar Compra",
+            use_container_width=True,
+            disabled=not st.session_state.get("merc_compra_confirma_out", False)
+        )
+
+    # ✅ Checkbox posicionado ABAIXO do formulário (visual)
+    st.checkbox("Confirmo os dados", key="merc_compra_confirma_out")
 
     if not submitted:
         return
 
-    # Validações mínimas
+    # Validações mínimas + server-side do checkbox
+    if not st.session_state.get("merc_compra_confirma_out", False):
+        st.warning("⚠️ Marque 'Confirmo os dados' para salvar.")
+        return
+
+    colecao = (colecao or "").strip()
+    fornecedor = (fornecedor or "").strip()
+
     if not fornecedor or valor_mercadoria <= 0:
         st.warning("⚠️ Informe fornecedor e um valor de mercadoria maior que zero.")
         return
 
     # Conversões
     frete_f = float(frete) if frete is not None else None
-
-    # ✅ Validação explícita para CRÉDITO (server-side)
     try:
         parcelas_int = int(parcelas)
     except Exception:
@@ -124,13 +137,8 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
         return
     if parcelas_int < 1:
         parcelas_int = 1
-        st.info("ℹ️ Parcelas ajustadas para 1.")
-
-    parcelas_f = int(parcelas_int)
-
     numero_pedido = _to_float_or_none(numero_pedido_str)
     numero_nf = _to_float_or_none(numero_nf_str)
-
     previsao_faturamento = str(prev_fat_dt) if prev_fat_dt else None
     previsao_recebimento = str(prev_rec_dt) if prev_rec_dt else None
 
@@ -147,7 +155,7 @@ def render_merc_compra(caminho_banco: str, data_lanc: date):
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data_txt, colecao, fornecedor, float(valor_mercadoria), frete_f,
-                forma_pagamento, parcelas_f,
+                forma_pagamento, int(parcelas_int),
                 previsao_faturamento, None,
                 previsao_recebimento, None,
                 numero_pedido, numero_nf
@@ -168,6 +176,12 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
     # Toggle de visibilidade — chave separada
     if st.button("📥 Recebimento de Mercadorias", use_container_width=True, key="btn_merc_receb_toggle"):
         st.session_state["show_merc_receb"] = not st.session_state.get("show_merc_receb", False)
+        # Ao abrir, limpe o checkbox ANTES dele ser criado neste run
+        if st.session_state["show_merc_receb"]:
+            if "merc_receb_confirma_out" in st.session_state:
+                del st.session_state["merc_receb_confirma_out"]
+        st.rerun()
+
     if not st.session_state.get("show_merc_receb", False):
         return
 
@@ -238,7 +252,7 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
         st.warning("Seleção inválida.")
         return
 
-    with st.form("form_merc_receb"):  # NÃO escrever em st.session_state["form_merc_receb"]
+    with st.form("form_merc_receb"):
         # Linha 1 — cabeçalho bloqueado
         b1, b2, b3 = st.columns([1, 1, 1.4])
         with b1:
@@ -288,10 +302,21 @@ def render_merc_recebimento(caminho_banco: str, data_lanc: date):
             placeholder="Opcional"
         )
 
-        confirmar = st.checkbox("Confirmo os dados", key="merc_receb_confirma")
-        submitted = st.form_submit_button("💾 Salvar Recebimento", use_container_width=True, disabled=not confirmar)
+        submitted = st.form_submit_button(
+            "💾 Salvar Recebimento",
+            use_container_width=True,
+            disabled=not st.session_state.get("merc_receb_confirma_out", False)
+        )
+
+    # ✅ Checkbox posicionado ABAIXO do formulário (visual)
+    st.checkbox("Confirmo os dados", key="merc_receb_confirma_out")
 
     if not submitted:
+        return
+
+    # Validação server-side extra (segurança)
+    if not st.session_state.get("merc_receb_confirma_out", False):
+        st.warning("⚠️ Marque 'Confirmo os dados' para salvar.")
         return
 
     try:
