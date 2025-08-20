@@ -6,22 +6,21 @@ from utils.utils import formatar_valor
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 from .shared_ui import upsert_saldos_bancos, canonicalizar_banco  # helpers padronizados
 
-
 def _r2(x) -> float:
     """Arredonda em 2 casas (evita -0,00)."""
     return round(float(x or 0.0), 2)
 
-
 def render_deposito(caminho_banco: str, data_lanc):
     """
-    Deposita DINHEIRO do Caixa 2 em um banco:
-      - Debita primeiro de 'caixa2_dia'; se faltar, debita o restante de 'caixa_2'.
-      - Insere snapshot em 'saldos_caixas' com os novos saldos.
-      - Lança UMA ENTRADA em 'movimentacoes_bancarias' (origem='deposito') para o banco escolhido.
-      - Soma o valor no banco (coluna correspondente) em 'saldos_bancos' na MESMA data.
+    Depósito: debita do Caixa 2 (primeiro do dia, depois do saldo) e credita no banco escolhido.
+    - saldos_caixas: UPSERT por dia (uma linha por dia).
+    - movimentacoes_bancarias: **uma linha por lançamento** (sem agregar).
+      -> referencia_id recebe o próprio id da linha (self-reference)
+      -> referencia_tabela = 'movimentacoes_bancarias'
+    - saldos_bancos: soma na coluna do banco na mesma data (helper upsert_saldos_bancos).
     """
     # Toggle do formulário
-    if st.button("🏦 Depósito (Caixa 2 → Banco)", use_container_width=True, key="btn_deposito_toggle"):
+    if st.button("🏦 Depósito Bancário", use_container_width=True, key="btn_deposito_toggle"):
         st.session_state.form_deposito = not st.session_state.get("form_deposito", False)
         if st.session_state.form_deposito:
             st.session_state["deposito_confirmar"] = False  # sempre reinicia desmarcado
@@ -58,10 +57,7 @@ def render_deposito(caminho_banco: str, data_lanc):
 
     # Confirmação obrigatória
     confirmar = st.checkbox("Confirmo os dados acima", key="deposito_confirmar")
-
-    # Botão só habilita se confirmar
     salvar_btn = st.button("💾 Registrar Depósito", use_container_width=True, key="deposito_salvar", disabled=not confirmar)
-
     if not salvar_btn:
         return
 
@@ -89,88 +85,110 @@ def render_deposito(caminho_banco: str, data_lanc):
     try:
         data_str = str(data_lanc)
         valor_f = _r2(valor)
-        trans_uid = str(uuid.uuid4())  # identificador único do lançamento no livro
 
         with get_conn(caminho_banco) as conn:
             cur = conn.cursor()
 
-            # 1) Buscar último snapshot de saldos_caixas
-            row = cur.execute("""
-                SELECT data, caixa, caixa_2, caixa_vendas, caixa_total, caixa2_dia, caixa2_total
-                  FROM saldos_caixas
-              ORDER BY date(data) DESC, rowid DESC
-                 LIMIT 1
-            """).fetchone()
+            # ================== SNAPSHOT DO DIA EM saldos_caixas (UPSERT) ==================
+            df_caixas = pd.read_sql(
+                "SELECT id, data, caixa, caixa_2, caixa_vendas, caixa_total, caixa2_dia, caixa2_total FROM saldos_caixas",
+                conn
+            )
+            snap_id = None
+            base_caixa = base_caixa2 = base_vendas = base_caixa2dia = 0.0
 
-            # saldos atuais (ou zero se não houver snapshot)
-            caixa        = _r2(float(row[1])) if row else 0.0
-            caixa_2      = _r2(float(row[2])) if row else 0.0
-            caixa_vendas = _r2(float(row[3])) if row else 0.0
-            caixa2_dia   = _r2(float(row[5])) if row else 0.0
+            if not df_caixas.empty:
+                df_caixas["data"] = pd.to_datetime(df_caixas["data"], errors="coerce", dayfirst=True)
+                same_day = df_caixas[df_caixas["data"].dt.date == pd.to_datetime(data_lanc).date()]
+                if not same_day.empty:
+                    same_day = same_day.sort_values(["data","id"]).tail(1)
+                    snap_id        = int(same_day.iloc[0]["id"])
+                    base_caixa     = _r2(same_day.iloc[0].get("caixa", 0.0))
+                    base_caixa2    = _r2(same_day.iloc[0].get("caixa_2", 0.0))
+                    base_vendas    = _r2(same_day.iloc[0].get("caixa_vendas", 0.0))
+                    base_caixa2dia = _r2(same_day.iloc[0].get("caixa2_dia", 0.0))
+                else:
+                    prev = df_caixas[df_caixas["data"].dt.date < pd.to_datetime(data_lanc).date()]
+                    if not prev.empty:
+                        prev = prev.sort_values(["data","id"]).tail(1)
+                        base_caixa     = _r2(prev.iloc[0].get("caixa", 0.0))
+                        base_caixa2    = _r2(prev.iloc[0].get("caixa_2", 0.0))
+                        base_vendas    = _r2(prev.iloc[0].get("caixa_vendas", 0.0))
+                        base_caixa2dia = 0.0  # novo dia começa com 0 no caixa2_dia
 
-            # 2) Disponível no Caixa 2 (dia + saldo acumulado)
-            caixa2_disp_total = _r2(caixa2_dia + caixa_2)
-            if valor_f > caixa2_disp_total:
+            base_total_cx2 = _r2(base_caixa2 + base_caixa2dia)
+            if valor_f > base_total_cx2:
                 st.warning(
-                    f"⚠️ Valor indisponível no Caixa 2. Disponível: {formatar_valor(caixa2_disp_total)} "
-                    f"(Dia: {formatar_valor(caixa2_dia)} • Saldo: {formatar_valor(caixa_2)})"
+                    f"⚠️ Valor indisponível no Caixa 2. Disponível: {formatar_valor(base_total_cx2)} "
+                    f"(Dia: {formatar_valor(base_caixa2dia)} • Saldo: {formatar_valor(base_caixa2)})"
                 )
                 return
 
-            # 3) Regra: abate primeiro de 'caixa2_dia', depois de 'caixa_2'
-            usar_de_dia   = _r2(min(valor_f, caixa2_dia))
+            # Debita primeiro do dia, depois do saldo
+            usar_de_dia   = _r2(min(valor_f, base_caixa2dia))
             usar_de_saldo = _r2(valor_f - usar_de_dia)
 
-            novo_caixa2_dia = _r2(caixa2_dia - usar_de_dia)
-            novo_caixa_2    = _r2(caixa_2 - usar_de_saldo)
-
-            # clamps (não negativos)
-            novo_caixa2_dia = max(0.0, novo_caixa2_dia)
-            novo_caixa_2    = max(0.0, novo_caixa_2)
-
-            # 4) Recalcular totais
-            #    Caixa Total (dinheiro físico) não muda: envolve 'caixa' e 'caixa_vendas'
-            novo_caixa_total  = _r2(caixa + caixa_vendas)
-            #    Caixa 2 Total = novo_caixa_2 + novo_caixa2_dia
+            novo_caixa2_dia  = max(0.0, _r2(base_caixa2dia - usar_de_dia))
+            novo_caixa_2     = max(0.0, _r2(base_caixa2 - usar_de_saldo))
+            # Caixa físico não muda no depósito (vai do Caixa 2 pro banco)
+            novo_caixa        = base_caixa
+            novo_caixa_vendas = base_vendas
+            novo_caixa_total  = _r2(novo_caixa + novo_caixa_vendas)
             novo_caixa2_total = _r2(novo_caixa_2 + novo_caixa2_dia)
 
-            # 5) Gravar snapshot em saldos_caixas
-            cur.execute("""
-                INSERT INTO saldos_caixas
-                    (data, caixa, caixa_2, caixa_vendas, caixa_total, caixa2_dia, caixa2_total)
-                VALUES (?,    ?,     ?,       ?,            ?,            ?,         ?)
-            """, (
-                data_str,
-                caixa,                # inalterado
-                novo_caixa_2,         # atualizado (↓ se houve uso)
-                caixa_vendas,         # inalterado
-                novo_caixa_total,     # recalculado (igual ao anterior)
-                novo_caixa2_dia,      # atualizado (↓)
-                novo_caixa2_total     # recalculado
-            ))
+            if snap_id is not None:
+                cur.execute("""
+                    UPDATE saldos_caixas
+                       SET caixa=?,
+                           caixa_2=?,
+                           caixa_vendas=?,
+                           caixa_total=?,
+                           caixa2_dia=?,
+                           caixa2_total=?
+                     WHERE id=?
+                """, (novo_caixa, novo_caixa_2, novo_caixa_vendas, novo_caixa_total,
+                      novo_caixa2_dia, novo_caixa2_total, snap_id))
+            else:
+                cur.execute("""
+                    INSERT INTO saldos_caixas
+                        (data, caixa, caixa_2, caixa_vendas, caixa_total, caixa2_dia, caixa2_total)
+                    VALUES (?,    ?,     ?,       ?,            ?,           ?,          ?)
+                """, (data_str, novo_caixa, novo_caixa_2, novo_caixa_vendas,
+                      novo_caixa_total, novo_caixa2_dia, novo_caixa2_total))
 
-            # 6) Lançar UMA entrada no livro (movimentacoes_bancarias)
+            # ================== LIVRO: **uma linha por lançamento** ==================
+            trans_uid = str(uuid.uuid4())
             observ = (
-                "Depósito (Caixa 2 → Banco) | "
-                f"abatido: Caixa 2 (dia)={usar_de_dia:.2f}, Caixa 2 (saldo)={usar_de_saldo:.2f}"
+                f"Depósito Cx2→{banco_nome} | "
+                f"Valor={formatar_valor(valor_f)} | "
+                f"dia={usar_de_dia:.2f}; saldo={usar_de_saldo:.2f}"
             )
             cur.execute("""
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco,    tipo,     valor,  origem,     observacao, referencia_id, referencia_tabela, trans_uid)
-                VALUES (?,   ?,       ?,        ?,      ?,          ?,          ?,             ?,                 ?)
+                    (data, banco,   tipo,     valor,  origem,   observacao,
+                     referencia_id, referencia_tabela, trans_uid)
+                VALUES (?,   ?,      ?,        ?,      ?,        ?,
+                        ?,             ?,                 ?)
             """, (
-                data_str, banco_nome, "entrada", valor_f,
-                "deposito", observ,
-                None, None, trans_uid
+                data_str, banco_nome, "entrada", valor_f, "deposito", observ,
+                None, "movimentacoes_bancarias", trans_uid
             ))
+            mov_id = cur.lastrowid
+
+            # Atualiza a própria linha com referencia_id = seu id e adiciona REF na observação
+            observ_final = observ + f" | REF={mov_id}"
+            cur.execute("""
+                UPDATE movimentacoes_bancarias
+                   SET referencia_id = ?, observacao = ?
+                 WHERE id = ?
+            """, (mov_id, observ_final, mov_id))
 
             conn.commit()
 
-        # 7) Atualizar saldos_bancos (soma na coluna do banco, na mesma data)
+        # ================== saldos_bancos (helper padronizado) ==================
         try:
             upsert_saldos_bancos(caminho_banco, data_str, banco_nome, valor_f)
         except Exception as e:
-            # Se a tabela não existir ou o banco não estiver cadastrado, só avisa
             st.warning(f"Não foi possível atualizar saldos_bancos para '{banco_nome}': {e}")
 
         st.session_state["msg_ok"] = (
