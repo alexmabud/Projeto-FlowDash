@@ -1,2 +1,7 @@
-/data/
-**/data/
+# --- Python cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Pastas "data" (na raiz e em qualquer subpasta) ---
+data/
