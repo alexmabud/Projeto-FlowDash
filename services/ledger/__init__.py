@@ -1,12 +1,24 @@
+# services/ledger/__init__.py
 """
-Pacote Ledger (serviços financeiros).
-
-Mantém compatibilidade com:
-    from services.ledger import LedgerService
-
-Ao longo da refatoração, a classe `LedgerService` deve residir em
-`service_ledger.py`, e este __init__ apenas a reexporta.
+Pacote dos mixins do Ledger.
 """
-from .service_ledger import LedgerService
 
-__all__ = ["LedgerService"]
+from .service_ledger_infra import LedgerInfra
+from .service_ledger_saida import SaidasMixin
+from .service_ledger_credito import CreditoMixin
+from .service_ledger_boleto import BoletoMixin
+from .service_ledger_fatura import FaturaMixin
+from .service_ledger_emprestimo import EmprestimoMixin
+from .service_ledger_autobaixa import AutoBaixaMixin
+from .service_ledger_cap_helpers import CapHelpersMixin
+
+__all__ = [
+    "LedgerInfra",
+    "SaidasMixin",
+    "CreditoMixin",
+    "BoletoMixin",
+    "FaturaMixin",
+    "EmprestimoMixin",
+    "AutoBaixaMixin",
+    "CapHelpersMixin",
+]
