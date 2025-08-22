@@ -2,9 +2,9 @@
 Módulo Shared UI
 ================
 
-Este módulo concentra **componentes reutilizáveis de interface** em Streamlit, 
-facilitando a padronização visual e a manutenção do sistema. Ele fornece funções 
-auxiliares para renderização de botões, tabelas, cards e elementos visuais comuns 
+Este módulo concentra **componentes reutilizáveis de interface** em Streamlit,
+facilitando a padronização visual e a manutenção do sistema. Ele fornece funções
+auxiliares para renderização de botões, tabelas, cards e elementos visuais comuns
 a várias páginas do FlowDash.
 
 Funcionalidades principais
@@ -13,16 +13,18 @@ Funcionalidades principais
 - Funções para exibir **tabelas com formatação padronizada** (valores monetários,
   percentuais e datas).
 - Criação de **componentes de formulário reutilizáveis** (inputs, selects, etc.).
-- Padronização de estilos visuais (cores, ícones, espaçamentos) para manter a 
+- Padronização de estilos visuais (cores, ícones, espaçamentos) para manter a
   identidade do sistema.
 - Suporte a mensagens de status (alertas, avisos, sucesso).
 
 Detalhes técnicos
 -----------------
 - Construído em cima do Streamlit.
-- Utiliza funções auxiliares de formatação (como `formatar_moeda` e 
+- Utiliza funções auxiliares de formatação (como `formatar_moeda` e
   `formatar_percentual`).
 - Pensado para reduzir duplicação de código nas páginas de lançamentos e cadastros.
+- **Datas**: parsing com `dayfirst=True` para consistência com formato brasileiro.
+- **Consultas de taxas**: matching **case-insensitive** para `forma_pagamento`.
 
 Dependências
 ------------
@@ -55,6 +57,9 @@ def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
     """
     Carrega uma tabela do banco em DataFrame, converte coluna de data e
     padroniza seu nome para 'data' (aceita 'data' ou 'Data').
+
+    Observação:
+        Usa `dayfirst=True` no parsing de datas para aderir ao padrão BR.
     """
     try:
         with get_conn(caminho_banco) as conn:
@@ -63,7 +68,7 @@ def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
         # Detecta coluna de data, qualquer variação de caixa
         col_data = next((c for c in df.columns if c.lower() == "data"), None)
         if col_data:
-            df[col_data] = pd.to_datetime(df[col_data], errors="coerce")
+            df[col_data] = pd.to_datetime(df[col_data], errors="coerce", dayfirst=True)
             if col_data != "data":
                 df = df.rename(columns={col_data: "data"})
         return df
@@ -74,9 +79,10 @@ def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
 def bloco_resumo_dia(itens_ou_linhas, titulo: str = "📆 Resumo do Dia"):
     """
     Renderiza um cartão de resumo como HTML real (components.html).
+
     Aceita:
-      - lista plana: [("Label", "Valor"), ...]              -> 1 linha
-      - lista de linhas: [[("Label","Valor"), ...], ...]    -> n linhas
+        - lista plana: [("Label", "Valor"), ...]              -> 1 linha
+        - lista de linhas: [[("Label","Valor"), ...], ...]    -> n linhas
     """
     # Normaliza para lista de linhas
     if itens_ou_linhas and isinstance(itens_ou_linhas[0], tuple):
@@ -144,7 +150,12 @@ DIAS_COMPENSACAO = {
 
 
 def proximo_dia_util_br(data_base: date, dias: int) -> date:
-    """Retorna a próxima data útil no Brasil (considera fins de semana e, se possível, feriados)."""
+    """
+    Retorna a próxima data útil no Brasil (considera fins de semana e, se possível, feriados).
+
+    Fallback:
+        Se a biblioteca de feriados não estiver disponível, considera apenas fins de semana.
+    """
     try:
         from workalendar.america import BrazilDistritoFederal
         cal = BrazilDistritoFederal()
@@ -174,9 +185,10 @@ def inserir_mov_liquidacao_venda(
 ):
     """
     Registra a liquidação da venda em movimentacoes_bancarias com idempotência:
-      - tipo='entrada' / origem='vendas_liquidacao'
-      - referencia_tabela='entrada'
-      - trans_uid via uid_venda_liquidacao
+
+    - tipo='entrada' / origem='vendas_liquidacao'
+    - referencia_tabela='entrada'
+    - trans_uid via `uid_venda_liquidacao`
     """
     if not valor_liquido or valor_liquido <= 0:
         return
@@ -211,7 +223,7 @@ def inserir_mov_liquidacao_venda(
 
 
 def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float):
-    """Atualiza o saldo de caixa_vendas em saldos_caixas (soma na mesma data)."""
+    """Atualiza o saldo de `caixa_vendas` em `saldos_caixas` (soma na mesma data)."""
     if not valor or valor <= 0:
         return
     with get_conn(caminho_banco) as conn:
@@ -247,37 +259,56 @@ def obter_banco_destino(
     parcelas: Optional[int]
 ) -> Optional[str]:
     """
-    Obtém banco destino (taxas_maquinas) de acordo com forma, maquineta, bandeira e parcelas.
-    Tenta variações para LINK_PAGAMENTO.
+    Obtém banco destino (tabela `taxas_maquinas`) de acordo com forma, maquineta, bandeira e parcelas.
+
+    Notas:
+        - Matching **case-insensitive** para `forma_pagamento` via `UPPER(...)`.
+        - Tenta variação para LINK_PAGAMENTO utilizando CRÉDITO como fallback.
     """
     formas_try = [forma]
     if forma == "LINK_PAGAMENTO":
         formas_try.append("CRÉDITO")
+
     with get_conn(caminho_banco) as conn:
+        # match preciso por bandeira e parcelas (case-insensitive na forma)
         for f in formas_try:
-            row = conn.execute("""
+            row = conn.execute(
+                """
                 SELECT banco_destino FROM taxas_maquinas
-                WHERE forma_pagamento=? AND maquineta=? AND bandeira=? AND parcelas=?
+                WHERE UPPER(forma_pagamento)=? AND maquineta=? AND bandeira=? AND parcelas=?
                 LIMIT 1
-            """, (f, maquineta or "", bandeira or "", int(parcelas or 1))).fetchone()
+                """,
+                (f.upper(), maquineta or "", bandeira or "", int(parcelas or 1))
+            ).fetchone()
             if row and row[0]:
                 return row[0]
+
+        # fallback por maquineta (sem filtrar bandeira/parcelas), ainda case-insensitive na forma
         for f in formas_try:
-            row = conn.execute("""
+            row = conn.execute(
+                """
                 SELECT banco_destino FROM taxas_maquinas
-                WHERE forma_pagamento=? AND maquineta=?
+                WHERE UPPER(forma_pagamento)=? AND maquineta=?
                   AND banco_destino IS NOT NULL AND TRIM(banco_destino)<>'' 
                 LIMIT 1
-            """, (f, maquineta or "")).fetchone()
+                """,
+                (f.upper(), maquineta or "")
+            ).fetchone()
             if row and row[0]:
                 return row[0]
-        row = conn.execute("""
+
+        # último fallback: qualquer registro da maquineta com banco_destino definido
+        row = conn.execute(
+            """
             SELECT banco_destino FROM taxas_maquinas
             WHERE maquineta=? AND banco_destino IS NOT NULL AND TRIM(banco_destino)<>'' 
             LIMIT 1
-        """, (maquineta or "",)).fetchone()
+            """,
+            (maquineta or "",)
+        ).fetchone()
         if row and row[0]:
             return row[0]
+
     return None
 
 
@@ -292,8 +323,8 @@ def _normalize_bank(s: str) -> str:
 
 def canonicalizar_banco(caminho_banco: str, nome_banco: str) -> Optional[str]:
     """
-    Retorna o nome EXATO (como cadastrado) em bancos_cadastrados para o nome_banco informado.
-    Evita criar colunas erradas em saldos_bancos.
+    Retorna o nome EXATO (como cadastrado) em `bancos_cadastrados` para o `nome_banco` informado.
+    Evita criar colunas erradas em `saldos_bancos`.
     """
     alvo = _normalize_bank(nome_banco)
     with get_conn(caminho_banco) as conn:
@@ -329,11 +360,13 @@ def _date_col_name(conn: sqlite3.Connection, table: str) -> str:
 
 def upsert_saldos_bancos(caminho_banco: str, data_str: str, banco_nome: str, valor: float) -> None:
     """
-    Soma 'valor' na coluna do banco 'banco_nome' na linha da data 'data_str'.
-    - Garante que a coluna exista (REAL NOT NULL DEFAULT 0.0)
-    - Cria a linha da data se necessário (ou soma se já existir)
-    - Usa COALESCE para evitar NULL
-    - Funciona com coluna 'data' OU 'Data'
+    Soma `valor` na coluna do banco `banco_nome` na linha da data `data_str`.
+
+    Regras:
+        - Garante que a coluna exista (`REAL NOT NULL DEFAULT 0.0`).
+        - Cria a linha da data se necessário (ou soma se já existir).
+        - Usa COALESCE para evitar `NULL`.
+        - Funciona com coluna `data` OU `Data`.
     """
     if not valor or valor <= 0:
         return
@@ -346,7 +379,7 @@ def upsert_saldos_bancos(caminho_banco: str, data_str: str, banco_nome: str, val
         except Exception:
             nomes_cadastrados = []
         if banco_nome not in nomes_cadastrados:
-            raise ValueError(f"Banco '{banco_nome}' não está cadastrado em bancos_cadastrados.")
+            raise ValueError(f"Banco '{banco_nome}' não está registrado em bancos_cadastrados.")
 
         cols_info = cur.execute("PRAGMA table_info(saldos_bancos);").fetchall()
         existentes = {c[1] for c in cols_info}
@@ -378,3 +411,15 @@ def upsert_saldos_bancos(caminho_banco: str, data_str: str, banco_nome: str, val
             cur.execute(f'INSERT INTO saldos_bancos ({cols_sql}) VALUES ({placeholders});', valores)
 
         conn.commit()
+
+
+# ===========================
+# API pública (estável)
+# ===========================
+__all__ = [
+    "carregar_tabela",
+    "DIAS_COMPENSACAO", "proximo_dia_util_br",
+    "inserir_mov_liquidacao_venda", "registrar_caixa_vendas", "obter_banco_destino",
+    "canonicalizar_banco", "upsert_saldos_bancos",
+    "bloco_resumo_dia",
+]
