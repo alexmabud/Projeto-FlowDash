@@ -1,3 +1,37 @@
+"""
+Módulo Shared UI
+================
+
+Este módulo concentra **componentes reutilizáveis de interface** em Streamlit, 
+facilitando a padronização visual e a manutenção do sistema. Ele fornece funções 
+auxiliares para renderização de botões, tabelas, cards e elementos visuais comuns 
+a várias páginas do FlowDash.
+
+Funcionalidades principais
+--------------------------
+- Renderização de **cards informativos** (ex.: resumo de entradas, saídas, caixa).
+- Funções para exibir **tabelas com formatação padronizada** (valores monetários,
+  percentuais e datas).
+- Criação de **componentes de formulário reutilizáveis** (inputs, selects, etc.).
+- Padronização de estilos visuais (cores, ícones, espaçamentos) para manter a 
+  identidade do sistema.
+- Suporte a mensagens de status (alertas, avisos, sucesso).
+
+Detalhes técnicos
+-----------------
+- Construído em cima do Streamlit.
+- Utiliza funções auxiliares de formatação (como `formatar_moeda` e 
+  `formatar_percentual`).
+- Pensado para reduzir duplicação de código nas páginas de lançamentos e cadastros.
+
+Dependências
+------------
+- streamlit
+- pandas
+- utils.utils (funções de formatação e helpers internos)
+
+"""
+
 import re
 import sqlite3
 from typing import Optional

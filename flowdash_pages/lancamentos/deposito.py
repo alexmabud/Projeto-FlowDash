@@ -1,3 +1,41 @@
+"""
+Módulo Depósito (Lançamentos)
+=============================
+
+Este módulo define a página e a lógica para registrar **depósitos bancários** 
+no sistema FlowDash. Ele é usado para contabilizar valores em espécie que são 
+transferidos do caixa físico para uma conta bancária, mantendo consistência 
+no controle de saldos.
+
+Funcionalidades principais
+--------------------------
+- Registro de depósitos vinculados a um banco específico.
+- Ajuste automático:
+  - Saída do valor no **Caixa** ou **Caixa 2**.
+  - Entrada do valor no **Banco de destino**.
+- Registro da movimentação em `movimentacoes_bancarias` via `LedgerService`.
+- Interface em Streamlit com formulário simples (valor, banco de destino, data).
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit.
+- Operação neutra no fluxo global de caixa (não cria entrada de receita),
+  apenas movimenta recursos entre caixa físico e bancos.
+- Garantia de idempotência através do `LedgerService`.
+- Pode ser expandido para suportar depósitos oriundos de aportes/financiamentos.
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- services.ledger.LedgerService
+- repository.movimentacoes_repository.MovimentacoesRepository
+- flowdash_pages.cadastros.cadastro_classes.BancoRepository
+- shared.db.get_conn
+
+"""
+
 import uuid
 import streamlit as st
 import pandas as pd

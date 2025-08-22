@@ -1,3 +1,25 @@
+"""
+Serviço de Vendas: entrada, liquidação, saldos e log idempotente.
+
+Resumo
+------
+Implementa as regras de negócio para registrar vendas:
+- insere a entrada (bruto e líquido),
+- credita a liquidação no caixa/banco na data correta,
+- registra log idempotente em `movimentacoes_bancarias`.
+
+A camada de UI é responsável por calcular `data_liq` e fornecer
+forma/maquineta/bandeira/parcelas/taxa/banco_destino.
+
+Estilo
+------
+Docstrings padronizadas no estilo Google (pt-BR).
+"""
+
+# =============================
+# Imports
+# =============================
+
 import pandas as pd
 import sqlite3
 from typing import Optional, Tuple
@@ -7,18 +29,40 @@ from shared.db import get_conn
 from shared.ids import uid_venda_liquidacao, sanitize
 from repository.movimentacoes_repository import MovimentacoesRepository
 
+
+# =============================
+# Serviço de Vendas
+# =============================
+
 class VendasService:
-    """
-    Regras de negócio para registrar vendas (entrada + liquidação + saldos + log idempotente).
-    A UI calcula data_liq e decide forma/maquineta/bandeira/parcelas/taxa/banco_destino.
+    """Regras de negócio para registro de vendas.
+
+    Centraliza a operação de registrar a venda (entrada), aplicar a liquidação
+    em caixa/banco na data apropriada e gravar um log idempotente.
     """
 
     def __init__(self, db_path: str):
+        """Inicializa o serviço com o caminho do banco de dados.
+
+        Args:
+            db_path (str): Caminho para o arquivo SQLite.
+        """
         self.db_path = db_path
         self.mov_repo = MovimentacoesRepository(db_path)  # garante schema
 
-    # ---------- infra ----------
+    # =============================
+    # Infraestrutura interna
+    # =============================
+
     def _garantir_linha_saldos_caixas(self, conn, data: str):
+        """Garante a existência da linha em `saldos_caixas` para a data.
+
+        Se não existir, insere uma linha zerada para a data informada.
+
+        Args:
+            conn (sqlite3.Connection): Conexão SQLite aberta.
+            data (str): Data no formato `YYYY-MM-DD`.
+        """
         cur = conn.execute("SELECT 1 FROM saldos_caixas WHERE data = ? LIMIT 1", (data,))
         if not cur.fetchone():
             conn.execute("""
@@ -27,11 +71,27 @@ class VendasService:
             """, (data,))
 
     def _garantir_linha_saldos_bancos(self, conn, data: str):
+        """Garante a existência da linha em `saldos_bancos` para a data.
+
+        Args:
+            conn (sqlite3.Connection): Conexão SQLite aberta.
+            data (str): Data no formato `YYYY-MM-DD`.
+        """
         cur = conn.execute("SELECT 1 FROM saldos_bancos WHERE data = ? LIMIT 1", (data,))
         if not cur.fetchone():
             conn.execute("INSERT OR IGNORE INTO saldos_bancos (data) VALUES (?)", (data,))
 
     def _ajustar_banco_dynamic(self, conn, banco_col: str, delta: float, data: str):
+        """Ajusta dinamicamente a coluna do banco em `saldos_bancos`.
+
+        Cria a coluna do banco (se necessário) e aplica o delta na data indicada.
+
+        Args:
+            conn (sqlite3.Connection): Conexão SQLite aberta.
+            banco_col (str): Nome exato da coluna do banco.
+            delta (float): Variação a aplicar (pode ser positiva ou negativa).
+            data (str): Data do ajuste no formato `YYYY-MM-DD`.
+        """
         # garante coluna dinâmica em saldos_bancos
         cols = pd.read_sql("PRAGMA table_info(saldos_bancos);", conn)["name"].tolist()
         if banco_col not in cols:
@@ -43,7 +103,10 @@ class VendasService:
             (float(delta), data)
         )
 
-    # ---------- regra principal ----------
+    # =============================
+    # Regra principal
+    # =============================
+
     def registrar_venda(
         self,
         data_venda: str,            # YYYY-MM-DD
@@ -57,12 +120,31 @@ class VendasService:
         taxa_percentual: float,
         usuario: str
     ) -> Tuple[int, int]:
-        """
-        Retorna: (venda_id, mov_id) ou (-1, -1) se idempotência bloquear.
-        Faz:
-          - INSERT em 'entrada' (bruto + líquido)
-          - Atualiza saldos na data_liq (caixa_vendas ou banco)
-          - 1 log (liquidação) idempotente em movimentacoes_bancarias
+        """Registra a venda, aplica a liquidação e grava log idempotente.
+
+        Fluxo:
+          1. INSERT em `entrada` (bruto + líquido);
+          2. Atualiza saldos na `data_liq` (caixa_vendas ou banco);
+          3. Registra um único log de liquidação em `movimentacoes_bancarias`
+             protegido por idempotência (`trans_uid`).
+
+        Args:
+            data_venda (str): Data da venda (`YYYY-MM-DD`).
+            data_liq (str): Data da liquidação (`YYYY-MM-DD`).
+            valor_bruto (float): Valor bruto da venda.
+            forma (str): Forma de pagamento.
+            parcelas (int): Número de parcelas (1 para à vista).
+            bandeira (Optional[str]): Bandeira do cartão (quando aplicável).
+            maquineta (Optional[str]): Maquineta/PSP (quando aplicável).
+            banco_destino (Optional[str]): Banco de destino (não usado para DINHEIRO).
+            taxa_percentual (float): Taxa cobrada pela adquirente/PSP (%).
+            usuario (str): Usuário responsável.
+
+        Returns:
+            Tuple[int, int]: `(venda_id, mov_id)`; `(-1, -1)` se bloqueado por idempotência.
+
+        Raises:
+            ValueError: Se valores obrigatórios estiverem inválidos.
         """
         # validações
         if float(valor_bruto) <= 0:

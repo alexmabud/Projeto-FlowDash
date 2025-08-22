@@ -1,3 +1,36 @@
+"""
+Módulo CategoriasRepository
+===========================
+
+Este módulo define a classe `CategoriasRepository`, responsável por gerenciar
+as tabelas de **categorias** e **subcategorias** no banco de dados SQLite.
+Ele centraliza operações de criação, consulta e manutenção da hierarquia de
+classificação das movimentações financeiras.
+
+Funcionalidades principais
+--------------------------
+- Criação automática do schema das tabelas `categorias` e `subcategorias`.
+- Cadastro, alteração e exclusão de categorias e subcategorias.
+- Consulta de categorias e subcategorias ativas.
+- Relacionamento entre categoria → subcategoria (chave estrangeira).
+- Suporte a filtragem e ordenação para uso em formulários de entrada e saída.
+
+Detalhes técnicos
+-----------------
+- Conexão SQLite configurada em modo WAL, com busy_timeout e suporte a
+  foreign keys.
+- Garantia de integridade referencial entre categorias e subcategorias.
+- Organização pensada para integração direta com o `LedgerService` e
+  páginas de lançamentos (entradas, saídas, boletos e cartões).
+
+Dependências
+------------
+- sqlite3
+- pandas
+- typing (Optional, List, Dict)
+
+"""
+
 import sqlite3
 import pandas as pd
 from typing import Optional, List, Tuple

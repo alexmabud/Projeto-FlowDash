@@ -1,3 +1,37 @@
+"""
+Módulo CartoesRepository
+========================
+
+Este módulo define a classe `CartoesRepository`, responsável por gerenciar
+a tabela `cartoes` no banco de dados SQLite. Ele centraliza operações de
+cadastro, consulta e manutenção de cartões de crédito utilizados no sistema.
+
+Funcionalidades principais
+--------------------------
+- Criação automática do schema da tabela `cartoes`.
+- Cadastro de novos cartões (nome, banco associado, data de vencimento, dia de fechamento).
+- Alteração e exclusão de cartões cadastrados.
+- Consulta de cartões ativos para uso em lançamentos de crédito.
+- Integração com o `LedgerService` para geração de faturas futuras e controle
+  de obrigações vinculadas.
+
+Detalhes técnicos
+-----------------
+- Conexão SQLite configurada em modo WAL, com busy_timeout e suporte a
+  foreign keys.
+- Cada cartão possui campos de configuração essenciais para cálculo de
+  competência e fatura (fechamento e vencimento).
+- Estrutura pensada para suportar múltiplos cartões em paralelo, vinculados
+  a diferentes bancos.
+
+Dependências
+------------
+- sqlite3
+- pandas
+- typing (Optional, List, Dict)
+
+"""
+
 import sqlite3
 from typing import Optional, Tuple, List
 

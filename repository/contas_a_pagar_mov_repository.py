@@ -1,3 +1,37 @@
+"""
+Módulo ContasAPagarMovRepository
+================================
+
+Este módulo define a classe `ContasAPagarMovRepository`, responsável por gerenciar
+a tabela `contas_a_pagar_mov` no banco de dados SQLite. Ele centraliza o controle
+de obrigações financeiras (parceladas ou programadas), permitindo registrar,
+atualizar e consultar movimentações vinculadas a contas a pagar.
+
+Funcionalidades principais
+--------------------------
+- Criação automática do schema da tabela `contas_a_pagar_mov`.
+- Registro de novas parcelas/obrigações financeiras.
+- Atualização de status de pagamento (pendente, parcial, quitado).
+- Consulta de lançamentos por credor, competência, vencimento ou status.
+- Suporte a movimentações originadas de cartões de crédito, boletos e empréstimos.
+
+Detalhes técnicos
+-----------------
+- Conexão SQLite configurada em modo WAL, com busy_timeout e suporte a
+  foreign keys.
+- Registro idempotente para evitar duplicidade em lançamentos de parcelas.
+- Métodos preparados para integração com serviços como `LedgerService`
+  e repositórios de cartões e movimentações.
+
+Dependências
+------------
+- sqlite3
+- pandas
+- typing (Optional, Dict, List)
+- datetime (date)
+
+"""
+
 from __future__ import annotations
 
 import sqlite3

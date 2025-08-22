@@ -1,3 +1,40 @@
+"""
+Módulo Caixa (Lançamentos)
+==========================
+
+Este módulo define a página e a lógica para registrar e controlar o **caixa físico**
+da loja no sistema FlowDash. Ele é responsável por acompanhar o dinheiro em espécie
+que entra e sai, garantindo consistência entre **Caixa** e **Caixa 2**.
+
+Funcionalidades principais
+--------------------------
+- Registro de movimentações em dinheiro (entradas e saídas manuais).
+- Controle separado entre:
+  - **Caixa** → dinheiro que permanece na loja.
+  - **Caixa 2** → dinheiro retirado da loja e levado para casa/depósito futuro.
+- Suporte a transferências entre Caixa → Caixa 2 (com registro automático).
+- Integração com `LedgerService` para garantir idempotência e consistência.
+- Exibição em Streamlit com formulário dinâmico e totais consolidados.
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit.
+- Ajusta os saldos em `saldos_caixas` e gera movimentações correspondentes
+  em `movimentacoes_bancarias`.
+- Permite consultas por período para auditoria.
+- Integra-se ao fechamento de caixa e relatórios financeiros (DRE).
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- services.ledger.LedgerService
+- repository.movimentacoes_repository.MovimentacoesRepository
+- shared.db.get_conn
+
+"""
+
 import uuid
 import streamlit as st
 from shared.db import get_conn

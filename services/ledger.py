@@ -1,3 +1,39 @@
+"""
+ledger_service.py — Serviço central do Ledger (saídas e programações)
+
+Propósito
+---------
+Concentrar as regras de negócio para registrar movimentações financeiras de forma
+idempotente, mantendo a consistência entre caixas, bancos e obrigações.
+
+Principais operações
+--------------------
+- Saídas em DINHEIRO (ajusta saldos de caixas e loga movimentações)
+- Saídas bancárias (PIX/DÉBITO; cria coluna dinâmica do banco em saldos_bancos)
+- Compras a CRÉDITO (programação em fatura mensal)
+- BOLETOS programados (parcelas futuras em contas_a_pagar_mov)
+- Pagamentos de BOLETO/FATURA/EMPRÉSTIMO (com atualização de status)
+- Classificação por destino e auto-baixa de títulos em aberto
+
+Tabelas tocadas
+---------------
+saldos_caixas, saldos_bancos, movimentacoes_bancarias, saida,
+contas_a_pagar_mov (+views), cartoes_credito, fatura_cartao_itens,
+emprestimos_financiamentos.
+
+Idempotência e integridade
+--------------------------
+- Cada lançamento recebe um trans_uid determinístico (shared.ids.*).
+- Transações atômicas via get_conn (SQLite com WAL/busy_timeout).
+- Criação segura de colunas dinâmicas em saldos_bancos quando necessário.
+
+Convenções
+----------
+- Datas: YYYY-MM-DD.
+- Valores monetários em float (2 casas).
+- obrigacao_id agrega LANCAMENTO e PAGAMENTO de um mesmo título.
+"""
+
 import pandas as pd
 import sqlite3
 import calendar

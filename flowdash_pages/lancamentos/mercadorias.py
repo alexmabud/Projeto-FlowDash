@@ -1,3 +1,46 @@
+"""
+Módulo Mercadorias (Lançamentos)
+================================
+
+Este módulo define a página e a lógica para registrar e visualizar 
+**mercadorias** no sistema FlowDash. Ele controla compras de estoque, 
+valores de frete e prazos de recebimento, permitindo acompanhamento 
+integrado com o fluxo financeiro.
+
+Funcionalidades principais
+--------------------------
+- Registro de novas mercadorias com informações detalhadas:
+  - Data de compra
+  - Coleção / fornecedor
+  - Valor das mercadorias
+  - Frete
+  - Forma de pagamento
+  - Previsão de faturamento e recebimento
+  - Número do pedido e da nota fiscal
+- Controle de previsões (faturamento e recebimento) para 
+  alinhamento com fluxo de caixa.
+- Exibição em tabela no mesmo formato das páginas de Entradas 
+  e Saídas (filtros por ano/mês, totais acumulados, botões de seleção).
+- Integração futura com o módulo de Estoque.
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit.
+- Usa o banco de dados SQLite via repositórios para salvar e consultar mercadorias.
+- Formatação monetária e de datas padronizada através de funções auxiliares.
+- Pensado para relatórios gerenciais de estoque e DRE.
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- shared.db.get_conn
+- utils.utils (funções de formatação)
+- repositórios de apoio (categorias, bancos, movimentações, quando aplicável)
+
+"""
+
 import streamlit as st
 from datetime import date
 from shared.db import get_conn

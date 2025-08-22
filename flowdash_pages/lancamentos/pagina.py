@@ -1,3 +1,41 @@
+"""
+Módulo Página
+=============
+
+Este módulo organiza a **estrutura de navegação** e renderização das páginas 
+no FlowDash. Ele atua como um ponto central para carregar os módulos de 
+lançamentos, cadastros, relatórios e dashboards dentro da interface Streamlit.
+
+Funcionalidades principais
+--------------------------
+- Controle de **menu lateral** e seleção de páginas.
+- Carregamento dinâmico de subpáginas (Entradas, Saídas, Transferências, 
+  Mercadorias, Empréstimos, etc.).
+- Integração com controle de **perfis de usuário** (Administrador, Gerente, 
+  Vendedor), restringindo o acesso a determinadas seções.
+- Ponto único para configurar o **layout padrão** da aplicação 
+  (título, ícones, estilo, cabeçalho e rodapé).
+- Suporte a session state para persistir a navegação do usuário.
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit.
+- Utiliza componentes reutilizáveis definidos no módulo `shared_ui`.
+- Repositórios e serviços são injetados conforme a página acessada.
+- Mantém coesão entre o fluxo de navegação e os módulos de lançamentos e cadastros.
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- shared_ui (componentes visuais)
+- services.* (LedgerService e outros)
+- repositories.* (bancos, categorias, cartões, movimentações)
+- flowdash_pages.* (módulos específicos de páginas)
+
+"""
+
 import streamlit as st
 from datetime import date
 import pandas as pd

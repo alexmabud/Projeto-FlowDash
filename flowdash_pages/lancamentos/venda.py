@@ -1,3 +1,48 @@
+"""
+Módulo Venda (Lançamentos)
+==========================
+
+Este módulo define a página e a lógica de lançamento de **vendas** no sistema.
+Ele permite registrar entradas financeiras no caixa ou bancos a partir de
+transações de venda, integrando com o `LedgerService` para consistência
+contábil.
+
+Funcionalidades principais
+--------------------------
+- Registro de vendas com diferentes formas de pagamento:
+  - DINHEIRO → ajusta saldos de caixa.
+  - PIX / DÉBITO → ajusta saldos bancários.
+  - CRÉDITO → gera lançamentos futuros vinculados a faturas de cartão.
+  - LINK DE PAGAMENTO → integração prevista para registrar vendas online.
+- Associação de cada venda a categoria e subcategoria, permitindo relatórios
+  detalhados.
+- Integração com o `LedgerService` para aplicar regras de idempotência
+  e controle de saldos.
+- Exibição em interface Streamlit, com formulários dinâmicos para
+  preenchimento do usuário.
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit para interface interativa.
+- Utiliza repositórios internos (`CartoesRepository`, `CategoriasRepository`,
+  `BancoRepository`) para popular selects e validar dados.
+- Pode ser expandido para incluir campos adicionais (cliente, descrição,
+  observações).
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- services.ledger.LedgerService
+- repository.cartoes_repository.CartoesRepository
+- repository.categorias_repository.CategoriasRepository
+- flowdash_pages.cadastros.cadastro_classes.BancoRepository
+- shared.db.get_conn
+- repository.contas_a_pagar_mov_repository.ContasAPagarMovRepository
+
+"""
+
 import streamlit as st
 import pandas as pd
 from shared.db import get_conn  # ✅ conexão padronizada

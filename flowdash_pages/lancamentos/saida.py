@@ -1,3 +1,49 @@
+"""
+Módulo Saída (Lançamentos)
+==========================
+
+Este módulo define a página e a lógica para registrar **saídas financeiras** 
+no sistema. Ele é responsável por controlar despesas pagas em dinheiro, 
+transferências bancárias, boletos, cartões de crédito e outras formas 
+de pagamento, garantindo consistência nos saldos via `LedgerService`.
+
+Funcionalidades principais
+--------------------------
+- Registro de saídas com diferentes formas de pagamento:
+  - DINHEIRO → ajusta saldos de caixa.
+  - PIX / DÉBITO → ajusta saldos bancários.
+  - CRÉDITO → gera lançamentos futuros em `contas_a_pagar_mov` 
+    agrupados por fatura.
+  - BOLETO → gera lançamentos parcelados em `contas_a_pagar_mov`.
+- Associação de cada saída a categoria e subcategoria para relatórios 
+  detalhados.
+- Controle da **origem do dinheiro** (Caixa ou Caixa 2).
+- Integração com o `LedgerService` para aplicar regras de idempotência 
+  e consistência nos saldos.
+- Interface em Streamlit com formulários dinâmicos de preenchimento.
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit.
+- Integra com repositórios de **cartões**, **categorias** e **bancos** 
+  para popular selects e validar dados.
+- Suporta observações, referência externa e descrição detalhada da saída.
+- Pensado para futura integração com relatórios financeiros (DRE).
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- services.ledger.LedgerService
+- repository.cartoes_repository.CartoesRepository
+- repository.categorias_repository.CategoriasRepository
+- flowdash_pages.cadastros.cadastro_classes.BancoRepository
+- repository.contas_a_pagar_mov_repository.ContasAPagarMovRepository
+- shared.db.get_conn
+
+"""
+
 import streamlit as st
 import pandas as pd
 from datetime import date

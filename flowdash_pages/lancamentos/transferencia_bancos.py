@@ -1,3 +1,41 @@
+"""
+Módulo TransferenciaBancos (Lançamentos)
+========================================
+
+Este módulo define a página e a lógica para registrar **transferências entre bancos** 
+ou entre contas diferentes dentro do sistema. Ele permite movimentar saldos de forma 
+controlada e idempotente, sem gerar distorções no fluxo de entradas e saídas.
+
+Funcionalidades principais
+--------------------------
+- Registro de transferências entre contas bancárias distintas.
+- Ajuste automático dos saldos nas tabelas correspondentes.
+- Registro de movimentações no histórico (`movimentacoes_bancarias`).
+- Prevenção de duplicidade via integração com `LedgerService`.
+- Interface em Streamlit para escolha do banco de origem e destino.
+
+Detalhes técnicos
+-----------------
+- Implementado em Streamlit para interação via formulário.
+- Validações garantem que o banco de origem e o de destino não sejam iguais.
+- A operação é neutra no fluxo de caixa (não afeta entradas/saídas globais),
+  mas altera os saldos individuais de cada banco.
+- Cada transferência gera dois registros:
+  - Saída no banco de origem.
+  - Entrada no banco de destino.
+
+Dependências
+------------
+- streamlit
+- pandas
+- datetime
+- services.ledger.LedgerService
+- repository.movimentacoes_repository.MovimentacoesRepository
+- flowdash_pages.cadastros.cadastro_classes.BancoRepository
+- shared.db.get_conn
+
+"""
+
 import uuid
 import streamlit as st
 import pandas as pd

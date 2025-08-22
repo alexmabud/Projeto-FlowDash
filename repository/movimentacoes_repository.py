@@ -1,3 +1,36 @@
+"""
+Módulo MovimentacoesRepository
+==============================
+
+Este módulo define a classe `MovimentacoesRepository`, responsável por gerenciar
+a tabela `movimentacoes_bancarias` no banco SQLite. Ele centraliza as operações
+de inserção, consulta e garantia de schema para movimentações financeiras.
+
+Funcionalidades principais
+--------------------------
+- Criação automática do schema da tabela `movimentacoes_bancarias` e índices.
+- Registro de entradas (valores positivos) e saídas (valores negativos).
+- Armazenamento de metadados como origem, observação, tabela de referência
+  e identificador externo para garantir idempotência.
+- Consultas de movimentações por período, banco ou referência.
+
+Detalhes técnicos
+-----------------
+- Conexão SQLite configurada em modo WAL, com busy_timeout e suporte a
+  foreign keys.
+- Transações são atômicas, garantindo consistência dos dados.
+- Uso de métodos utilitários internos (`_get_conn`) para padronizar
+  conexões e simplificar manutenção.
+
+Dependências
+------------
+- sqlite3
+- hashlib
+- typing (Optional, Dict, Any)
+
+"""
+
+
 import sqlite3
 import hashlib
 from typing import Optional, Dict, Any
