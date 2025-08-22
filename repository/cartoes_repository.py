@@ -1,34 +1,31 @@
 """
-Módulo CartoesRepository
-========================
+Módulo Cartões (Repositório)
+============================
 
-Este módulo define a classe `CartoesRepository`, responsável por gerenciar
-a tabela `cartoes` no banco de dados SQLite. Ele centraliza operações de
-cadastro, consulta e manutenção de cartões de crédito utilizados no sistema.
+Este módulo define a classe `CartoesRepository`, responsável por acessar e
+gerenciar a tabela **`cartoes_credito`** no SQLite. Centraliza operações de
+consulta e validação de configuração dos cartões usados em lançamentos de
+crédito (vencimento e fechamento).
 
 Funcionalidades principais
 --------------------------
-- Criação automática do schema da tabela `cartoes`.
-- Cadastro de novos cartões (nome, banco associado, data de vencimento, dia de fechamento).
-- Alteração e exclusão de cartões cadastrados.
-- Consulta de cartões ativos para uso em lançamentos de crédito.
-- Integração com o `LedgerService` para geração de faturas futuras e controle
-  de obrigações vinculadas.
+- Validação de configuração de cartão (dia de vencimento e dias de fechamento).
+- Consulta de cartão por nome → retorna `(vencimento_dia, dias_fechamento)`.
+- Listagem de nomes de cartões (ordenada e normalizada).
 
 Detalhes técnicos
 -----------------
-- Conexão SQLite configurada em modo WAL, com busy_timeout e suporte a
-  foreign keys.
-- Cada cartão possui campos de configuração essenciais para cálculo de
-  competência e fatura (fechamento e vencimento).
-- Estrutura pensada para suportar múltiplos cartões em paralelo, vinculados
-  a diferentes bancos.
+- Conexão SQLite configurada com:
+  - `PRAGMA journal_mode=WAL;`
+  - `PRAGMA busy_timeout=30000;`
+  - `PRAGMA foreign_keys=ON;`
+- Comparações de nome **case/trim-insensitive** no SQL.
+- Não altera schema nem dados; foco em leitura e validação.
 
 Dependências
 ------------
 - sqlite3
-- pandas
-- typing (Optional, List, Dict)
+- typing (Optional, Tuple, List)
 
 """
 
@@ -37,10 +34,20 @@ from typing import Optional, Tuple, List
 
 
 class CartoesRepository:
+    """
+    Repositório para operações de leitura/validação sobre `cartoes_credito`.
+
+    Parâmetros:
+        db_path (str): Caminho do arquivo SQLite.
+    """
     def __init__(self, db_path: str):
         self.db_path = db_path
 
-    def _get_conn(self):
+    def _get_conn(self) -> sqlite3.Connection:
+        """
+        Abre conexão SQLite com PRAGMAs de confiabilidade/performance
+        adequados ao app (WAL, busy_timeout, foreign_keys).
+        """
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
@@ -48,20 +55,30 @@ class CartoesRepository:
         return conn
 
     def _validar_conf(self, vencimento_dia: int, dias_fechamento: int) -> None:
-        # dia do vencimento: 1..31 (ajustaremos para último dia do mês quando usar)
+        """
+        Valida parâmetros de configuração de fatura:
+
+        - `vencimento_dia`: 1..31 (o ajuste para último dia do mês ocorre no uso).
+        - `dias_fechamento`: 0..28 (dias ANTES do vencimento em que fecha).
+        """
         if not (1 <= int(vencimento_dia) <= 31):
             raise ValueError(f"vencimento inválido ({vencimento_dia}); use 1..31")
-        # offset de fechamento em dias: use um teto seguro (0..28 costuma cobrir todos os casos)
         if not (0 <= int(dias_fechamento) <= 28):
             raise ValueError(f"fechamento inválido ({dias_fechamento}); use 0..28 (dias antes do vencimento)")
 
     def obter_por_nome(self, nome: str) -> Optional[Tuple[int, int]]:
         """
-        Retorna (vencimento_dia, dias_fechamento) do cartão ou None se não existir.
+        Retorna `(vencimento_dia, dias_fechamento)` do cartão, ou `None` se não existir.
 
-        Observação:
-        - Coluna 'vencimento' armazena o DIA de vencimento (1..31).
-        - Coluna 'fechamento' armazena QUANTOS DIAS antes do vencimento a fatura fecha (0..28).
+        Notas:
+            - `vencimento` guarda o **dia** do vencimento (1..31).
+            - `fechamento` guarda **quantos dias antes** do vencimento a fatura fecha (0..28).
+
+        Parâmetros:
+            nome (str): Nome do cartão (case/trim-insensitive).
+
+        Retorno:
+            Optional[Tuple[int, int]]: `(vencimento_dia, dias_fechamento)` ou None.
         """
         if not nome or not nome.strip():
             return None
@@ -84,7 +101,10 @@ class CartoesRepository:
             return (vencimento_dia, dias_fechamento)
 
     def listar_nomes(self) -> List[str]:
-        """Lista nomes de cartões cadastrados, ordenados alfabeticamente (case/trim-insensitive)."""
+        """
+        Lista nomes de cartões cadastrados, ordenados alfabeticamente
+        (case/trim-insensitive).
+        """
         with self._get_conn() as conn:
             rows = conn.execute(
                 "SELECT nome FROM cartoes_credito ORDER BY LOWER(TRIM(nome)) ASC"
@@ -97,18 +117,26 @@ class CartoesRepository:
 # ----------------------------
 def listar_destinos_fatura_em_aberto(db_path: str):
     """
-    Retorna faturas em aberto (uma por cartão+mês), com o 'obrigacao_id' do LANCAMENTO.
-    Formato:
-    [
-      {
-        "label": "Fatura Cartão Bradesco 2025-08 — R$ 400,00",
-        "cartao": "Cartão Bradesco",
-        "competencia": "2025-08",
-        "obrigacao_id": 123,
-        "saldo": 400.0
-      },
-      ...
-    ]
+    Consulta faturas de cartão **em aberto** (uma por cartão+competência),
+    retornando rótulos prontos para selects de UI.
+
+    Regra:
+        - Base: `contas_a_pagar_mov`
+        - Lançamento de fatura: `tipo_obrigacao='FATURA_CARTAO'` e `categoria_evento='LANCAMENTO'`
+        - Pagamentos deduzidos: eventos onde `categoria_evento` começa com `'PAGAMENTO'`
+          (valores negativos somados para obter total pago).
+        - `saldo = total_lancado - total_pago` (apenas `saldo > 0` entra no resultado).
+
+    Parâmetros:
+        db_path (str): Caminho do arquivo SQLite.
+
+    Retorno:
+        list[dict]: Cada item contém:
+            - label (str): Ex.: `"Fatura Bradesco 2025-08 — R$ 400,00"`
+            - cartao (str)
+            - competencia (str)  # YYYY-MM
+            - obrigacao_id (int)
+            - saldo (float)
     """
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -158,3 +186,7 @@ def listar_destinos_fatura_em_aberto(db_path: str):
             "saldo": saldo,
         })
     return itens
+
+
+# (Opcional) API pública explícita
+__all__ = ["CartoesRepository", "listar_destinos_fatura_em_aberto"]
