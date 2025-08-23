@@ -9,3 +9,7 @@ Organiza a página, estado, formulários e ações da **Saída**:
 - BOLETO (parcelado)
 
 """
+
+"""Página de Saídas (Lançamentos)"""
+from .page_saida import render_saida
+__all__ = ["render_saida"]

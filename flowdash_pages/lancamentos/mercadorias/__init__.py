@@ -7,3 +7,6 @@ Organiza página, estado, formulários e ações de **Mercadorias**:
 - Recebimento (efetivo + divergências)
 
 """
+"""Página de Mercadorias (Lançamentos)"""
+from .page_mercadorias import render_mercadorias
+__all__ = ["render_mercadorias"]
