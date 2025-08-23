@@ -10,7 +10,7 @@ from .state_deposito import toggle_form, form_visivel
 from .ui_forms_deposito import render_form
 from .actions_deposito import registrar_deposito, carregar_nomes_bancos
 
-def render_page(caminho_banco: str, data_lanc):
+def render_deposito(caminho_banco: str, data_lanc):
     """
     Renderiza a página de Depósito.
 
