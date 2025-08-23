@@ -1,14 +1,13 @@
 # ===================== UI Forms: Mercadorias =====================
 """
 Componentes de UI (somente interface, sem SQL).
-
 """
 
 from __future__ import annotations
 
 import streamlit as st
 from datetime import date
-from utils.utils import formatar_valor
+from utils import formatar_valor  # <- padronizado
 
 # --------- helpers UI locais (sem DB)
 def _to_float_or_none(x):
