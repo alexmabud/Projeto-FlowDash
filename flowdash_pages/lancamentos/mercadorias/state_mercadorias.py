@@ -2,32 +2,30 @@
 """
 Gerencia visibilidade e confirmação dos formulários de Mercadorias.
 """
+import streamlit as st
 
-from dataclasses import dataclass
-
-@dataclass
-class MercadoriasState:
-    show_compra: bool = False
-    show_receb: bool = False
-    confirma_compra: bool = False
-    confirma_receb: bool = False
+def _ensure_keys():
+    st.session_state.setdefault("show_merc_compra", False)
+    st.session_state.setdefault("show_merc_receb", False)
+    st.session_state.setdefault("merc_compra_confirma_out", False)
+    st.session_state.setdefault("merc_receb_confirma_out", False)
 
 def toggle_compra():
-    import streamlit as st
-    st.session_state["show_merc_compra"] = not st.session_state.get("show_merc_compra", False)
-    if st.session_state["show_merc_compra"]:
-        st.session_state["merc_compra_confirma_out"] = False
+    _ensure_keys()
+    st.session_state.show_merc_compra = not st.session_state.show_merc_compra
+    if st.session_state.show_merc_compra:
+        st.session_state.merc_compra_confirma_out = False  # reset confirmação
 
 def toggle_receb():
-    import streamlit as st
-    st.session_state["show_merc_receb"] = not st.session_state.get("show_merc_receb", False)
-    if st.session_state["show_merc_receb"]:
-        st.session_state["merc_receb_confirma_out"] = False
+    _ensure_keys()
+    st.session_state.show_merc_receb = not st.session_state.show_merc_receb
+    if st.session_state.show_merc_receb:
+        st.session_state.merc_receb_confirma_out = False  # reset confirmação
 
 def compra_visivel() -> bool:
-    import streamlit as st
-    return bool(st.session_state.get("show_merc_compra", False))
+    _ensure_keys()
+    return bool(st.session_state.show_merc_compra)
 
 def receb_visivel() -> bool:
-    import streamlit as st
-    return bool(st.session_state.get("show_merc_receb", False))
+    _ensure_keys()
+    return bool(st.session_state.show_merc_receb)
