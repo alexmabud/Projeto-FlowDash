@@ -12,13 +12,14 @@ from datetime import date
 from .actions_pagina import carregar_resumo_dia
 from .ui_cards_pagina import render_card_row, render_card_mercadorias
 
-# Subpáginas (novo padrão)
-from ..venda.page_venda import render_page as render_venda
-from ..saida.page_saida import render_page as render_saida
-from ..caixa2.page_caixa2 import render_page as render_caixa2
-from ..deposito.page_deposito import render_page as render_deposito
-from ..transferencia.page_transferencia import render_page as render_transferencia_bancaria
-from ..mercadorias.page_mercadorias import render_page as render_mercadorias
+# Subpáginas (novo padrão, nomes padronizados)
+from ..venda.page_venda import render_venda
+from ..saida.page_saida import render_saida
+from ..caixa2.page_caixa2 import render_caixa2
+from ..deposito.page_deposito import render_deposito
+from ..transferencia.page_transferencia import render_transferencia
+from ..mercadorias.page_mercadorias import render_mercadorias
+
 
 def render_page(caminho_banco: str, data_default: date | None = None):
     """
@@ -56,12 +57,14 @@ def render_page(caminho_banco: str, data_default: date | None = None):
         ("Bradesco",    bradesco,               True),
     ])
 
-    dep_lin = [f"R$ {float(v or 0.0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") + f" → {(b or '—')}"
-               for (b, v) in (resumo["depositos_list"] or [])]
+    dep_lin = [
+        f"R$ {float(v or 0.0):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') + f" → {(b or '—')}"
+        for (b, v) in (resumo["depositos_list"] or [])
+    ]
     trf_lin = []
     for de, para, v in (resumo["transf_bancos_list"] or []):
         de_txt = (de or "").strip()
-        val_txt = f"R$ {float(v or 0.0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        val_txt = f"R$ {float(v or 0.0):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
         trf_lin.append(f"{val_txt} {'%s ' % de_txt if de_txt else ''}→ {(para or '—')}")
     render_card_row("🔁 Transferências", [
         ("P/ Caixa 2",                 resumo["transf_caixa2_total"], False),
@@ -85,7 +88,7 @@ def render_page(caminho_banco: str, data_default: date | None = None):
     with c2:
         render_deposito(caminho_banco, data_lanc)
     with c3:
-        render_transferencia_bancaria(caminho_banco, data_lanc)
+        render_transferencia(caminho_banco, data_lanc)
 
     st.markdown("---")
     st.markdown("### 📦 Mercadorias — Lançamentos")
