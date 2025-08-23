@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import pandas as pd
 from shared.db import get_conn
-from ..shared_ui import carregar_tabela  # mesmo helper já usado nos outros módulos
+from flowdash_pages.lancamentos.shared_ui import carregar_tabela
+
+
 
 # ---- helpers internos (iguais ao original) --------------------------------
 def _padronizar_cols_fin(df: pd.DataFrame) -> pd.DataFrame:
