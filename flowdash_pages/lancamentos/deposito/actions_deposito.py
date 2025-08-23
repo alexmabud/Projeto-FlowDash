@@ -12,9 +12,12 @@ from typing import TypedDict
 import pandas as pd
 
 from shared.db import get_conn
-from utils.utils import formatar_valor
+from utils import formatar_valor  # <- padronizado
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
-from flowdash_pages.lancamentos.shared_ui import upsert_saldos_bancos, canonicalizar_banco
+from flowdash_pages.lancamentos.ui_shared import (  # <- caminho novo
+    upsert_saldos_bancos,
+    canonicalizar_banco,
+)
 
 class ResultadoDeposito(TypedDict):
     ok: bool
@@ -37,19 +40,6 @@ def carregar_nomes_bancos(caminho_banco: str) -> list[str]:
 def registrar_deposito(caminho_banco: str, data_lanc, valor: float, banco_in: str) -> ResultadoDeposito:
     """
     Registra o depósito (do Caixa 2 para um banco).
-
-    Args:
-        caminho_banco: Caminho do SQLite.
-        data_lanc: Data (date/str).
-        valor: Valor a depositar (>0).
-        banco_in: Nome do banco de destino (será canonicalizado).
-
-    Returns:
-        ResultadoDeposito: dados para exibição.
-
-    Raises:
-        ValueError: validações de valor/banco/saldo.
-        Exception: erros de banco/SQL.
     """
     if valor is None or float(valor) <= 0:
         raise ValueError("Valor inválido.")
@@ -167,7 +157,6 @@ def registrar_deposito(caminho_banco: str, data_lanc, valor: float, banco_in: st
     try:
         upsert_saldos_bancos(caminho_banco, data_str, banco_nome, valor_f)
     except Exception as e:
-        # Não interrompe a operação, replica aviso do original (UI avisará).
         raise RuntimeError(f"Não foi possível atualizar saldos_bancos para '{banco_nome}': {e}") from e
 
     return {
