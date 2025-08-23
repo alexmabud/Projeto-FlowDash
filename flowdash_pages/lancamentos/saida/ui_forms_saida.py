@@ -81,10 +81,12 @@ def render_form_saida(
     # >>> BOLETO <<<
     parcela_boleto_escolhida: Optional[dict] = None
     multa_boleto = juros_boleto = desconto_boleto = 0.0
+    obrigacao_id_boleto: Optional[int] = None  # <-- novo campo opcional
 
     # >>> EMPRÉSTIMO <<<
     parcela_emp_escolhida: Optional[dict] = None
     multa_emp = juros_emp = desconto_emp = 0.0
+    obrigacao_id_emp: Optional[int] = None  # <-- novo campo opcional
 
     if is_pagamentos:
         tipo_pagamento_sel = st.selectbox(
@@ -135,8 +137,6 @@ def render_form_saida(
             )
 
             if destino_pagamento_sel and str(destino_pagamento_sel).strip():
-                df_parc = st.session_state.get("_cap_boletos_df")  # opcional cache (você pode remover)
-                # UI usa a mesma exibição que o módulo original; a busca real fica na action.
                 st.number_input(
                     "Valor do pagamento (pode ser parcial)",
                     value=float(valor_saida),
@@ -154,14 +154,22 @@ def render_form_saida(
                 with col3:
                     desconto_boleto = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_boleto")
 
-                # A seleção da parcela exata é feita via lookup na action (mantendo a lógica original)
+                # A seleção real da parcela pode ser feita por ID; se você souber o ID da obrigação, informe abaixo:
+                obrigacao_txt = st.text_input(
+                    "ID da obrigação (opcional, ajuda a localizar a parcela exata)",
+                    key="obrigacao_id_boleto_text"
+                )
+                try:
+                    obrigacao_id_boleto = int(obrigacao_txt) if obrigacao_txt.strip() else None
+                except Exception:
+                    obrigacao_id_boleto = None
+
+                # Alternativamente, passe um "hint" textual (actions tentará fallbacks)
                 escolha_textual = st.text_input("Identificador/descrição da parcela (igual ao painel detalhado)", key="parcela_boleto_hint")
+                parcela_boleto_escolhida = {"hint": (escolha_textual or "").strip()} if (escolha_textual or "").strip() else None
 
                 total_saida_calc = float(valor_saida) + float(juros_boleto) + float(multa_boleto) - float(desconto_boleto)
                 st.caption(f"Total da saída (caixa/banco): R$ {total_saida_calc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-                # Passa apenas um hint textual (action faz o match real)
-                parcela_boleto_escolhida = {"hint": (escolha_textual or "").strip()} if (escolha_textual or "").strip() else None
 
         # ===== Empréstimos e Financiamentos =====
         else:
@@ -191,7 +199,17 @@ def render_form_saida(
             with colE3:
                 desconto_emp = st.number_input("Desconto (R$)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_emp")
 
-            # seleção da parcela feita na action via lookup
+            # Se souber o ID da obrigação/parcela, informe aqui:
+            obrigacao_txt_emp = st.text_input(
+                "ID da obrigação (opcional, ajuda a localizar a parcela exata)",
+                key="obrigacao_id_emp_text"
+            )
+            try:
+                obrigacao_id_emp = int(obrigacao_txt_emp) if obrigacao_txt_emp.strip() else None
+            except Exception:
+                obrigacao_id_emp = None
+
+            # Ou passe um hint textual (actions mantém fallbacks):
             escolha_emp = st.text_input("Identificador/descrição da parcela do empréstimo (igual ao painel)", key="parcela_emp_hint")
             parcela_emp_escolhida = {"hint": (escolha_emp or "").strip()} if (escolha_emp or "").strip() else None
 
@@ -274,7 +292,11 @@ def render_form_saida(
             f"- **Vencimento 1ª Parcela:** {venc_1.strftime('%d/%m/%Y') if venc_1 else '—'}",
             f"- **Fornecedor:** {fornecedor or '—'}",
             f"- **Documento:** {documento or '—'}",
+            (f"- **Obrigação ID:** {obrigacao_id_boleto}") if obrigacao_id_boleto else "",
         ]
+    if is_pagamentos and tipo_pagamento_sel == "Empréstimos e Financiamentos" and obrigacao_id_emp:
+        linhas_md += [f"- **Obrigação ID:** {obrigacao_id_emp}"]
+
     st.info("\n".join([l for l in linhas_md if l != ""]))
 
     confirmado = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
@@ -285,22 +307,34 @@ def render_form_saida(
         "cat_nome": (cat_nome or "").strip(),
         "cat_id": cat_id,
         "subcat_nome": (subcat_nome or "").strip() if subcat_nome else None,
+
+        # Pagamentos
         "is_pagamentos": bool(is_pagamentos),
         "tipo_pagamento_sel": (tipo_pagamento_sel or "").strip() if is_pagamentos else None,
         "destino_pagamento_sel": (destino_pagamento_sel or "").strip() if is_pagamentos else None,
-        "competencia_fatura_sel": competencia_fatura_sel,
+
+        # Fatura
+        "competencia_fatura_sel": obrigacao_id_fatura and competencia_fatura_sel or competencia_fatura_sel,
         "obrigacao_id_fatura": obrigacao_id_fatura,
         "multa_fatura": float(multa_fatura),
         "juros_fatura": float(juros_fatura),
         "desconto_fatura": float(desconto_fatura),
+
+        # Boletos
+        "obrigacao_id": obrigacao_id_boleto,  # actions usa como prioridade se existir
         "parcela_boleto_escolhida": parcela_boleto_escolhida,
         "multa_boleto": float(multa_boleto),
         "juros_boleto": float(juros_boleto),
         "desconto_boleto": float(desconto_boleto),
+
+        # Empréstimos
         "parcela_emp_escolhida": parcela_emp_escolhida,
         "multa_emp": float(multa_emp),
         "juros_emp": float(juros_emp),
         "desconto_emp": float(desconto_emp),
+        "parcela_obrigacao_id": obrigacao_id_emp,  # fallback aceito pelo actions
+
+        # Comuns/forma
         "parcelas": int(parcelas or 1),
         "cartao_escolhido": (cartao_escolhido or "").strip(),
         "banco_escolhido": (banco_escolhido or "").strip(),
@@ -309,5 +343,6 @@ def render_form_saida(
         "fornecedor": (fornecedor or "").strip(),
         "documento": (documento or "").strip(),
         "descricao_final": descricao_final,
+
         "confirmado": bool(confirmado),
     }
