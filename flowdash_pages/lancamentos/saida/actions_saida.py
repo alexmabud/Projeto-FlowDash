@@ -11,7 +11,7 @@ A página captura e exibe as mensagens.
 
 from __future__ import annotations
 
-from typing import TypedDict, Optional, List
+from typing import TypedDict, Optional, List, Callable, Tuple
 from datetime import date
 
 import pandas as pd
@@ -27,6 +27,7 @@ from flowdash_pages.lancamentos.shared_ui import canonicalizar_banco  # usado no
 FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
 ORIGENS_DINHEIRO = ["Caixa", "Caixa 2"]
 
+
 def _distinct_lower_trim(series: pd.Series) -> list[str]:
     if series is None or series.empty:
         return []
@@ -35,17 +36,18 @@ def _distinct_lower_trim(series: pd.Series) -> list[str]:
     df = df[df["key"] != ""].drop_duplicates("key", keep="first")
     return df["orig"].sort_values().tolist()
 
+
 def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> list[str]:
     """
     Mesma função do módulo original (Boletos/Empréstimos).
     """
-    from shared.db import get_conn
     with get_conn(caminho_banco) as conn:
         if tipo == "Fatura Cartão de Crédito":
             return []
 
         elif tipo == "Empréstimos e Financiamentos":
-            df_emp = pd.read_sql("""
+            df_emp = pd.read_sql(
+                """
                 SELECT DISTINCT
                     TRIM(
                         COALESCE(
@@ -53,36 +55,47 @@ def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> list[str]:
                         )
                     ) AS rotulo
                 FROM emprestimos_financiamentos
-            """, conn)
+                """,
+                conn,
+            )
             df_emp = df_emp.dropna()
             df_emp = df_emp[df_emp["rotulo"] != ""]
             return _distinct_lower_trim(df_emp["rotulo"]) if not df_emp.empty else []
 
         elif tipo == "Boletos":
-            df_cart = pd.read_sql("""
+            df_cart = pd.read_sql(
+                """
                 SELECT DISTINCT TRIM(nome) AS nome
                   FROM cartoes_credito
                  WHERE nome IS NOT NULL AND TRIM(nome) <> ''
-            """, conn)
+                """,
+                conn,
+            )
             cart_set = set(x.strip().lower() for x in (df_cart["nome"].dropna().tolist() if not df_cart.empty else []))
 
-            df_emp = pd.read_sql("""
+            df_emp = pd.read_sql(
+                """
                 SELECT DISTINCT TRIM(
                     COALESCE(
                         NULLIF(TRIM(banco),''), NULLIF(TRIM(descricao),''), NULLIF(TRIM(tipo),'')
                     )
                 ) AS rotulo
                   FROM emprestimos_financiamentos
-            """, conn)
+                """,
+                conn,
+            )
             emp_set = set(x.strip().lower() for x in (df_emp["rotulo"].dropna().tolist() if not df_emp.empty else []))
 
-            df_cred = pd.read_sql("""
+            df_cred = pd.read_sql(
+                """
                 SELECT DISTINCT TRIM(credor) AS credor
                   FROM contas_a_pagar_mov
                  WHERE credor IS NOT NULL AND TRIM(credor) <> ''
                    AND COALESCE(status, 'Em aberto') IN ('Em aberto', 'Parcial')
                  ORDER BY credor
-            """, conn)
+                """,
+                conn,
+            )
 
             def eh_boleto_nome(nm: str) -> bool:
                 lx = (nm or "").strip().lower()
@@ -98,13 +111,24 @@ def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> list[str]:
 
     return []
 
+
 # ---------------- Resultado
 class ResultadoSaida(TypedDict):
     ok: bool
     msg: str
 
+
 # ---------------- Carregamentos para a UI (listas)
-def carregar_listas_para_form(caminho_banco: str):
+def carregar_listas_para_form(
+    caminho_banco: str,
+) -> Tuple[
+    list[str],               # nomes_bancos
+    list[str],               # nomes_cartoes
+    pd.DataFrame,            # df_categorias
+    Callable[[str], list[str]],  # listar_subcategorias(cat_nome) -> list[str]
+    Callable[[], list[str]],     # listar_destinos_fatura_em_aberto() -> list[str]
+    Callable[[str], list[str]],  # _opcoes_pagamentos(tipo) -> list[str]
+]:
     """
     Carrega listas necessárias para o formulário.
     Returns: (nomes_bancos, nomes_cartoes, df_categorias, listar_subcategorias_fn, listar_destinos_fatura_em_aberto_fn, carregar_opcoes_pagamentos_fn)
@@ -122,10 +146,11 @@ def carregar_listas_para_form(caminho_banco: str):
         nomes_bancos,
         nomes_cartoes,
         df_categorias,
-        cats_repo.listar_subcategorias,            # function
+        cats_repo.listar_subcategorias,                 # function
         lambda: listar_destinos_fatura_em_aberto(caminho_banco),  # function
         lambda tipo: _opcoes_pagamentos(caminho_banco, tipo),     # function
     )
+
 
 # ---------------- Dispatcher principal (mantém as mesmas regras do original)
 def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payload: dict) -> ResultadoSaida:
@@ -152,7 +177,7 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
     desconto_fatura = float(payload.get("desconto_fatura") or 0.0)
 
     # Boleto
-    parcela_boleto_escolhida = payload.get("parcela_boleto_escolhida")
+    parcela_boleto_escolhida = payload.get("parcela_boleto_escolhida")  # objeto/identificador da parcela
     multa_boleto = float(payload.get("multa_boleto") or 0.0)
     juros_boleto = float(payload.get("juros_boleto") or 0.0)
     desconto_boleto = float(payload.get("desconto_boleto") or 0.0)
@@ -217,13 +242,21 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
         if not parcela_boleto_escolhida:
             raise ValueError("Selecione a parcela do boleto para pagar (ou informe o identificador).")
 
+        # Padroniza campo obrigacao_id com fallbacks para manter compatibilidade
+        obrigacao_id = (
+            payload.get("obrigacao_id")
+            or payload.get("parcela_obrigacao_id")
+            or (parcela_boleto_escolhida.get("obrigacao_id") if isinstance(parcela_boleto_escolhida, dict) else None)
+            or 0
+        )
+
         origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else _canonicalizar_banco_safe(caminho_banco, banco_escolhido_in)
         id_saida, id_mov, id_cap = ledger.pagar_parcela_boleto(
             data=data_str,
             valor=float(valor_saida),
             forma_pagamento=forma_pagamento,
             origem=origem,
-            obrigacao_id=int(payload.get("obrigacao_id") or payload.get("parcela_obrigacao_id", parcela_boleto_escolhida.get("obrigacao_id", 0)) or 0),
+            obrigacao_id=int(obrigacao_id),
             usuario=usuario_nome,
             categoria="Boletos",
             sub_categoria=subcat_nome,
@@ -238,7 +271,7 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             "msg": (
                 "ℹ️ Transação já registrada (idempotência)."
                 if id_saida == -1 or id_mov == -1 or id_cap == -1
-                else f"✅ Pagamento de boleto registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                else f"✅ Pagamento de boleto registrado! Valor: {valor_saida:.2f} | Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
             ),
         }
 
@@ -263,7 +296,7 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             "msg": (
                 "ℹ️ Transação já registrada (idempotência)."
                 if id_saida == -1 or id_mov == -1 or id_cap == -1
-                else f"✅ Pagamento de fatura registrado! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                else f"✅ Pagamento de fatura registrado! Valor: {valor_saida:.2f} | Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
             ),
         }
 
@@ -273,13 +306,19 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
         if not parcela_emp_escolhida:
             raise ValueError("Selecione a parcela do empréstimo (ou informe o identificador).")
 
+        obrigacao_id = (
+            payload.get("obrigacao_id")
+            or payload.get("parcela_obrigacao_id")
+            or 0
+        )
+
         origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else _canonicalizar_banco_safe(caminho_banco, banco_escolhido_in)
         id_saida, id_mov, id_cap = ledger.pagar_parcela_emprestimo(
             data=data_str,
             valor=float(valor_saida),
             forma_pagamento=forma_pagamento,
             origem=origem,
-            obrigacao_id=int(payload.get("obrigacao_id") or payload.get("parcela_obrigacao_id", 0) or 0),
+            obrigacao_id=int(obrigacao_id),
             usuario=usuario_nome,
             categoria="Empréstimos e Financiamentos",
             sub_categoria=subcat_nome,
@@ -293,7 +332,7 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             "msg": (
                 "ℹ️ Transação já registrada (idempotência)."
                 if id_saida == -1 or id_mov == -1 or id_cap == -1
-                else f"✅ Parcela de Empréstimo paga! Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+                else f"✅ Parcela de Empréstimo paga! Valor: {valor_saida:.2f} | Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
             ),
         }
 
@@ -313,8 +352,11 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
         )
         return {
             "ok": True,
-            "msg": ("ℹ️ Transação já registrada (idempotência)." if id_saida == -1 else
-                    f"✅ Saída em dinheiro registrada! ID saída: {id_saida} | Log: {id_mov}")
+            "msg": (
+                "ℹ️ Transação já registrada (idempotência)."
+                if id_saida == -1
+                else f"✅ Saída em dinheiro registrada! Valor: {valor_saida:.2f} | ID saída: {id_saida} | Log: {id_mov}"
+            ),
         }
 
     if forma_pagamento in ["PIX", "DÉBITO"]:
@@ -331,8 +373,11 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
         )
         return {
             "ok": True,
-            "msg": ("ℹ️ Transação já registrada (idempotência)." if id_saida == -1 else
-                    f"✅ Saída bancária ({forma_pagamento}) registrada! ID saída: {id_saida} | Log: {id_mov}")
+            "msg": (
+                "ℹ️ Transação já registrada (idempotência)."
+                if id_saida == -1
+                else f"✅ Saída bancária ({forma_pagamento}) registrada! Valor: {valor_saida:.2f} | ID saída: {id_saida} | Log: {id_mov}"
+            ),
         }
 
     if forma_pagamento == "CRÉDITO":
@@ -346,7 +391,7 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             parcelas=int(parcelas),
             cartao_nome=cartao_escolhido,
             categoria=categoria,
-            sub_categoria=subcat_nome,
+            sub_categoria=sub_categoria,
             descricao=descricao_final,
             usuario=usuario_nome,
             fechamento=int(fechamento),
@@ -354,8 +399,11 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
         )
         return {
             "ok": True,
-            "msg": ("ℹ️ Transação já registrada (idempotência)." if not ids_fatura else
-                    f"✅ Despesa em CRÉDITO programada! Parcelas criadas: {len(ids_fatura)} | Log: {id_mov}")
+            "msg": (
+                "ℹ️ Transação já registrada (idempotência)."
+                if not ids_fatura
+                else f"✅ Despesa em CRÉDITO programada! Valor: {valor_saida:.2f} | Parcelas criadas: {len(ids_fatura)} | Log: {id_mov}"
+            ),
         }
 
     if forma_pagamento == "BOLETO":
@@ -363,22 +411,26 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             data_compra=data_str,
             valor=float(valor_saida),
             parcelas=int(parcelas),
-            vencimento_primeira=str(payload.get("venc_1")),
+            vencimento_primeira=str(venc_1),
             categoria=categoria,
             sub_categoria=sub_categoria,
             descricao=descricao_final,
             usuario=usuario_nome,
-            fornecedor=(payload.get("fornecedor") or None),
-            documento=(payload.get("documento") or None),
+            fornecedor=(fornecedor or None),
+            documento=(documento or None),
         )
         return {
             "ok": True,
-            "msg": ("ℹ️ Transação já registrada (idempotência)." if not ids_cap else
-                    f"✅ Boleto programado! Parcelas criadas: {len(ids_cap)} | Log: {id_mov}")
+            "msg": (
+                "ℹ️ Transação já registrada (idempotência)."
+                if not ids_cap
+                else f"✅ Boleto programado! Valor: {valor_saida:.2f} | Parcelas criadas: {len(ids_cap)} | Log: {id_mov}"
+            ),
         }
 
     # Se chegou aqui, forma desconhecida
     raise ValueError("Forma de pagamento inválida ou não suportada.")
+
 
 # ---------------- Canonicalização de banco (igual ao original, tolerante a falha)
 def _canonicalizar_banco_safe(caminho_banco: str, banco_in: str) -> str:
