@@ -13,7 +13,7 @@ from .state_mercadorias import toggle_compra, toggle_receb, compra_visivel, rece
 from .ui_forms_mercadorias import render_form_compra, render_form_recebimento
 from .actions_mercadorias import salvar_compra, carregar_compras, salvar_recebimento
 
-def render_page(caminho_banco: str, data_lanc: date):
+def render_mercadorias(caminho_banco: str, data_lanc: date):
     st.markdown("### 📦 Mercadorias")
 
     # ====== Compra ======
