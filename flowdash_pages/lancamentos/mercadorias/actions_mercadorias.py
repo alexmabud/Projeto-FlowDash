@@ -38,10 +38,7 @@ def _ensure_extra_cols(conn):
 
 # ---- Compra
 def salvar_compra(caminho_banco: str, payload: dict) -> str:
-    """
-    Insere compra de mercadorias. Mantém validações e conversões do original.
-    Retorna mensagem de sucesso.
-    """
+    """Insere compra de mercadorias e retorna mensagem de sucesso."""
     data_txt = payload["data_txt"]
     colecao = payload["colecao"]
     fornecedor = payload["fornecedor"]
@@ -79,18 +76,14 @@ def salvar_compra(caminho_banco: str, payload: dict) -> str:
             numero_pedido, numero_nf
         ))
         conn.commit()
-
     return "✅ Compra registrada com sucesso!"
 
 # ---- Recebimento
 def carregar_compras(caminho_banco: str, incluir_recebidas: bool = False) -> list[dict]:
-    """
-    Carrega compras (pendentes por padrão). Limite 200 como no original.
-    """
+    """Carrega compras (pendentes por padrão). Limite 200 como no original."""
     with get_conn(caminho_banco) as conn:
         _ensure_extra_cols(conn)
         cur = conn.cursor()
-
         base_select = """
             SELECT id, Data, Colecao, Fornecedor,
                    Previsao_Faturamento, Previsao_Recebimento, Numero_Pedido,
@@ -100,15 +93,13 @@ def carregar_compras(caminho_banco: str, incluir_recebidas: bool = False) -> lis
               FROM mercadorias
         """
         where_clause = "" if incluir_recebidas else "WHERE Recebimento IS NULL OR TRIM(Recebimento) = ''"
-
         rows = cur.execute(f"""
             {base_select}
             {where_clause}
             ORDER BY date(Data) DESC, rowid DESC
             LIMIT 200
         """).fetchall()
-
-        compras = [
+        return [
             {
                 "id": r[0],
                 "Data": r[1] or "",
@@ -124,12 +115,9 @@ def carregar_compras(caminho_banco: str, incluir_recebidas: bool = False) -> lis
                 "Numero_NF": "" if r[10] is None else str(r[10]),
             } for r in rows
         ]
-        return compras
 
 def salvar_recebimento(caminho_banco: str, payload: dict) -> str:
-    """
-    Atualiza recebimento/ajustes da compra selecionada. Mantém SQL do original.
-    """
+    """Atualiza recebimento/ajustes da compra selecionada e retorna mensagem de sucesso."""
     sel_id = int(payload["selected_id"])
     with get_conn(caminho_banco) as conn:
         _ensure_extra_cols(conn)
@@ -155,5 +143,6 @@ def salvar_recebimento(caminho_banco: str, payload: dict) -> str:
             sel_id
         ))
         conn.commit()
-
     return "✅ Recebimento registrado/atualizado com sucesso!"
+
+__all__ = ["salvar_compra", "carregar_compras", "salvar_recebimento"]
