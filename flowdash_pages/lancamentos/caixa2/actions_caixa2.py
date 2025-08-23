@@ -12,7 +12,7 @@ import uuid
 from typing import TypedDict
 
 from shared.db import get_conn
-from utils.utils import formatar_valor
+from utils import formatar_valor  # ← padronizado
 
 class ResultadoTransferencia(TypedDict):
     ok: bool
