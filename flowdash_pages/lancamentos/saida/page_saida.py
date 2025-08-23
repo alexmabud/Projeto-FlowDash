@@ -21,7 +21,7 @@ from .actions_saida import (
     registrar_saida,
 )
 
-def render_page(caminho_banco: str, data_lanc: date):
+def render_saida(caminho_banco: str, data_lanc: date):
     """
     Renderiza a página de Saída.
 
