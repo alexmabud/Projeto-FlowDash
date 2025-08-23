@@ -5,7 +5,7 @@ Componentes de UI para Depósito. Apenas interface – sem regra/SQL.
 
 import streamlit as st
 import pandas as pd
-from utils.utils import formatar_valor
+from utils import formatar_valor  # <- padronizado
 
 def render_form(data_lanc, nomes_bancos: list[str]) -> dict:
     """
