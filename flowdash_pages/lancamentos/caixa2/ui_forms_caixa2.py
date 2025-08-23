@@ -8,12 +8,6 @@ Somente UI – sem regra de negócio. A lógica de gravação fica em `actions.p
 import streamlit as st
 
 def render_form() -> dict:
-    """
-    Desenha o formulário de transferência para o Caixa 2.
-
-    Returns:
-        dict: { "valor": float, "confirmado": bool, "submit": bool }
-    """
     st.markdown("#### 💸 Transferência para Caixa 2")
 
     valor = st.number_input(
@@ -30,4 +24,10 @@ def render_form() -> dict:
         key="caixa2_salvar",
         disabled=not confirmado
     )
-    return {"valor": float(valor or 0.0), "confirmado": bool(confirmado), "submit": bool(submit)}
+
+    valor = round(float(valor or 0.0), 2)
+    if submit:
+        # opcional: desmarca confirmação após salvar
+        st.session_state.caixa2_confirma = False
+
+    return {"valor": valor, "confirmado": bool(confirmado), "submit": bool(submit)}
