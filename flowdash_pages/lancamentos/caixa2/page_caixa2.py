@@ -14,7 +14,7 @@ from .state_caixa2 import toggle_form, form_visivel
 from .ui_forms_caixa2 import render_form
 from .actions_caixa2 import transferir_para_caixa2
 
-def render_page(caminho_banco: str, data_lanc):
+def render_caixa2(caminho_banco: str, data_lanc):
     """
     Renderiza a página do Caixa 2 (transferência para Caixa 2).
 
