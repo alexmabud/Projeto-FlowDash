@@ -39,12 +39,37 @@ _CARD_TABLE_CSS = """
 </style>
 """
 
+def _coerce_number(value) -> float:
+    """
+    Converte valores variados (float, int, str em formato BR/EN) em float.
+    Exemplos aceitos: 1234.56, "1234.56", "1.234,56", "1,234.56", "1234,56".
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    try:
+        s = str(value).strip()
+        if not s:
+            return 0.0
+        # Normalização br/intl
+        # Caso 1: "1.234,56" (BR) -> "1234.56"
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        # Caso 2: "1234,56" (BR simples) -> "1234.56"
+        elif "," in s:
+            s = s.replace(",", ".")
+        # Caso 3: "1,234.56" (EN com milhares) -> "1234.56"
+        elif s.count(",") == 1 and s.count(".") == 1 and s.find(",") < s.find("."):
+            s = s.replace(",", "")
+        return float(s)
+    except Exception:
+        return 0.0
+
 def _fmt_val(v) -> str:
     try:
-        if v is None:
-            v = 0.0
-        v = float(v)
-        return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        num = _coerce_number(v)
+        return f"R$ {num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "R$ 0,00"
 
@@ -59,6 +84,7 @@ def render_card_row(title: str, items: list[tuple[str, float | list[str] | None,
             - Se float/None: number_always=True força exibir 0,00; senão mostra "Sem movimentações" para 0/None.
     """
     st.markdown(_CARD_TABLE_CSS, unsafe_allow_html=True)
+    items = list(items or [])  # robustez contra None/iteráveis não-lista
     cells_html = []
 
     for label, value, number_always in items:
@@ -69,12 +95,13 @@ def render_card_row(title: str, items: list[tuple[str, float | list[str] | None,
                 linhas = ''.join(f'<div class="cell-item">{str(x)}</div>' for x in value)
                 vhtml = f'<div class="cell-list">{linhas}</div>'
         else:
-            try:
-                is_zero = (value is None) or (float(value) == 0.0)
-            except Exception:
-                is_zero = True
-            vhtml = f'<div class="cell-value">{_fmt_val(value or 0.0)}</div>' if (number_always or not is_zero) \
-                    else '<div class="cell-empty">Sem movimentações</div>'
+            num = _coerce_number(value)
+            is_zero = (num == 0.0)
+            vhtml = (
+                f'<div class="cell-value">{_fmt_val(num)}</div>'
+                if (number_always or not is_zero)
+                else '<div class="cell-empty">Sem movimentações</div>'
+            )
 
         cells_html.append(f'<div class="cell"><div class="cell-label">{label}</div>{vhtml}</div>')
 
