@@ -8,6 +8,7 @@ mensagens e rerun após sucesso.
 from __future__ import annotations
 
 from datetime import date
+import time
 import streamlit as st
 
 from utils.utils import coerce_data  # <<< normaliza a data recebida
@@ -60,15 +61,25 @@ def render_venda(caminho_banco: str, data_lanc=None) -> None:
     # Execução
     try:
         res = registrar_venda(
-            caminho_banco=caminho_banco,
+            db_like=caminho_banco,   # ✅ alinha com a nova API
             data_lanc=data_lanc,
             payload=form,
         )
 
-        st.session_state["msg_ok"] = res.get("msg", "Venda registrada.")
-        st.session_state.form_venda = False
-        st.success(res.get("msg", "Venda registrada com sucesso."))
-        st.rerun()
+        if res.get("ok"):
+            st.session_state["msg_ok"] = res.get("msg", "Venda registrada.")
+            st.session_state.form_venda = False
+            st.success(res.get("msg", "Venda registrada com sucesso."))
+
+            # 🔄 força o Recarregamento do Resumo do Dia / cards
+            st.session_state["_resumo_dirty"] = time.time()
+
+            # ✅ limpa caches de @st.cache_data para garantir recomputo do resumo
+            st.cache_data.clear()
+
+            st.rerun()
+        else:
+            st.error(res.get("msg") or "Erro ao salvar a venda.")
 
     except ValueError as ve:
         st.warning(f"⚠️ {ve}")

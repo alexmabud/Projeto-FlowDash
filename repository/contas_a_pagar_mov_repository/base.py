@@ -11,6 +11,9 @@ Funcionalidades principais
   - `journal_mode=WAL`
   - `busy_timeout=30000`
   - `foreign_keys=ON`
+  - `synchronous=NORMAL`
+  - `detect_types = PARSE_DECLTYPES | PARSE_COLNAMES`
+  - `row_factory = sqlite3.Row`
 - Validação de eventos antes da inserção.
 - Inserção genérica de eventos em `contas_a_pagar_mov`.
 - Recuperação do próximo `obrigacao_id` sequencial.
@@ -24,35 +27,48 @@ Dependências
 ------------
 - sqlite3
 - repository.contas_a_pagar_mov_repository.types (ALLOWED_TIPOS, ALLOWED_CATEGORIAS)
+- utils.utils.resolve_db_path
 """
 
+from __future__ import annotations
+from typing import Any, Optional
 import sqlite3
-from typing import Optional
 
-from repository.contas_a_pagar_mov_repository.types import ALLOWED_TIPOS, ALLOWED_CATEGORIAS
+from utils.utils import resolve_db_path
+from repository.contas_a_pagar_mov_repository.types import (
+    ALLOWED_TIPOS,
+    ALLOWED_CATEGORIAS,
+)
 
 
 class BaseRepo(object):
     """Classe base com utilitários comuns para os mixins do repositório de Contas a Pagar."""
 
-    def __init__(self, db_path: str, *args, **kwargs):
+    def __init__(self, db_path_like: Any, *args, **kwargs):
         # __init__ cooperativo para múltipla herança com mixins
         super().__init__(*args, **kwargs)
-        self.db_path = db_path
+        # Aceita string/Path/objeto com atributo db_path/caminho_banco/database
+        self.db_path: str = resolve_db_path(db_path_like)
 
     # ------------------ conexão / PRAGMAs ------------------
 
     def _get_conn(self) -> sqlite3.Connection:
         """
         Abre conexão SQLite com PRAGMAs padronizados do projeto:
-        - WAL
-        - busy_timeout=30000
-        - foreign_keys=ON
+        - WAL, busy_timeout=30000, foreign_keys=ON, synchronous=NORMAL
+        - detect_types para DATE/DATETIME
+        - row_factory para acesso por nome de coluna
         """
-        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        )
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.row_factory = sqlite3.Row
         return conn
 
     # ------------------ helpers internos ------------------

@@ -99,17 +99,96 @@ def hash_uid(*parts) -> str:
 
 # =============== Construtores semânticos de UID ===============
 
-def uid_venda_liquidacao(data_liq, valor_liq, forma, maquineta, bandeira, parcelas, banco, usuario):
-    """UID para liquidação de venda."""
+def uid_venda_liquidacao(*args, **kwargs):
+    """
+    UID para liquidação de venda.
+
+    Compatível com:
+      - NOVO (10 args):
+        (data_venda, data_liq, valor_bruto, forma, parcelas, bandeira, maquineta, banco_destino, taxa_percentual, usuario)
+      - LEGADO (8 args):
+        (data_liq, valor_liq, forma, maquineta, bandeira, parcelas, banco, usuario)
+
+    Retorna um SHA-256 determinístico.
+    """
+    # ----------- NOVO: 10 argumentos -----------
+    if len(args) == 10 and not kwargs:
+        (
+            data_venda,
+            data_liq,
+            valor_bruto,
+            forma,
+            parcelas,
+            bandeira,
+            maquineta,
+            banco_destino,
+            taxa_percentual,
+            usuario,
+        ) = args
+
+        return hash_uid(
+            "VENDA_LIQ_V2",
+            _fmt_date(data_venda),
+            _fmt_date(data_liq),
+            _fmt_float(valor_bruto),
+            sanitize_plus(forma, upper=True),
+            _int_parcelas(parcelas),
+            sanitize_plus(bandeira, upper=True),
+            sanitize_plus(maquineta, upper=True),
+            sanitize_plus(banco_destino, upper=True),
+            _fmt_float(taxa_percentual),
+            sanitize_plus(usuario, upper=True),
+        )
+
+    # ----------- LEGADO: 8 argumentos -----------
+    if len(args) == 8 and not kwargs:
+        (
+            data_liq,
+            valor_liq,
+            forma,
+            maquineta,
+            bandeira,
+            parcelas,
+            banco,
+            usuario,
+        ) = args
+
+        return hash_uid(
+            "VENDA_LIQ_V1",
+            _fmt_date(data_liq),
+            _fmt_float(valor_liq),
+            sanitize_plus(forma, upper=True),
+            sanitize_plus(maquineta, upper=True),
+            sanitize_plus(bandeira, upper=True),
+            _int_parcelas(parcelas),
+            sanitize_plus(banco, upper=True),
+            sanitize_plus(usuario, upper=True),
+        )
+
+    # ----------- Suporte via kwargs (flexível) -----------
+    # permite chamar nomeando campos (qualquer subset, usa defaults)
+    data_venda       = kwargs.get("data_venda", "")
+    data_liq         = kwargs.get("data_liq", "")
+    valor_bruto      = kwargs.get("valor_bruto", 0.0)
+    forma            = kwargs.get("forma", "")
+    parcelas         = kwargs.get("parcelas", 1)
+    bandeira         = kwargs.get("bandeira", "")
+    maquineta        = kwargs.get("maquineta", "")
+    banco_destino    = kwargs.get("banco_destino", "")
+    taxa_percentual  = kwargs.get("taxa_percentual", 0.0)
+    usuario          = kwargs.get("usuario", "")
+
     return hash_uid(
-        "VENDA_LIQ",
+        "VENDA_LIQ_V2K",
+        _fmt_date(data_venda),
         _fmt_date(data_liq),
-        _fmt_float(valor_liq),
+        _fmt_float(valor_bruto),
         sanitize_plus(forma, upper=True),
-        sanitize_plus(maquineta, upper=True),
-        sanitize_plus(bandeira, upper=True),
         _int_parcelas(parcelas),
-        sanitize_plus(banco, upper=True),
+        sanitize_plus(bandeira, upper=True),
+        sanitize_plus(maquineta, upper=True),
+        sanitize_plus(banco_destino, upper=True),
+        _fmt_float(taxa_percentual),
         sanitize_plus(usuario, upper=True),
     )
 

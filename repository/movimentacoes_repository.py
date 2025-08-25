@@ -19,6 +19,9 @@ Detalhes técnicos
   - `PRAGMA journal_mode=WAL;`
   - `PRAGMA busy_timeout=30000;`
   - `PRAGMA foreign_keys=ON;`
+  - `PRAGMA synchronous=NORMAL;`
+  - `detect_types = PARSE_DECLTYPES | PARSE_COLNAMES` (DATE/DATETIME)
+  - `row_factory = sqlite3.Row` (acesso por nome de coluna)
 - Índices por data e banco.
 - `trans_uid` com restrição UNIQUE para evitar duplicações.
 
@@ -27,12 +30,15 @@ Dependências
 - sqlite3
 - hashlib
 - typing (Optional, Dict, Any)
-
+- utils.utils.resolve_db_path
 """
+
+from __future__ import annotations
 
 import sqlite3
 import hashlib
 from typing import Optional, Dict, Any
+from utils.utils import resolve_db_path
 
 
 class MovimentacoesRepository:
@@ -40,21 +46,30 @@ class MovimentacoesRepository:
     Repositório para operações na tabela `movimentacoes_bancarias`.
 
     Parâmetros:
-        db_path (str): Caminho do arquivo SQLite.
+        db_path_like (Any): Caminho do arquivo SQLite (.db) OU objeto com
+            atributo `db_path` / `caminho_banco` / `database`.
     """
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self, db_path_like: Any):
+        # Aceita string/Path/objeto com atributo de caminho
+        self.db_path: str = resolve_db_path(db_path_like)
         self.garantir_schema()  # garante tabela/índices na inicialização
 
     def _get_conn(self) -> sqlite3.Connection:
         """
         Abre conexão SQLite com PRAGMAs padronizados do projeto
-        (WAL, busy timeout, foreign keys).
+        (WAL, busy timeout, foreign keys, synchronous NORMAL)
+        e parsing de tipos (DATE/DATETIME).
         """
-        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=30,
+            detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        )
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
-        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.row_factory = sqlite3.Row
         return conn
 
     def garantir_schema(self) -> None:

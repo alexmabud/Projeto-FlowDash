@@ -17,14 +17,16 @@ Detalhes técnicos
 - Views `vw_cap_em_aberto` e `vw_cap_saldos` são usadas como fonte de dados.
 - Para boletos, o saldo é recalculado diretamente da tabela `contas_a_pagar_mov`
   considerando LANCAMENTO, PAGAMENTO, MULTA, JUROS, DESCONTO e AJUSTE.
-- ESTE MIXIN **NÃO** herda de `BaseRepo`. Ele é combinado com `BaseRepo` na
-  classe final (`ContasAPagarMovRepository`).
+- Este mixin é combinado com `BaseRepo` na classe final (`ContasAPagarMovRepository`).
 
 Dependências
 ------------
 - pandas
 """
 
+from __future__ import annotations
+
+from typing import Any, Optional
 import pandas as pd
 
 
@@ -35,15 +37,33 @@ class QueriesMixin(object):
         # __init__ cooperativo para múltipla herança
         super().__init__(*args, **kwargs)
 
-    def listar_em_aberto(self, conn, tipo_obrigacao: str | None = None) -> pd.DataFrame:
+    # ---------------------------------------------------------------------
+    # Helper de conexão (igual aos outros mixins)
+    # ---------------------------------------------------------------------
+    def _conn_ctx(self, conn: Any):
+        """
+        Context manager de conexão:
+        - Se `conn` for fornecido (sqlite3.Connection), usa-o diretamente.
+        - Se `conn` for None, abre via `self._get_conn()` (fornecido por BaseRepo).
+        """
+        if conn is not None:
+            class _DummyCtx:
+                def __init__(self, c): self.c = c
+                def __enter__(self): return self.c
+                def __exit__(self, exc_type, exc, tb): return False
+            return _DummyCtx(conn)
+        return self._get_conn()  # type: ignore[attr-defined]
+
+    # ---------------------------------------------------------------------
+    # Consultas
+    # ---------------------------------------------------------------------
+    def listar_em_aberto(self, conn: Any = None, tipo_obrigacao: Optional[str] = None) -> pd.DataFrame:
         """
         Retorna obrigações em aberto a partir de `vw_cap_em_aberto`.
 
         Parâmetros
         ----------
-        tipo_obrigacao : str | None
-            Pode ser 'BOLETO', 'FATURA_CARTAO' ou 'EMPRESTIMO'.
-            Se None, retorna todos os tipos.
+        tipo_obrigacao : 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO' | None
 
         Retorno
         -------
@@ -58,19 +78,21 @@ class QueriesMixin(object):
                        total_lancado, total_pago, saldo_aberto, perc_quitado
                 FROM vw_cap_em_aberto
                 WHERE tipo_obrigacao = ?
-                ORDER BY date(vencimento) ASC NULLS LAST, obrigacao_id ASC;
+                ORDER BY date(vencimento) ASC, obrigacao_id ASC;
             """
-            return pd.read_sql(sql, conn, params=(tipo_obrigacao,))
+            with self._conn_ctx(conn) as c:
+                return pd.read_sql(sql, c, params=(tipo_obrigacao,))
         else:
             sql = """
                 SELECT obrigacao_id, tipo_obrigacao, credor, descricao, competencia, vencimento,
                        total_lancado, total_pago, saldo_aberto, perc_quitado
                 FROM vw_cap_em_aberto
-                ORDER BY date(vencimento) ASC NULLS LAST, tipo_obrigacao, obrigacao_id ASC;
+                ORDER BY date(vencimento) ASC, tipo_obrigacao, obrigacao_id ASC;
             """
-            return pd.read_sql(sql, conn)
+            with self._conn_ctx(conn) as c:
+                return pd.read_sql(sql, c)
 
-    def obter_saldo_obrigacao(self, conn, obrigacao_id: int) -> float:
+    def obter_saldo_obrigacao(self, conn: Any = None, obrigacao_id: int = 0) -> float:
         """
         Retorna o saldo em aberto (ou 0) de uma obrigação a partir de `vw_cap_saldos`.
 
@@ -78,19 +100,15 @@ class QueriesMixin(object):
         ----------
         obrigacao_id : int
             ID da obrigação.
-
-        Retorno
-        -------
-        float
-            Valor do saldo em aberto.
         """
-        row = conn.execute(
-            "SELECT COALESCE(saldo_aberto,0) FROM vw_cap_saldos WHERE obrigacao_id=?;",
-            (obrigacao_id,),
-        ).fetchone()
-        return float(row[0]) if row else 0.0
+        with self._conn_ctx(conn) as c:
+            row = c.execute(
+                "SELECT COALESCE(saldo_aberto,0) FROM vw_cap_saldos WHERE obrigacao_id=?;",
+                (int(obrigacao_id),),
+            ).fetchone()
+            return float(row[0]) if row else 0.0
 
-    def listar_boletos_em_aberto_detalhado(self, conn, credor: str | None = None) -> pd.DataFrame:
+    def listar_boletos_em_aberto_detalhado(self, conn: Any = None, credor: Optional[str] = None) -> pd.DataFrame:
         """
         Lista parcelas (LANCAMENTOS) de BOLETO em aberto ou parcial.
 
@@ -153,10 +171,11 @@ class QueriesMixin(object):
         sql = base_sql.format(
             filtro_credor="AND LOWER(TRIM(credor)) = LOWER(TRIM(?))" if credor else ""
         )
-        if credor:
-            return pd.read_sql(sql, conn, params=(credor,))
-        else:
-            return pd.read_sql(sql, conn)
+        with self._conn_ctx(conn) as c:
+            if credor:
+                return pd.read_sql(sql, c, params=(credor,))
+            else:
+                return pd.read_sql(sql, c)
 
 
 # API pública explícita

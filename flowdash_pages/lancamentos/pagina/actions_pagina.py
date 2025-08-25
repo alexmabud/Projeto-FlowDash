@@ -59,10 +59,23 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
     df_s = _padronizar_cols_fin(carregar_tabela("saida", caminho_banco))
 
     total_vendas, total_saidas = 0.0, 0.0
-    if not (df_e is None or df_e.empty) and {"data", "valor"}.issubset(df_e.columns):
-        mask_e = df_e["data"].notna() & (df_e["data"].dt.date == data_lanc)
-        total_vendas = float(df_e.loc[mask_e, "valor"].sum())
-    if not (df_s is None or df_s.empty) and {"data", "valor"}.issubset(df_s.columns):
+
+    # --- VENDAS: preferir Valor_Liquido; senão Valor; senão Valor_Bruto ---
+    if df_e is not None and not df_e.empty:
+        cols_low = {c.lower(): c for c in df_e.columns}
+        date_col = _coerce_date_col(df_e, guess_names=("data","Data"))
+        vcol = (
+            cols_low.get("valor_liquido")
+            or cols_low.get("valor")
+            or cols_low.get("valor_bruto")
+        )
+        if date_col and vcol:
+            df_e[vcol] = pd.to_numeric(df_e[vcol], errors="coerce").fillna(0.0)
+            mask_e = df_e[date_col].notna() & (df_e[date_col].dt.date == data_lanc)
+            total_vendas = float(df_e.loc[mask_e, vcol].sum())
+
+    # --- SAÍDAS: permanece como estava (coluna 'valor' padronizada) ---
+    if df_s is not None and not df_s.empty and {"data", "valor"}.issubset(df_s.columns):
         mask_s = df_s["data"].notna() & (df_s["data"].dt.date == data_lanc)
         total_saidas = float(df_s.loc[mask_s, "valor"].sum())
 
@@ -78,6 +91,17 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
     # Banco
     with get_conn(caminho_banco) as conn:
         cur = conn.cursor()
+
+        # ⚠️ Fallback: se total_vendas ficou 0, usa o log idempotente da liquidação
+        if total_vendas == 0.0:
+            total_vendas = cur.execute("""
+                SELECT COALESCE(SUM(valor), 0.0)
+                  FROM movimentacoes_bancarias
+                 WHERE date(data)=?
+                   AND tipo='entrada'
+                   AND origem='vendas_liquidacao'
+            """, (str(data_lanc),)).fetchone()[0] or 0.0
+            total_vendas = float(total_vendas)
 
         # Snapshot saldos_caixas
         try:
@@ -193,7 +217,7 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
         except Exception:
             pass
 
-        # Saldos bancos (acumulado <= data)
+        # Saldos bancos (acumulado <= data) — mantém sua lógica
         try:
             df_bancos_raw = pd.read_sql("SELECT * FROM saldos_bancos", conn)
             if not df_bancos_raw.empty:

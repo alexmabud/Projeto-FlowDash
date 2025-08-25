@@ -13,38 +13,55 @@ Eventos suportados
 
 Detalhes técnicos
 -----------------
-- NÃO herda de `BaseRepo`. Este mixin é combinado com `BaseRepo` na classe final
-  do repositório, que fornece utilitários como `_validar_evento_basico` e
-  `_inserir_evento`.
+- Este mixin é combinado com `BaseRepo` na classe final do repositório, que
+  fornece utilitários como `_validar_evento_basico`, `_inserir_evento` e `_get_conn`.
 - `TipoObrigacao` é importado de `types` e usado para tipagem.
 - Eventos de pagamento e ajuste são armazenados como **valores negativos**.
-
-Dependências
-------------
-- typing.Optional
-- repository.contas_a_pagar_mov_repository.types.TipoObrigacao
 """
 
-from typing import Optional
+from __future__ import annotations
+
+from typing import Optional, Any
 from repository.contas_a_pagar_mov_repository.types import TipoObrigacao
 
 
 class EventsMixin(object):
     """Mixin para registrar eventos principais: LANCAMENTO, PAGAMENTO e AJUSTE (legado)."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs) -> None:
         # __init__ cooperativo para múltipla herança
         super().__init__(*args, **kwargs)
 
+    # ---------------------------------------------------------------------
+    # Helpers internos
+    # ---------------------------------------------------------------------
+    def _conn_ctx(self, conn: Any):
+        """
+        Context manager de conexão:
+        - Se `conn` for fornecido (sqlite3.Connection), usa-o diretamente.
+        - Se `conn` for None, abre via `self._get_conn()` (fornecido por BaseRepo).
+        """
+        if conn is not None:
+            class _DummyCtx:
+                def __init__(self, c): self.c = c
+                def __enter__(self): return self.c
+                def __exit__(self, exc_type, exc, tb): return False
+            return _DummyCtx(conn)
+        # BaseRepo deve fornecer _get_conn()
+        return self._get_conn()  # type: ignore[attr-defined]
+
+    # ---------------------------------------------------------------------
+    # Eventos
+    # ---------------------------------------------------------------------
     def registrar_lancamento(
         self,
-        conn,
+        conn: Any = None,
         *,
         obrigacao_id: int,
         tipo_obrigacao: TipoObrigacao,
         valor_total: float,
-        data_evento: str,          # 'YYYY-MM-DD'
-        vencimento: Optional[str], # 'YYYY-MM-DD'
+        data_evento: str,           # 'YYYY-MM-DD'
+        vencimento: Optional[str],  # 'YYYY-MM-DD'
         descricao: Optional[str],
         credor: Optional[str],
         competencia: Optional[str], # 'YYYY-MM'
@@ -56,9 +73,10 @@ class EventsMixin(object):
         valor_total = float(valor_total)
         if valor_total <= 0:
             raise ValueError("LANCAMENTO deve ter valor > 0.")
+        # Deriva competência de vencimento (AAAA-MM), se não informada
         competencia = competencia or (vencimento[:7] if vencimento else None)
 
-        self._validar_evento_basico(
+        self._validar_evento_basico(  # BaseRepo
             obrigacao_id=obrigacao_id,
             tipo_obrigacao=tipo_obrigacao,
             categoria_evento="LANCAMENTO",
@@ -67,28 +85,29 @@ class EventsMixin(object):
             usuario=usuario,
         )
 
-        return self._inserir_evento(
-            conn,
-            obrigacao_id=obrigacao_id,
-            tipo_obrigacao=tipo_obrigacao,
-            categoria_evento="LANCAMENTO",
-            data_evento=data_evento,
-            vencimento=vencimento,
-            valor_evento=valor_total,
-            descricao=descricao,
-            credor=credor,
-            competencia=competencia,
-            parcela_num=parcela_num,
-            parcelas_total=parcelas_total,
-            forma_pagamento=None,
-            origem=None,
-            ledger_id=None,
-            usuario=usuario,
-        )
+        with self._conn_ctx(conn) as c:
+            return self._inserir_evento(  # BaseRepo
+                c,
+                obrigacao_id=obrigacao_id,
+                tipo_obrigacao=tipo_obrigacao,
+                categoria_evento="LANCAMENTO",
+                data_evento=data_evento,
+                vencimento=vencimento,
+                valor_evento=valor_total,
+                descricao=descricao,
+                credor=credor,
+                competencia=competencia,
+                parcela_num=parcela_num,
+                parcelas_total=parcelas_total,
+                forma_pagamento=None,
+                origem=None,
+                ledger_id=None,
+                usuario=usuario,
+            )
 
     def registrar_pagamento(
         self,
-        conn,
+        conn: Any = None,
         *,
         obrigacao_id: int,
         tipo_obrigacao: TipoObrigacao,
@@ -113,28 +132,29 @@ class EventsMixin(object):
             usuario=usuario,
         )
 
-        return self._inserir_evento(
-            conn,
-            obrigacao_id=obrigacao_id,
-            tipo_obrigacao=tipo_obrigacao,
-            categoria_evento="PAGAMENTO",
-            data_evento=data_evento,
-            vencimento=None,
-            valor_evento=-abs(valor_pago),  # sempre negativo
-            descricao=None,
-            credor=None,
-            competencia=None,
-            parcela_num=None,
-            parcelas_total=None,
-            forma_pagamento=forma_pagamento,
-            origem=origem,
-            ledger_id=int(ledger_id),
-            usuario=usuario,
-        )
+        with self._conn_ctx(conn) as c:
+            return self._inserir_evento(
+                c,
+                obrigacao_id=obrigacao_id,
+                tipo_obrigacao=tipo_obrigacao,
+                categoria_evento="PAGAMENTO",
+                data_evento=data_evento,
+                vencimento=None,
+                valor_evento=-abs(valor_pago),  # sempre negativo
+                descricao=None,
+                credor=None,
+                competencia=None,
+                parcela_num=None,
+                parcelas_total=None,
+                forma_pagamento=forma_pagamento,
+                origem=origem,
+                ledger_id=int(ledger_id),
+                usuario=usuario,
+            )
 
     def registrar_ajuste_legado(
         self,
-        conn,
+        conn: Any = None,
         *,
         obrigacao_id: int,
         tipo_obrigacao: TipoObrigacao,
@@ -150,7 +170,7 @@ class EventsMixin(object):
         Uso:
             - Importação de dívidas antigas (já pagas parcialmente).
             - Ajustes manuais.
-        Observação:
+        Observações:
             - Valor sempre registrado como negativo.
             - Não movimenta caixa (ledger_id=None).
         """
@@ -167,24 +187,25 @@ class EventsMixin(object):
             usuario=usuario,
         )
 
-        return self._inserir_evento(
-            conn,
-            obrigacao_id=obrigacao_id,
-            tipo_obrigacao=tipo_obrigacao,
-            categoria_evento="AJUSTE",
-            data_evento=data_evento,
-            vencimento=None,
-            valor_evento=-abs(valor_negativo),
-            descricao=descricao,
-            credor=credor,
-            competencia=None,
-            parcela_num=None,
-            parcelas_total=None,
-            forma_pagamento="LEGADO",
-            origem="IMPORTACAO",
-            ledger_id=None,
-            usuario=usuario,
-        )
+        with self._conn_ctx(conn) as c:
+            return self._inserir_evento(
+                c,
+                obrigacao_id=obrigacao_id,
+                tipo_obrigacao=tipo_obrigacao,
+                categoria_evento="AJUSTE",
+                data_evento=data_evento,
+                vencimento=None,
+                valor_evento=-abs(valor_negativo),
+                descricao=descricao,
+                credor=credor,
+                competencia=None,
+                parcela_num=None,
+                parcelas_total=None,
+                forma_pagamento="LEGADO",
+                origem="IMPORTACAO",
+                ledger_id=None,
+                usuario=usuario,
+            )
 
 
 # API pública explícita

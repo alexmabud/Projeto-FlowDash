@@ -24,30 +24,44 @@ Detalhes técnicos
 Dependências
 ------------
 - sqlite3
+- utils.utils.resolve_db_path
 """
 
+from __future__ import annotations
+from typing import Any
 import sqlite3
+from utils.utils import resolve_db_path
 
 
-def get_conn(db_path: str) -> sqlite3.Connection:
+def get_conn(db_path_like: Any) -> sqlite3.Connection:
     """
     Abre uma conexão SQLite pronta para uso em produção.
 
+    Aceita:
+        - Caminho (str ou PathLike)
+        - Objetos com atributo `db_path`, `caminho_banco` ou `database`
+          (ex.: SimpleNamespace, config, etc.)
+
     Args:
-        db_path (str): Caminho do arquivo SQLite (.db).
+        db_path_like (Any): Referência ao banco (string/PathLike/objeto com atributo de caminho).
 
     Returns:
         sqlite3.Connection: Conexão aberta. O chamador é responsável por fechá-la.
     """
+    db_path = resolve_db_path(db_path_like)
+
     conn = sqlite3.connect(
         db_path,
         timeout=30,
         detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
     )
+    # PRAGMAs padrão do projeto
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+
+    # Rows acessíveis por nome de coluna
     conn.row_factory = sqlite3.Row
     return conn
 

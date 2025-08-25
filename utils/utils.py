@@ -329,3 +329,34 @@ def coerce_data(value=None) -> date:
             except ValueError:
                 continue
     raise ValueError(f"Data inválida: {value!r}")
+
+
+# utils/utils.py
+from types import SimpleNamespace
+import os
+
+def resolve_db_path(obj) -> str:
+    """
+    Normaliza o 'caminho do banco' aceitando string/Path/objetos de config.
+    Retorna sempre uma string com o path.
+    Levanta TypeError se não conseguir resolver.
+    """
+    if obj is None:
+        raise TypeError("Caminho do banco não informado.")
+
+    # Já é string ou PathLike
+    if isinstance(obj, (str, os.PathLike)):
+        return str(obj)
+
+    # SimpleNamespace com atributos comuns
+    if isinstance(obj, SimpleNamespace):
+        for key in ("db_path", "caminho_banco", "database"):
+            if hasattr(obj, key):
+                return str(getattr(obj, key))
+
+    # Qualquer objeto com atributo comum
+    for key in ("db_path", "caminho_banco", "database"):
+        if hasattr(obj, key):
+            return str(getattr(obj, key))
+
+    raise TypeError(f"expected str, bytes or os.PathLike object, got {type(obj).__name__}")
