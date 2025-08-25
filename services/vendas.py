@@ -9,7 +9,7 @@ em `movimentacoes_bancarias`.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Any
 import re
 import sqlite3
 from datetime import datetime
@@ -123,13 +123,8 @@ class VendasService:
         )
 
     # =============================
-    # Helpers de schema/insert
+    # Insert em `entrada`
     # =============================
-    def _columns(self, conn: sqlite3.Connection, table: str) -> Dict[str, Dict[str, Any]]:
-        """Retorna metadados de colunas (name -> info) para uma tabela."""
-        rows = conn.execute(f"PRAGMA table_info({table});").fetchall()
-        return {str(r[1]): {"cid": r[0], "name": r[1], "type": r[2], "notnull": r[3], "dflt": r[4]} for r in rows}
-
     def _insert_entrada(
         self,
         conn: sqlite3.Connection,
@@ -194,7 +189,7 @@ class VendasService:
         else:
             liquido = float(valor_liquido)
 
-        # montar INSERT
+        # montar INSERT (usar None para gravar NULL em campos opcionais)
         to_insert = {
             "Data": data_venda,
             "Data_Liq": data_liq,
@@ -223,7 +218,6 @@ class VendasService:
         cols_sql = ", ".join(names)
         conn.execute(f"INSERT INTO entrada ({cols_sql}) VALUES ({placeholders})", values)
         return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-
 
     # =============================
     # Regra principal (compat wrapper)
@@ -354,7 +348,7 @@ class VendasService:
 
             cur = conn.cursor()
 
-            # 1) INSERT em `entrada` (adaptativo ao schema)
+            # 1) INSERT em `entrada`
             venda_id = self._insert_entrada(
                 conn,
                 data_venda=data_venda,
