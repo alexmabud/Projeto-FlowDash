@@ -32,8 +32,6 @@ def render_venda(caminho_banco: str, data_lanc=None) -> None:
     # --- Normaliza para datetime.date (evita erro de .strftime em string) ---
     data_lanc: date = coerce_data(data_lanc)
 
-    st.markdown("### 🟢 Nova Venda")
-
     # Toggle
     if st.button("🟢 Nova Venda", use_container_width=True, key="btn_venda_toggle"):
         toggle_form()

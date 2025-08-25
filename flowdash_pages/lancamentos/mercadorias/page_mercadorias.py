@@ -39,8 +39,6 @@ def render_mercadorias(caminho_banco: str, data_lanc=None):
     # --- Normaliza para datetime.date (aceita None/str/date) ---
     data_lanc: date = coerce_data(data_lanc)
 
-    st.markdown("### 📦 Mercadorias")
-
     # ====== Compra ======
     if st.button("🧾 Compra de Mercadorias", use_container_width=True, key="btn_merc_compra_toggle"):
         toggle_compra()
@@ -76,7 +74,6 @@ def render_mercadorias(caminho_banco: str, data_lanc=None):
                 except Exception as e:
                     st.error(f"❌ Erro ao salvar compra: {e}")
 
-    st.divider()
 
     # ====== Recebimento ======
     if st.button("📥 Recebimento de Mercadorias", use_container_width=True, key="btn_merc_receb_toggle"):

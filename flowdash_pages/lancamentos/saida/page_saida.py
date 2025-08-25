@@ -80,8 +80,6 @@ def render_saida(
         st.error(f"❌ Configuração incompleta: {e}")
         return
 
-    st.markdown("### 🔴 Saída")
-
     # Toggle do formulário
     if st.button("🔴 Saída", use_container_width=True, key="btn_saida_toggle"):
         toggle_form()

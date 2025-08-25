@@ -78,8 +78,6 @@ def render_deposito(
         st.error(f"❌ Configuração incompleta: {e}")
         return
 
-    st.markdown("### 🏦 Depósito Bancário")
-
     # Toggle do formulário
     if st.button("🏦 Depósito Bancário", use_container_width=True, key="btn_deposito_toggle"):
         toggle_form()

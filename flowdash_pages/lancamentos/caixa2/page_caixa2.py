@@ -92,8 +92,6 @@ def render_caixa2(
         st.error(f"❌ Configuração incompleta: {e}")
         return
 
-    st.markdown("### 💼 Caixa 2")
-
     # Toggle do formulário (mesmo comportamento do original)
     if st.button("🔄 Caixa 2", use_container_width=True, key="btn_caixa2_toggle"):
         toggle_form()

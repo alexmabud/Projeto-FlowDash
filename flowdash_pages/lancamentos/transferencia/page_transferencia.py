@@ -81,8 +81,6 @@ def render_transferencia(
         st.error(f"❌ Configuração incompleta: {e}")
         return
 
-    st.markdown("### 🔁 Transferência entre Bancos")
-
     # Toggle do formulário
     if st.button("🔁 Transferência entre Bancos", use_container_width=True, key="btn_trf_toggle"):
         toggle_form()
