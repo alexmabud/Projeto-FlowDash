@@ -1,6 +1,28 @@
-# Normalmente só marcamos como pacote e expomos subpacotes
-from . import lancamentos
-# Se você tiver outras sub-seções como dre, dashboard, cadastros dentro de flowdash_pages:
-# from . import dre, dashboard, cadastros, fechamento, dataframes
+"""
+Pacote Flowdash Pages
+=====================
 
-__all__ = ["lancamentos"]
+Contém as páginas principais do sistema FlowDash (baseadas em Streamlit).
+
+Subpacotes
+----------
+- cadastros ....... telas de cadastro (categorias, usuários, etc.)
+- dashboard ....... visualizações principais do sistema
+- dataframes ...... utilitários de DataFrame para visualização
+- dre ............. módulo de Demonstração de Resultado (DRE)
+- fechamento ...... módulo de fechamento de caixa
+- lancamentos ..... páginas de lançamentos (entrada, saída, transferência, etc.)
+- metas ........... cadastro e acompanhamento de metas
+"""
+
+from . import cadastros, dashboard, dataframes, dre, fechamento, lancamentos, metas
+
+__all__ = [
+    "cadastros",
+    "dashboard",
+    "dataframes",
+    "dre",
+    "fechamento",
+    "lancamentos",
+    "metas",
+]
