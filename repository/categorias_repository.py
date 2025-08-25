@@ -28,6 +28,7 @@ Dependências
 - sqlite3
 - pandas
 - typing (Optional, List, Tuple)
+
 """
 
 import sqlite3

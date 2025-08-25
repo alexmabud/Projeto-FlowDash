@@ -1,28 +1,36 @@
 """
-Repositório: Taxas por Maquineta
-================================
+Módulo Taxas por Maquineta (Repositório)
+========================================
 
-Acessa a tabela `taxas_maquinas` para consultar:
-- maquinetas disponíveis por forma de pagamento
-- bandeiras por (forma, maquineta)
-- parcelas por (forma, maquineta, bandeira)
-- taxa (%) e banco de destino da liquidação
-- heurística de fallback para descobrir `banco_destino`
+Este módulo define a classe `TaxasMaquinasRepository`, responsável por consultas
+à tabela **`taxas_maquinas`** no SQLite. Fornece operações de leitura para
+alimentar selects na UI e para cálculo de liquidação líquida.
+
+Funcionalidades principais
+--------------------------
+- Listagem de maquinetas disponíveis por forma de pagamento.
+- Listagem de bandeiras por (forma, maquineta).
+- Listagem de parcelas por (forma, maquineta, bandeira).
+- Consulta de taxa (%) e banco de destino da liquidação.
+- Heurística de fallback para descobrir `banco_destino`.
 
 Detalhes técnicos
 -----------------
-- Leitura via SQLite (SELECT).
-- Comparações **case-insensitive** para `forma_pagamento` (UPPER(...)).
-- Não altera dados (somente leitura).
+- Operações somente leitura (não altera dados).
+- Conexão SQLite via helper `get_conn` (shared.db).
+- Comparações **case-insensitive** para `forma_pagamento` usando UPPER.
+- Retorno resiliente: listas vazias ou `None` em caso de falha.
 
 Dependências
 ------------
-- shared.db.get_conn
 - pandas
+- typing (Iterable, List, Optional, Tuple)
+- shared.db.get_conn
 """
 
 from typing import Iterable, List, Optional, Tuple
 import pandas as pd
+
 from shared.db import get_conn
 
 
@@ -196,3 +204,7 @@ class TaxasMaquinasRepository:
                 return row[0]
 
         return None
+
+
+# API pública explícita
+__all__ = ["TaxasMaquinasRepository"]

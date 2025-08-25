@@ -1,266 +1,331 @@
 """
-Utilitários de dados, formatação e segurança para o FlowDash.
+Módulo Utils
+============
 
-Resumo
-------
-Coleção de funções auxiliares para:
-- cálculos percentuais e datas úteis (considerando feriados do DF),
-- formatação e limpeza de valores monetários/percentuais,
-- padronização de colunas em DataFrames,
-- manutenção de gatilhos de totais em `saldos_caixas`,
-- geração e verificação de senhas (hash e força).
+Funções utilitárias de uso geral no FlowDash.
 
-Estilo
-------
-Docstrings padronizadas no estilo Google (pt-BR).
+Inclui:
+- Segurança: geração de hash de senha (`gerar_hash_senha`).
+- Formatação: moeda BR (`formatar_moeda`), percentual (`formatar_percentual`)
+  e wrapper retrocompatível (`formatar_valor`).
+- Infra/BD: garantia idempotente da estrutura de `saldos_caixas`
+  (`garantir_trigger_totais_saldos_caixas`).
+
+Observações
+-----------
+- `formatar_moeda` / `formatar_percentual` aceitam int/float/str/Decimal.
+- `gerar_hash_senha` usa SHA‑256 (sem sal). Para produção, considere sal/pepper.
 """
 
-import pandas as pd
+from __future__ import annotations
 import hashlib
-import re
-import sqlite3
-from datetime import datetime, timedelta
-from workalendar.america import BrazilDistritoFederal
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
 
-# =============================
-# Funções Auxiliares Gerais
-# =============================
-
-def calcular_percentual(valor: float, meta: float) -> float:
-    """Calcula o percentual de `valor` em relação à `meta`.
-
-    Trata divisão por zero retornando 0.0 quando `meta` é 0.
-
-    Args:
-        valor (float): Valor observado.
-        meta (float): Meta de referência.
-
-    Returns:
-        float: Percentual arredondado com 2 casas decimais (0.0 se meta == 0).
-    """
-    if meta == 0:
-        return 0.0
-    return round((valor / meta) * 100, 2)
-
-
-def adicionar_dia_semana(df: pd.DataFrame, coluna_data: str = "Data") -> pd.DataFrame:
-    """Adiciona a coluna ``Dia_Semana`` a partir de uma coluna de datas.
-
-    Converte a coluna informada para datetime (coercivo) e usa locale ``pt_BR``
-    para obter o nome do dia da semana.
-
-    Args:
-        df (pd.DataFrame): DataFrame de entrada.
-        coluna_data (str): Nome da coluna contendo datas. Padrão: ``"Data"``.
-
-    Returns:
-        pd.DataFrame: Cópia do DataFrame com a coluna ``Dia_Semana`` incluída.
-    """
-    df = df.copy()
-    df[coluna_data] = pd.to_datetime(df[coluna_data], errors="coerce")
-    df["Dia_Semana"] = df[coluna_data].dt.day_name(locale="pt_BR")
-    return df
-
-
-def ultimo_dia_util(data: datetime) -> datetime:
-    """Retorna o último dia útil anterior (ou igual) à data informada.
-
-    Utiliza o calendário de feriados/trabalho do Distrito Federal (workalendar).
-
-    Args:
-        data (datetime): Data de referência.
-
-    Returns:
-        datetime: Último dia útil não-feriado no DF anterior ou igual a `data`.
-    """
-    cal = BrazilDistritoFederal()
-    data = pd.to_datetime(data)
-    while not cal.is_working_day(data.date()):
-        data -= timedelta(days=1)
-    return data
-
-
-# === Formatação de Valores =========================================================================================
-
-def formatar_valor(valor: float) -> str:
-    """Formata um float como moeda brasileira.
-
-    Exemplos:
-        1234.56 -> ``"R$ 1.234,56"``
-
-    Args:
-        valor (float): Valor numérico.
-
-    Returns:
-        str: Valor formatado em BRL.
-    """
-    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def formatar_percentual(valor: float) -> str:
-    """Formata um float como percentual brasileiro (1 casa decimal).
-
-    Exemplos:
-        87.5 -> ``"87,5%"``
-
-    Args:
-        valor (float): Valor percentual (0–100, tipicamente).
-
-    Returns:
-        str: Percentual formatado (vírgula como separador decimal).
-    """
-    return f"{valor:.1f}%".replace(".", ",")
-
-
-def formatar_dataframe(df, colunas_monetarias=[], colunas_percentuais=[]):
-    """Aplica formatação monetária/percentual em colunas de um DataFrame.
-
-    Observação:
-        Usa cópia do DataFrame. Colunas inexistentes são ignoradas.
-
-    Args:
-        df (pd.DataFrame): DataFrame de entrada.
-        colunas_monetarias (list[str]): Lista de nomes de colunas a formatar como BRL.
-        colunas_percentuais (list[str]): Lista de nomes de colunas a formatar como %.
-
-    Returns:
-        pd.DataFrame: DataFrame formatado.
-    """
-    df_formatado = df.copy()
-    for col in colunas_monetarias:
-        if col in df_formatado.columns:
-            df_formatado[col] = df_formatado[col].apply(lambda x: formatar_valor(x) if x is not None else "")
-    for col in colunas_percentuais:
-        if col in df_formatado.columns:
-            df_formatado[col] = df_formatado[col].apply(lambda x: formatar_percentual(x) if x is not None else "")
-    return df_formatado
-
-
-def limpar_valor_formatado(valor_str: str) -> float:
-    """Converte uma string monetária brasileira para float.
-
-    Remove ``"R$"``, separadores de milhar e troca vírgula por ponto.
-
-    Exemplos:
-        ``"R$ 1.234,56"`` -> ``1234.56``
-
-    Args:
-        valor_str (str): Valor formatado como string.
-
-    Returns:
-        float: Valor numérico; 0.0 em caso de conversão inválida.
-    """
-    if isinstance(valor_str, str):
-        valor_str = valor_str.replace("R$", "").replace(".", "").replace(",", ".").strip()
-        try:
-            return float(valor_str)
-        except ValueError:
-            return 0.0
-    return float(valor_str)
-
-
-def garantir_trigger_totais_saldos_caixas(caminho_banco: str) -> None:
-    """(Re)cria triggers para manter totais em `saldos_caixas`.
-
-    Cria dois gatilhos:
-      - ``trg_saldos_insert_totais``: após INSERT, atualiza ``caixa_total`` e ``caixa2_total``;
-      - ``trg_saldos_update_totais``: após UPDATE das colunas relevantes, recalcula os totais.
-
-    A função detecta automaticamente se a coluna de vendas é ``caixa_vendas`` ou ``caixa_venda``.
-    Exige também a existência das colunas: ``caixa``, ``caixa_2``, ``caixa2_dia``, ``caixa_total``,
-    ``caixa2_total``.
-
-    Args:
-        caminho_banco (str): Caminho para o arquivo SQLite.
-
-    Raises:
-        RuntimeError: Se a tabela/colunas necessárias não existirem.
-    """
-    with sqlite3.connect(caminho_banco) as conn:
-        cur = conn.cursor()
-        cols = {r[1] for r in cur.execute("PRAGMA table_info(saldos_caixas)").fetchall()}
-
-        # Detecta a coluna de vendas
-        if "caixa_vendas" in cols:
-            col_vendas = "caixa_vendas"
-        elif "caixa_venda" in cols:
-            col_vendas = "caixa_venda"
-        else:
-            raise RuntimeError("Tabela 'saldos_caixas' não possui 'caixa_vendas' nem 'caixa_venda'.")
-
-        # Verifica demais colunas
-        required = {"caixa", "caixa_2", "caixa2_dia", "caixa_total", "caixa2_total"}
-        missing = required - cols
-        if missing:
-            raise RuntimeError(f"Faltam colunas em saldos_caixas: {', '.join(sorted(missing))}")
-
-        ddl = f"""
-        DROP TRIGGER IF EXISTS trg_saldos_insert_totais;
-        DROP TRIGGER IF EXISTS trg_saldos_update_totais;
-
-        -- Atualiza totais após INSERT (qualquer insert)
-        CREATE TRIGGER trg_saldos_insert_totais
-        AFTER INSERT ON saldos_caixas
-        BEGIN
-            UPDATE saldos_caixas
-            SET 
-                caixa_total  = COALESCE(NEW.caixa, 0) + COALESCE(NEW.{col_vendas}, 0),
-                caixa2_total = COALESCE(NEW.caixa_2, 0) + COALESCE(NEW.caixa2_dia, 0)
-            WHERE rowid = NEW.rowid;
-        END;
-
-        -- Atualiza totais após UPDATE das colunas relevantes
-        CREATE TRIGGER trg_saldos_update_totais
-        AFTER UPDATE OF caixa, {col_vendas}, caixa_2, caixa2_dia ON saldos_caixas
-        BEGIN
-            UPDATE saldos_caixas
-            SET 
-                caixa_total  = COALESCE(NEW.caixa, 0) + COALESCE(NEW.{col_vendas}, 0),
-                caixa2_total = COALESCE(NEW.caixa_2, 0) + COALESCE(NEW.caixa2_dia, 0)
-            WHERE rowid = NEW.rowid;
-        END;
-        """
-        conn.executescript(ddl)
-        conn.commit()
-
-
-# =============================
-# Segurança e Autenticação
-# =============================
-
+# -----------------------------------------------------------------------------
+# Segurança
+# -----------------------------------------------------------------------------
 def gerar_hash_senha(senha: str) -> str:
-    """Gera o hash SHA-256 de uma senha em texto claro.
-
-    Args:
-        senha (str): Senha em texto.
-
-    Returns:
-        str: Hash hexadecimal (64 caracteres).
     """
-    return hashlib.sha256(senha.encode()).hexdigest()
+    Gera hash SHA-256 de uma senha em texto claro.
 
+    Parâmetros
+    ----------
+    senha : str
+        Senha informada pelo usuário.
 
-def senha_forte(senha: str) -> bool:
-    """Verifica requisitos mínimos de força da senha.
-
-    A senha é considerada forte se:
-      - tiver pelo menos 8 caracteres,
-      - contiver letras maiúsculas e minúsculas,
-      - contiver números,
-      - contiver símbolos (ex.: ``!@#$%^&*(),.?":{}|<>``).
-
-    Args:
-        senha (str): Senha a validar.
-
-    Returns:
-        bool: ``True`` se atender a todos os requisitos; ``False`` caso contrário.
+    Retorno
+    -------
+    str
+        Hex digest do hash SHA-256.
     """
-    if (
-        len(senha) >= 8 and
-        re.search(r"[A-Z]", senha) and
-        re.search(r"[a-z]", senha) and
-        re.search(r"[0-9]", senha) and
-        re.search(r"[!@#$%^&*(),.?\":{}|<>]", senha)
-    ):
-        return True
-    return False
+    if senha is None:
+        senha = ""
+    return hashlib.sha256(senha.encode("utf-8")).hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# Formatação
+# -----------------------------------------------------------------------------
+def _to_decimal(valor) -> Decimal:
+    """Converte `valor` para Decimal, retornando 0 em caso de falha."""
+    if isinstance(valor, Decimal):
+        return valor
+    try:
+        return Decimal(str(valor))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def formatar_moeda(valor) -> str:
+    """
+    Formata um valor numérico no padrão BR: `R$ 1.234,56`.
+    """
+    v = _to_decimal(valor).quantize(Decimal("0.01"))
+    s = f"{v:,.2f}"                       # 1,234.56 (en_US)
+    s = s.replace(",", "X").replace(".", ",").replace("X", ".")  # 1.234,56
+    return f"R$ {s}"
+
+
+def formatar_percentual(valor, casas: int = 2) -> str:
+    """
+    Formata um valor como percentual. Ex.: `0.153` -> `15,30%`.
+
+    Regras
+    ------
+    - Se |valor| <= 1, trata como fração (0.15 -> 15%).
+    - Caso contrário, assume que já está em % (15 -> 15%).
+    """
+    v = _to_decimal(valor)
+    if abs(v) <= 1:
+        v = v * 100
+    fmt = f"{{:,.{casas}f}}".format(v)
+    fmt = fmt.replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{fmt}%"
+
+
+def formatar_valor(valor, *, tipo: str = "moeda", casas: int = 2) -> str:
+    """
+    Wrapper retrocompatível para formatação de valores.
+
+    Parâmetros
+    ----------
+    valor : Any
+        Valor numérico (int, float, str, Decimal).
+    tipo : str
+        "moeda" (padrão) ou "percentual".
+    casas : int
+        Casas decimais para percentual.
+
+    Retorno
+    -------
+    str
+        'R$ 1.234,56' (moeda) ou '15,30%' (percentual).
+    """
+    t = (tipo or "moeda").strip().lower()
+    if t in ("percentual", "porcento", "%"):
+        return formatar_percentual(valor, casas=casas)
+    return formatar_moeda(valor)
+
+
+# Aliases de retrocompatibilidade (caso páginas usem outros nomes)
+formatar_preco = formatar_moeda
+formatar_porcentagem = formatar_percentual
+
+
+# -----------------------------------------------------------------------------
+# Infraestrutura / Banco
+# -----------------------------------------------------------------------------
+def garantir_trigger_totais_saldos_caixas(caminho_banco: str) -> None:
+    """
+    Garante (idempotente) a estrutura mínima e o registro inicial da tabela `saldos_caixas`.
+
+    Compatível com esquemas existentes que possuam coluna `data` NOT NULL sem default.
+    Detecta colunas via PRAGMA e preenche dinamicamente no INSERT inicial.
+    """
+    import sqlite3
+
+    with sqlite3.connect(caminho_banco, timeout=30) as conn:
+        conn.execute("PRAGMA foreign_keys = ON;")
+
+        # Cria tabela se não existir (com defaults para evitar NOT NULL)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS saldos_caixas (
+                id INTEGER PRIMARY KEY CHECK (id=1),
+                data TEXT NOT NULL DEFAULT (date('now','localtime')),
+                caixa REAL NOT NULL DEFAULT 0,
+                caixa2 REAL NOT NULL DEFAULT 0,
+                atualizado_em TEXT DEFAULT (datetime('now','localtime'))
+            );
+        """)
+
+        # Inspeciona colunas atuais
+        cols_info = conn.execute("PRAGMA table_info('saldos_caixas');").fetchall()
+        col_names = {row[1] for row in cols_info}
+        notnull_cols = {row[1] for row in cols_info if int(row[3]) == 1}
+        defaults = {row[1]: row[4] for row in cols_info}  # dflt_value string ou None
+
+        # Insere o registro id=1 se não existir, respeitando NOT NULL
+        already = conn.execute("SELECT 1 FROM saldos_caixas WHERE id=1;").fetchone()
+        if already is None:
+            insert_cols = ["id"]
+            insert_vals = [1]
+
+            if "data" in col_names and ("data" in notnull_cols) and (defaults.get("data") is None):
+                insert_cols.append("data")
+                insert_vals.append(conn.execute("SELECT date('now','localtime');").fetchone()[0])
+            if "caixa" in col_names and ("caixa" in notnull_cols) and (defaults.get("caixa") is None):
+                insert_cols.append("caixa")
+                insert_vals.append(0.0)
+            if "caixa2" in col_names and ("caixa2" in notnull_cols) and (defaults.get("caixa2") is None):
+                insert_cols.append("caixa2")
+                insert_vals.append(0.0)
+
+            placeholders = ",".join(["?"] * len(insert_cols))
+            sql = f"INSERT INTO saldos_caixas ({','.join(insert_cols)}) VALUES ({placeholders});"
+            conn.execute(sql, insert_vals)
+
+        # Trigger de "touch" (se a coluna existir)
+        if "atualizado_em" in col_names:
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_saldos_caixas_touch
+                AFTER UPDATE ON saldos_caixas
+                BEGIN
+                    UPDATE saldos_caixas
+                       SET atualizado_em = datetime('now','localtime')
+                     WHERE id = NEW.id;
+                END;
+            """)
+
+def limpar_valor_formatado(valor, *, as_decimal: bool = False):
+    """
+    Converte textos de moeda em número (Decimal ou float).
+
+    Aceita formatos BR e EN:
+    - "R$ 1.234,56"  -> 1234.56
+    - "1.234,56"     -> 1234.56
+    - "1,234.56"     -> 1234.56
+    - "2500"         -> 2500.0
+    - "- 2.500,00"   -> -2500.00
+
+    Parâmetros
+    ----------
+    valor : Any
+        Texto/num a ser convertido (str, int, float, Decimal).
+    as_decimal : bool, opcional
+        Se True, retorna `Decimal`; caso contrário, `float`. Padrão: False.
+
+    Retorno
+    -------
+    Decimal | float
+        Número convertido. Valores inválidos retornam 0 (ou Decimal("0")).
+
+    Notas
+    -----
+    - Mantém compatibilidade com código legado que importava `limpar_valor_formatado`.
+    - Heurística de separadores:
+        * Se houver '.' e ',', assume padrão BR ('.' milhar, ',' decimal).
+        * Se houver só ',', assume vírgula como decimal.
+        * Caso contrário, assume ponto como decimal.
+    """
+    from decimal import Decimal, InvalidOperation
+    import re
+
+    # atalho para tipos já numéricos
+    if isinstance(valor, (int, float, Decimal)):
+        return Decimal(str(valor)) if as_decimal else float(valor)
+
+    if valor is None:
+        return Decimal("0") if as_decimal else 0.0
+
+    txt = str(valor).strip()
+    if not txt:
+        return Decimal("0") if as_decimal else 0.0
+
+    # remove símbolos e letras, preservando dígitos, sinais e separadores
+    txt = re.sub(r"[^\d,.\-+]", "", txt)
+
+    # normalização de separadores
+    if "," in txt and "." in txt:
+        # Ex.: 1.234,56  -> 1234.56
+        txt = txt.replace(".", "")
+        txt = txt.replace(",", ".")
+    elif "," in txt:
+        # Ex.: 1234,56 -> 1234.56
+        txt = txt.replace(",", ".")
+
+    # múltiplos sinais/sujeiras -> mantém o primeiro sinal se houver
+    # e remove sinais sobrando no meio
+    txt = re.sub(r"(?<=.)[+\-]", "", txt)
+
+    try:
+        dec = Decimal(txt)
+    except (InvalidOperation, ValueError):
+        dec = Decimal("0")
+
+    return dec if as_decimal else float(dec)
+
+
+# Alias de retrocompatibilidade
+desformatar_moeda = limpar_valor_formatado
+
+
+def senha_forte(
+    senha: str | None,
+    *,
+    min_len: int = 8,
+    requer_maiuscula: bool = True,
+    requer_minuscula: bool = True,
+    requer_digito: bool = True,
+    requer_especial: bool = True,
+) -> bool:
+    """
+    Valida se a senha atende critérios mínimos de força.
+
+    Parâmetros
+    ----------
+    senha : str | None
+        Senha a ser validada.
+    min_len : int, opcional
+        Tamanho mínimo (padrão: 8).
+    requer_maiuscula : bool, opcional
+        Exige pelo menos 1 letra maiúscula (padrão: True).
+    requer_minuscula : bool, opcional
+        Exige pelo menos 1 letra minúscula (padrão: True).
+    requer_digito : bool, opcional
+        Exige pelo menos 1 dígito (padrão: True).
+    requer_especial : bool, opcional
+        Exige pelo menos 1 caractere especial (padrão: True).
+
+    Retorno
+    -------
+    bool
+        True se a senha cumpre os critérios; caso contrário, False.
+
+    Observações
+    -----------
+    - Função retrocompatível com código legado que importava `senha_forte` de `utils.utils`.
+    - Para produção, considere políticas adicionais (ex.: verificação contra listas de senhas vazadas).
+    """
+    if not isinstance(senha, str):
+        return False
+
+    if len(senha) < int(min_len):
+        return False
+
+    has_upper = any(c.isupper() for c in senha)
+    has_lower = any(c.islower() for c in senha)
+    has_digit = any(c.isdigit() for c in senha)
+    # Considera qualquer caractere que não seja letra nem dígito como especial
+    has_special = any(not c.isalnum() for c in senha)
+
+    if requer_maiuscula and not has_upper:
+        return False
+    if requer_minuscula and not has_lower:
+        return False
+    if requer_digito and not has_digit:
+        return False
+    if requer_especial and not has_special:
+        return False
+
+    return True
+
+
+
+def coerce_data(value=None) -> date:
+    """
+    Normaliza 'value' para datetime.date.
+    Aceita: None, date, 'YYYY-MM-DD', 'DD/MM/YYYY', 'DD-MM-YYYY'.
+    Se vier vazio/None, retorna a data de hoje.
+    """
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return date.today()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    raise ValueError(f"Data inválida: {value!r}")

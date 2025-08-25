@@ -14,7 +14,7 @@ import pandas as pd
 from shared.db import get_conn
 from utils import formatar_valor  # <- padronizado
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
-from flowdash_pages.lancamentos.ui_shared import (  # <- caminho novo
+from flowdash_pages.lancamentos.shared_ui import (  # <- caminho novo
     upsert_saldos_bancos,
     canonicalizar_banco,
 )

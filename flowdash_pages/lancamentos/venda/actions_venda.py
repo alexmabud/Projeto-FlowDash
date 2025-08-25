@@ -4,15 +4,16 @@ Executa a MESMA lógica do módulo original de Vendas (sem Streamlit aqui):
 - Validações de campos
 - Cálculo de taxa/banco_destino a partir de taxas_maquinas
 - Suporte a PIX via maquineta ou direto para banco (com taxa informada)
-- Cálculo de data de liquidação (DIAS_COMPENSACAO + proximo dia útil)
-- Chamada do VendasService.registrar_venda
+- Cálculo de data de liquidação (DIAS_COMPENSACAO + próximo dia útil)
+- Chamada do serviço de vendas (VendasService); fallback para LedgerService se necessário
 """
 
 from __future__ import annotations
 
+from typing import Optional, Tuple
 import pandas as pd
+
 from shared.db import get_conn
-from services.vendas import VendasService
 from utils.utils import formatar_valor
 from flowdash_pages.lancamentos.shared_ui import (
     DIAS_COMPENSACAO,
@@ -20,9 +21,23 @@ from flowdash_pages.lancamentos.shared_ui import (
     obter_banco_destino,
 )
 
+# ---- Serviço de vendas: usa services.vendas se existir; fallback para services.ledger ----
+_VendasService = None
+try:
+    # Projeto com serviço dedicado de vendas
+    from services.vendas import VendasService as _VendasService  # type: ignore
+except Exception:
+    try:
+        # Projeto que centraliza tudo no Ledger
+        from services.ledger import LedgerService as _VendasService  # type: ignore
+    except Exception:
+        _VendasService = None  # será checado em runtime
+
+
 def _r2(x) -> float:
     """Arredonda em 2 casas para evitar ruídos (ex.: -0,00)."""
     return round(float(x or 0.0), 2)
+
 
 def _formas_equivalentes(forma: str):
     forma = (forma or "").upper()
@@ -30,9 +45,19 @@ def _formas_equivalentes(forma: str):
         return ["LINK_PAGAMENTO", "LINK PAGAMENTO", "LINK-DE-PAGAMENTO", "LINK DE PAGAMENTO"]
     return [forma]
 
-def _descobrir_taxa_e_banco(caminho_banco: str, forma: str, maquineta: str, bandeira: str, parcelas: int, modo_pix: str | None, banco_pix_direto: str | None, taxa_pix_direto: float) -> tuple[float, str | None]:
+
+def _descobrir_taxa_e_banco(
+    caminho_banco: str,
+    forma: str,
+    maquineta: str,
+    bandeira: str,
+    parcelas: int,
+    modo_pix: Optional[str],
+    banco_pix_direto: Optional[str],
+    taxa_pix_direto: float
+) -> Tuple[float, Optional[str]]:
     """
-    Replica exatamente a lógica do módulo original para determinar taxa% e banco_destino.
+    Mesma lógica do módulo original para determinar taxa% e banco_destino.
     """
     taxa, banco_destino = 0.0, None
 
@@ -43,7 +68,8 @@ def _descobrir_taxa_e_banco(caminho_banco: str, forma: str, maquineta: str, band
             row = conn.execute(
                 f"""
                 SELECT taxa_percentual, banco_destino FROM taxas_maquinas
-                WHERE UPPER(forma_pagamento) IN ({placeholders}) AND maquineta=? AND bandeira=? AND parcelas=?
+                WHERE UPPER(forma_pagamento) IN ({placeholders})
+                  AND maquineta=? AND bandeira=? AND parcelas=?
                 LIMIT 1
                 """,
                 [f.upper() for f in formas] + [maquineta, bandeira, int(parcelas or 1)]
@@ -60,7 +86,8 @@ def _descobrir_taxa_e_banco(caminho_banco: str, forma: str, maquineta: str, band
                 row = conn.execute(
                     """
                     SELECT taxa_percentual, banco_destino FROM taxas_maquinas
-                    WHERE UPPER(forma_pagamento)='PIX' AND maquineta=? AND bandeira='' AND parcelas=1
+                    WHERE UPPER(forma_pagamento)='PIX'
+                      AND maquineta=? AND bandeira='' AND parcelas=1
                     LIMIT 1
                     """,
                     (maquineta,)
@@ -76,13 +103,14 @@ def _descobrir_taxa_e_banco(caminho_banco: str, forma: str, maquineta: str, band
 
     return _r2(taxa), (banco_destino or None)
 
+
 def registrar_venda(caminho_banco: str, data_lanc, payload: dict) -> dict:
     """
     Registra a venda de acordo com a forma/parametrizações — mesma lógica do original.
     Retorna dict com {ok: bool, msg: str}.
     """
     valor = float(payload.get("valor") or 0.0)
-    forma = (payload.get("forma") or "").strip()
+    forma = (payload.get("forma") or "").strip().upper()
     parcelas = int(payload.get("parcelas") or 1)
     bandeira = (payload.get("bandeira") or "").strip()
     maquineta = (payload.get("maquineta") or "").strip()
@@ -90,7 +118,7 @@ def registrar_venda(caminho_banco: str, data_lanc, payload: dict) -> dict:
     banco_pix_direto = payload.get("banco_pix_direto")
     taxa_pix_direto = float(payload.get("taxa_pix_direto") or 0.0)
 
-    # --- Validações idênticas ---
+    # --- Validações (iguais ao original) ---
     if valor <= 0:
         raise ValueError("Valor inválido.")
     if forma in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"] and (not maquineta or not bandeira):
@@ -117,20 +145,34 @@ def registrar_venda(caminho_banco: str, data_lanc, payload: dict) -> dict:
     dias = DIAS_COMPENSACAO.get(forma, 0)
     data_liq = proximo_dia_util_br(base, dias) if dias > 0 else base
 
-    # service
-    service = VendasService(caminho_banco)
-    venda_id, mov_id = service.registrar_venda(
-        data_venda=str(data_lanc),
-        data_liq=str(data_liq),
-        valor_bruto=_r2(valor),
-        forma=forma,
-        parcelas=int(parcelas or 1),
-        bandeira=bandeira or "",
-        maquineta=maquineta or "",
-        banco_destino=banco_destino,
-        taxa_percentual=_r2(taxa or 0.0),
-        usuario=( "Sistema" )  # o original usa usuario_logado["nome"] no page; aqui deixamos placeholder
-    )
+    # serviço
+    if _VendasService is None:
+        raise RuntimeError(
+            "Serviço de Vendas não encontrado. Certifique-se de ter `services.vendas.VendasService` "
+            "ou `services.ledger.LedgerService` disponível."
+        )
+    service = _VendasService(caminho_banco)
+
+    # Nem todo projeto tem o mesmo nome de método; checamos dinamicamente:
+    if hasattr(service, "registrar_venda"):
+        venda_id, mov_id = service.registrar_venda(
+            data_venda=str(data_lanc),
+            data_liq=str(data_liq),
+            valor_bruto=_r2(valor),
+            forma=forma,
+            parcelas=int(parcelas or 1),
+            bandeira=bandeira or "",
+            maquineta=maquineta or "",
+            banco_destino=banco_destino,
+            taxa_percentual=_r2(taxa or 0.0),
+            usuario="Sistema",  # a page injeta o usuário real
+        )
+    else:
+        # Ajuste aqui se seu LedgerService tiver outro nome/assinatura para vendas
+        raise RuntimeError(
+            "O serviço carregado não expõe `registrar_venda(...)`. "
+            "Implemente esse método no serviço ou adapte a chamada aqui."
+        )
 
     if venda_id == -1:
         msg = "⚠️ Venda já registrada (idempotência)."

@@ -138,8 +138,13 @@ def listar_destinos_fatura_em_aberto(db_path: str):
             - obrigacao_id (int)
             - saldo (float)
     """
-    with sqlite3.connect(db_path) as conn:
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         conn.row_factory = sqlite3.Row
+
         rows = conn.execute("""
             WITH lanc AS (
                 SELECT
@@ -171,6 +176,8 @@ def listar_destinos_fatura_em_aberto(db_path: str):
             WHERE (l.total_lancado - COALESCE(p.total_pago,0)) > 0
             ORDER BY LOWER(TRIM(l.cartao)) ASC, l.competencia ASC
         """).fetchall()
+    finally:
+        conn.close()
 
     itens = []
     for r in rows:

@@ -1,29 +1,37 @@
 """
+Módulo DB (Shared)
+==================
+
 Camada de acesso SQLite (PRAGMAs padrão) para o FlowDash.
 
-Resumo
-------
-Fornece uma função utilitária para abrir conexões SQLite já configuradas com
-PRAGMAs seguros e performáticos (WAL, busy_timeout, foreign_keys, synchronous),
-além de `row_factory` por nome e detecção automática de tipos.
+Funcionalidades principais
+--------------------------
+- Fornece uma função utilitária `get_conn` para abrir conexões SQLite já
+  configuradas para uso em produção.
+- Configuração automática de PRAGMAs de integridade e performance.
+- Suporte a parsing automático de DATE/DATETIME.
+- Retorno de resultados com `row_factory` permitindo acesso por nome de coluna.
 
-Estilo
-------
-Docstrings padronizadas no estilo Google (pt-BR).
+Detalhes técnicos
+-----------------
+- `journal_mode = WAL`: permite concorrência de leitura/escrita.
+- `busy_timeout = 30000 ms`: evita erros de *database is locked*.
+- `foreign_keys = ON`: garante integridade referencial.
+- `synchronous = NORMAL`: equilíbrio entre segurança e performance.
+- `row_factory = sqlite3.Row`: acesso às colunas por nome.
+- `detect_types = PARSE_DECLTYPES | PARSE_COLNAMES`: parsing de DATE/DATETIME.
+
+Dependências
+------------
+- sqlite3
 """
 
 import sqlite3
 
-def get_conn(db_path: str) -> sqlite3.Connection:
-    """Abre uma conexão SQLite pronta para uso em produção.
 
-    Configurações aplicadas:
-      - `journal_mode = WAL`: permite concorrência leitura/escrita.
-      - `busy_timeout = 30000 ms`: evita erros de *database is locked*.
-      - `foreign_keys = ON`: garante integridade referencial.
-      - `synchronous = NORMAL`: equilíbrio entre segurança e performance.
-      - `row_factory = sqlite3.Row`: acesso às colunas por nome.
-      - `detect_types = PARSE_DECLTYPES | PARSE_COLNAMES`: parsing de DATE/DATETIME.
+def get_conn(db_path: str) -> sqlite3.Connection:
+    """
+    Abre uma conexão SQLite pronta para uso em produção.
 
     Args:
         db_path (str): Caminho do arquivo SQLite (.db).
@@ -42,3 +50,7 @@ def get_conn(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# API pública explícita
+__all__ = ["get_conn"]

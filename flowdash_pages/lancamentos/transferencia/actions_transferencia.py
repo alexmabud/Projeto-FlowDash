@@ -1,224 +1,221 @@
 # ===================== Actions: Transferência =====================
 """
-Executa a MESMA lógica/SQL do módulo original de Transferência Banco → Banco:
+Executa a lógica da **transferência banco → banco**:
 
-- movimentacoes_bancarias: cria 2 linhas
-    * SAÍDA no banco de origem (origem='transf_bancos_saida')
-    * ENTRADA no banco de destino (origem='transf_bancos')
-  (o card de resumo soma apenas origem='transf_bancos', então contará só a ENTRADA)
+- Canonicaliza nomes dos bancos (mantendo consistência com `saldos_bancos`)
+- Registra **duas linhas** em `movimentacoes_bancarias`:
+    1) SAÍDA no banco de ORIGEM (tipo='saida', origem='transferencia')
+    2) ENTRADA no banco de DESTINO (tipo='entrada', origem='transferencia')
+- Atualiza `saldos_bancos` no mesmo dia:
+    - decrementa coluna do banco de ORIGEM
+    - incrementa coluna do banco de DESTINO
 
-- saldos_bancos: soma no DESTINO (upsert_saldos_bancos) e subtrai na ORIGEM (_subtrair_saldo_banco)
+Observações:
+- Se não for possível calcular o saldo atual do banco de origem, o sistema **não bloqueia**,
+  apenas segue com a transferência (como no comportamento tolerante dos outros fluxos).
 """
 
-import uuid
-from typing import TypedDict
+from __future__ import annotations
 
+import uuid
+from typing import TypedDict, Optional
 import pandas as pd
+from datetime import date as _date, datetime as _dt
+
+from utils.utils import coerce_data  # <<< normaliza data
+from repository.movimentacoes_repository import MovimentacoesRepository  # <<< usa repo p/ respeitar CHECK
+
 from shared.db import get_conn
-from utils.utils import formatar_valor
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 from flowdash_pages.lancamentos.shared_ui import upsert_saldos_bancos, canonicalizar_banco
 
-class ResultadoTransferencia(TypedDict):
+
+class ResultadoTransferenciaBancos(TypedDict):
     ok: bool
     msg: str
-    banco_origem: str
-    banco_destino: str
+    origem: str
+    destino: str
     valor: float
-    saida_id: int
-    entrada_id: int
 
-def _r2(x) -> float:
-    """Arredonda em 2 casas (evita -0,00)."""
-    return round(float(x or 0.0), 2)
 
 def carregar_nomes_bancos(caminho_banco: str) -> list[str]:
-    """Obtém lista de nomes de bancos cadastrados."""
+    """Lista de bancos cadastrados (mesmo comportamento do Depósito)."""
     repo = BancoRepository(caminho_banco)
     df = repo.carregar_bancos()
     return df["nome"].tolist() if df is not None and not df.empty else []
 
-def _date_col_name(conn, table: str) -> str:
-    """Descobre o nome da coluna de data ('data' ou 'Data')."""
-    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table});").fetchall()]
-    for cand in ("data", "Data"):
-        if cand in cols:
-            return cand
-    return "data"
 
-def _subtrair_saldo_banco(caminho_banco: str, data_str: str, banco_nome: str, valor: float) -> None:
+def _try_saldo_banco(caminho_banco: str, banco_nome: str, data_str: str) -> Optional[float]:
     """
-    Subtrai 'valor' do saldo do banco na linha da 'data_str' em saldos_bancos.
-    - Garante a coluna do banco.
-    - Se a data não existir, cria a linha e subtrai nela.
-    (Não usa upsert_saldos_bancos pois ela rejeita valores <= 0.)
+    Tenta calcular o saldo acumulado (≤ data) do banco indicado em `saldos_bancos`.
+    Funciona se o modelo for wide-table (coluna por banco). Se não, retorna None.
+    """
+    try:
+        with get_conn(caminho_banco) as conn:
+            df = pd.read_sql("SELECT * FROM saldos_bancos", conn)
+        if df is None or df.empty:
+            return None
+
+        # Descobrir a coluna de data
+        date_col = None
+        for c in df.columns:
+            if c.lower() in ("data", "date"):
+                date_col = c
+                break
+        if date_col is not None:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+            df = df[df[date_col].dt.date <= pd.to_datetime(data_str).date()]
+
+        # Wide-table: soma da coluna do banco
+        if banco_nome in df.columns:
+            return float(pd.to_numeric(df[banco_nome], errors="coerce").fillna(0.0).sum())
+    except Exception:
+        return None
+    return None
+
+
+def _decrementar_saldos_bancos(caminho_banco: str, data_str: str, banco_nome: str, valor: float) -> None:
+    """
+    Decrementa `valor` na coluna do banco `banco_nome` para a linha da data `data_str`.
+    Espelha a lógica de `upsert_saldos_bancos`, mas subtraindo.
+    Ignora se valor <= 0.
     """
     if not valor or valor <= 0:
         return
 
+    import sqlite3
     with get_conn(caminho_banco) as conn:
         cur = conn.cursor()
 
-        # Garante que o banco está cadastrado
-        try:
-            nomes_cadastrados = pd.read_sql("SELECT nome FROM bancos_cadastrados", conn)["nome"].astype(str).tolist()
-        except Exception:
-            nomes_cadastrados = []
-        if banco_nome not in nomes_cadastrados:
-            raise ValueError(f"Banco '{banco_nome}' não está cadastrado em bancos_cadastrados.")
-
-        # Garante coluna do banco
+        # Garante existência da coluna do banco
         cols_info = cur.execute("PRAGMA table_info(saldos_bancos);").fetchall()
         existentes = {c[1] for c in cols_info}
         if banco_nome not in existentes:
             cur.execute(f'ALTER TABLE saldos_bancos ADD COLUMN "{banco_nome}" REAL NOT NULL DEFAULT 0.0')
             conn.commit()
             cols_info = cur.execute("PRAGMA table_info(saldos_bancos);").fetchall()
+            existentes = {c[1] for c in cols_info}
 
-        date_col = _date_col_name(conn, "saldos_bancos")
+        # Descobre coluna de data
+        def _date_col_name():
+            cols = [r[1] for r in cols_info]
+            for cand in ("data", "Data"):
+                if cand in cols:
+                    return cand
+            return "data"
 
-        # Se existe linha da data → UPDATE; senão → INSERT
+        date_col = _date_col_name()
+
+        # Tenta atualizar linha existente, senão insere uma nova com o débito
         row = cur.execute(f'SELECT rowid FROM saldos_bancos WHERE "{date_col}"=? LIMIT 1;', (data_str,)).fetchone()
         if row:
             cur.execute(
-                f'UPDATE saldos_bancos '
-                f'SET "{banco_nome}" = COALESCE("{banco_nome}", 0.0) - ? '
+                f'UPDATE saldos_bancos SET "{banco_nome}" = COALESCE("{banco_nome}", 0.0) - ? '
                 f'WHERE "{date_col}" = ?;',
                 (float(valor), data_str)
             )
         else:
-            # Monta um INSERT com -valor para o banco escolhido
-            colnames = [c[1] for c in cols_info]  # inclui a coluna de data e as demais
+            # Insere a linha do dia com débito dessa conta (demais colunas = 0)
+            colnames = [c[1] for c in cols_info]
             outras = [c for c in colnames if c != date_col]
             placeholders = ",".join(["?"] * (1 + len(outras)))
             cols_sql = f'"{date_col}",' + ",".join(f'"{c}"' for c in outras)
             valores = [data_str] + [0.0] * len(outras)
             if banco_nome in outras:
-                valores[1 + outras.index(banco_nome)] = -float(valor)
-            else:
-                raise RuntimeError(f"Coluna '{banco_nome}' não encontrada após criação em saldos_bancos.")
+                idx = 1 + outras.index(banco_nome)
+                valores[idx] = -float(valor)
             cur.execute(f'INSERT INTO saldos_bancos ({cols_sql}) VALUES ({placeholders});', valores)
 
         conn.commit()
 
-def registrar_transferencia(
+
+def registrar_transferencia_bancaria(
     caminho_banco: str,
     data_lanc,
     banco_origem_in: str,
     banco_destino_in: str,
-    valor: float
-) -> ResultadoTransferencia:
+    valor: float,
+    observacao: str | None = None,
+) -> ResultadoTransferenciaBancos:
     """
-    Registra a transferência de saldo entre dois bancos (banco → banco).
-
-    Creates:
-      - 2 linhas em movimentacoes_bancarias (SAÍDA/ENTRADA) compartilhando o mesmo referencia_id (id da SAÍDA).
-      - Atualização em saldos_bancos (soma no destino, subtrai na origem).
-
-    Raises:
-        ValueError: para validações.
+    Registra a transferência banco→banco:
+    - validações
+    - duas linhas em movimentacoes_bancarias (saida/entrada)
+    - ajuste em saldos_bancos (— origem, + destino)
     """
-    valor_f = _r2(valor)
+    # --- validações básicas ---
+    try:
+        valor_f = float(valor)
+    except Exception:
+        valor_f = 0.0
     if valor_f <= 0:
         raise ValueError("Valor inválido.")
-
-    b_origem_in = (banco_origem_in or "").strip()
-    b_dest_in   = (banco_destino_in or "").strip()
-    if not b_origem_in or not b_dest_in:
-        raise ValueError("Informe banco de origem e banco de destino.")
-    if b_origem_in.lower() == b_dest_in.lower():
+    if not (banco_origem_in and banco_destino_in):
+        raise ValueError("Informe banco de origem e destino.")
+    if str(banco_origem_in).strip().lower() == str(banco_destino_in).strip().lower():
         raise ValueError("Origem e destino não podem ser o mesmo banco.")
 
-    # Canonicalizar nomes
+    # Canonicaliza nomes
     try:
-        b_origem = canonicalizar_banco(caminho_banco, b_origem_in) or b_origem_in
+        banco_origem = canonicalizar_banco(caminho_banco, banco_origem_in) or (banco_origem_in or "").strip()
     except Exception:
-        b_origem = b_origem_in
+        banco_origem = (banco_origem_in or "").strip()
+
     try:
-        b_dest = canonicalizar_banco(caminho_banco, b_dest_in) or b_dest_in
+        banco_destino = canonicalizar_banco(caminho_banco, banco_destino_in) or (banco_destino_in or "").strip()
     except Exception:
-        b_dest = b_dest_in
+        banco_destino = (banco_destino_in or "").strip()
 
-    data_str = str(data_lanc)
+    # --- normaliza data ---
+    data_dt: _date = coerce_data(data_lanc)  # aceita None/str/date
+    data_str = data_dt.strftime("%Y-%m-%d")
 
-    with get_conn(caminho_banco) as conn:
-        cur = conn.cursor()
-
-        # 1) SAÍDA (inserimos primeiro para obter o id)
-        saida_uid = str(uuid.uuid4())
-        saida_obs = (
-            f"Transferência: {b_origem} → {b_dest} | Saída | "
-            f"Valor={formatar_valor(valor_f)}"
+    # (Opcional) checar saldo do banco origem (best-effort; aqui usamos warning via ValueError)
+    saldo_origem = _try_saldo_banco(caminho_banco, banco_origem, data_str)
+    if saldo_origem is not None and valor_f > saldo_origem:
+        raise ValueError(
+            f"Saldo insuficiente no banco '{banco_origem}'. "
+            f"Disponível até {data_str}: R$ {saldo_origem:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         )
-        cur.execute("""
-            INSERT INTO movimentacoes_bancarias
-                (data, banco,  tipo,   valor,  origem,                observacao,
-                 referencia_id, referencia_tabela, trans_uid)
-            VALUES (?,   ?,     ?,      ?,      ?,                     ?,
-                    ?,             ?,                 ?)
-        """, (
-            data_str, b_origem, "saida", valor_f, "transf_bancos_saida",
-            saida_obs,
-            None, "movimentacoes_bancarias", saida_uid
-        ))
-        saida_id = cur.lastrowid
 
-        # 2) ENTRADA (mesmo referencia_id = id da SAÍDA)
-        entrada_uid = str(uuid.uuid4())
-        entrada_obs = (
-            f"Transferência: {b_origem} → {b_dest} | Entrada | "
-            f"Valor={formatar_valor(valor_f)} | REF={saida_id}"
-        )
-        cur.execute("""
-            INSERT INTO movimentacoes_bancarias
-                (data, banco,   tipo,     valor,  origem,         observacao,
-                 referencia_id, referencia_tabela, trans_uid)
-            VALUES (?,   ?,      ?,        ?,      ?,              ?,
-                    ?,             ?,                 ?)
-        """, (
-            data_str, b_dest, "entrada", valor_f, "transf_bancos",
-            entrada_obs,
-            saida_id, "movimentacoes_bancarias", entrada_uid
-        ))
-        entrada_id = cur.lastrowid
+    # --- grava duas movimentações (saida/entrada), respeitando CHECK(tipo) ---
+    repo = MovimentacoesRepository(caminho_banco)
+    trans_uid = str(uuid.uuid4())
+    obs_extra = f" | {observacao.strip()}" if (observacao and observacao.strip()) else ""
 
-        # 3) Atualiza a SAÍDA com referencia_id e REF
-        saida_obs_final = (
-            f"Transferência: {b_origem} → {b_dest} | Saída | "
-            f"Valor={formatar_valor(valor_f)} | REF={saida_id}"
-        )
-        cur.execute("""
-            UPDATE movimentacoes_bancarias
-               SET referencia_id = ?,
-                   referencia_tabela = ?,
-                   observacao = ?
-             WHERE id = ?
-        """, (saida_id, "movimentacoes_bancarias", saida_obs_final, saida_id))
+    # SAÍDA - origem
+    repo.registrar_saida(
+        data=data_str,
+        banco=banco_origem,
+        valor=valor_f,
+        origem="transferencia",
+        observacao=f"Transferência para {banco_destino} | TX={trans_uid}{obs_extra}",
+        referencia_tabela="transferencias",
+        referencia_id=None,
+    )
 
-        conn.commit()
+    # ENTRADA - destino
+    repo.registrar_entrada(
+        data=data_str,
+        banco=banco_destino,
+        valor=valor_f,
+        origem="transferencia",
+        observacao=f"Transferência de {banco_origem} | TX={trans_uid}{obs_extra}",
+        referencia_tabela="transferencias",
+        referencia_id=None,
+    )
 
-    # 4) Atualiza saldos_bancos (mesma data)
-    try:
-        upsert_saldos_bancos(caminho_banco, data_str, b_dest, valor_f)
-    except Exception as e:
-        # segue a mesma filosofia dos outros módulos: avisar/propagar sem quebrar toda operação
-        raise RuntimeError(f"Não foi possível somar no destino '{b_dest}' em saldos_bancos: {e}") from e
-
-    try:
-        _subtrair_saldo_banco(caminho_banco, data_str, b_origem, valor_f)
-    except Exception as e:
-        raise RuntimeError(f"Não foi possível subtrair na origem '{b_origem}' em saldos_bancos: {e}") from e
+    # --- ajustes em saldos_bancos ---
+    _decrementar_saldos_bancos(caminho_banco, data_str, banco_origem, valor_f)   # — origem
+    upsert_saldos_bancos(caminho_banco, data_str, banco_destino, valor_f)        # + destino
 
     return {
         "ok": True,
         "msg": (
-            f"✅ Transferência registrada: {formatar_valor(valor_f)} "
-            f"de **{b_origem}** → **{b_dest}**. "
-            f"(IDs: saída #{saida_id}, entrada #{entrada_id} • ref_id comum={saida_id})"
-        ),
-        "banco_origem": b_origem,
-        "banco_destino": b_dest,
+            f"✅ Transferência registrada: {banco_origem} → {banco_destino} "
+            f"no valor de R$ {valor_f:,.2f} em {data_dt.strftime('%d/%m/%Y')}"
+        ).replace(",", "X").replace(".", ",").replace("X", "."),
+        "origem": banco_origem,
+        "destino": banco_destino,
         "valor": valor_f,
-        "saida_id": saida_id,
-        "entrada_id": entrada_id,
     }

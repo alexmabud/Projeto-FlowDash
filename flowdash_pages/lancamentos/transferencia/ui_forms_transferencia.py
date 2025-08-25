@@ -1,58 +1,59 @@
 # ===================== UI Forms: Transferência =====================
 """
-Componentes de UI para Transferência Banco → Banco. Apenas interface – sem regra/SQL.
+Apenas UI – sem regra/SQL. Campos:
+- Banco de origem
+- Banco de destino
+- Valor
+- Observação (opcional)
 """
 
+from __future__ import annotations
+
 import streamlit as st
-import pandas as pd
-from utils.utils import formatar_valor
+from datetime import date
 
-def render_form(data_lanc, nomes_bancos: list[str]) -> dict:
-    """
-    Desenha o formulário de transferência.
+def render_form_transferencia(
+    data_lanc: date,
+    nomes_bancos: list[str],
+    invalidate_cb,
+) -> dict:
+    st.markdown("#### 🔁 Transferência entre Bancos")
+    st.caption(f"Data do lançamento: **{data_lanc}**")
 
-    Args:
-        data_lanc: data do lançamento.
-        nomes_bancos: lista de bancos cadastrados.
-
-    Returns:
-        dict: {"banco_origem": str, "banco_destino": str, "valor": float, "confirmado": bool, "submit": bool}
-    """
-    st.markdown("#### 🔁 Transferência Banco → Banco")
-    st.caption(f"Data do lançamento: **{pd.to_datetime(data_lanc).strftime('%d/%m/%Y')}**")
-
-    col_a, col_b = st.columns(2)
-    with col_a:
+    c1, c2 = st.columns(2)
+    with c1:
         banco_origem = (
-            st.selectbox("Banco de Origem", nomes_bancos, key="transf_banco_origem")
+            st.selectbox("Banco de Origem", nomes_bancos, key="trf_banco_origem", on_change=invalidate_cb)
             if nomes_bancos else
-            st.text_input("Banco de Origem (digite)", key="transf_banco_origem_text")
+            st.text_input("Banco de Origem (digite)", key="trf_banco_origem_txt", on_change=invalidate_cb)
         )
-    with col_b:
+    with c2:
         banco_destino = (
-            st.selectbox("Banco de Destino", nomes_bancos, key="transf_banco_destino")
+            st.selectbox("Banco de Destino", nomes_bancos, key="trf_banco_destino", on_change=invalidate_cb)
             if nomes_bancos else
-            st.text_input("Banco de Destino (digite)", key="transf_banco_destino_text")
+            st.text_input("Banco de Destino (digite)", key="trf_banco_destino_txt", on_change=invalidate_cb)
         )
 
-    valor = st.number_input("Valor da Transferência", min_value=0.0, step=0.01, format="%.2f", key="transf_bancos_valor")
+    valor = st.number_input("Valor da Transferência", min_value=0.0, step=0.01, format="%.2f",
+                            key="trf_valor", on_change=invalidate_cb)
+    observacao = st.text_input("Observação (opcional)", key="trf_obs")
 
+    # Resumo
     st.info("\n".join([
         "**Confirme os dados da transferência**",
-        f"- **Data:** {pd.to_datetime(data_lanc).strftime('%d/%m/%Y')}",
-        f"- **Valor:** {formatar_valor(valor or 0.0)}",
-        f"- **Origem:** {(banco_origem or '—')}",
-        f"- **Destino:** {(banco_destino or '—')}",
-        "- Serão criadas 2 linhas com o MESMO referencia_id (id da SAÍDA).",
+        f"- **Data:** {data_lanc.strftime('%d/%m/%Y')}",
+        f"- **Origem:** {banco_origem or '—'}",
+        f"- **Destino:** {banco_destino or '—'}",
+        f"- **Valor:** R$ {valor:.2f}",
+        f"- **Obs.:** {observacao or '—'}",
     ]))
 
-    confirmado = st.checkbox("Confirmo os dados acima", key="transf_bancos_confirmar")
-    submit = st.button("💾 Registrar Transferência", use_container_width=True, key="transf_bancos_salvar", disabled=not confirmado)
+    confirmado = st.checkbox("Está tudo certo com os dados acima?", key="transferencia_confirmada")
 
     return {
         "banco_origem": (banco_origem or "").strip(),
         "banco_destino": (banco_destino or "").strip(),
         "valor": float(valor or 0.0),
+        "observacao": (observacao or "").strip(),
         "confirmado": bool(confirmado),
-        "submit": bool(submit),
     }

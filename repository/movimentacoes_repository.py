@@ -27,6 +27,7 @@ Dependências
 - sqlite3
 - hashlib
 - typing (Optional, Dict, Any)
+
 """
 
 import sqlite3

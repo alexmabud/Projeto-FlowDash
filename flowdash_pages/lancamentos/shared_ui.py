@@ -2,41 +2,15 @@
 Módulo Shared UI
 ================
 
-Este módulo concentra **componentes reutilizáveis de interface** em Streamlit,
-facilitando a padronização visual e a manutenção do sistema. Ele fornece funções
-auxiliares para renderização de botões, tabelas, cards e elementos visuais comuns
-a várias páginas do FlowDash.
-
-Funcionalidades principais
---------------------------
-- Renderização de **cards informativos** (ex.: resumo de entradas, saídas, caixa).
-- Funções para exibir **tabelas com formatação padronizada** (valores monetários,
-  percentuais e datas).
-- Criação de **componentes de formulário reutilizáveis** (inputs, selects, etc.).
-- Padronização de estilos visuais (cores, ícones, espaçamentos) para manter a
-  identidade do sistema.
-- Suporte a mensagens de status (alertas, avisos, sucesso).
-
-Detalhes técnicos
------------------
-- Construído em cima do Streamlit.
-- Utiliza funções auxiliares de formatação (como `formatar_moeda` e
-  `formatar_percentual`).
-- Pensado para reduzir duplicação de código nas páginas de lançamentos e cadastros.
-- **Datas**: parsing com `dayfirst=True` para consistência com formato brasileiro.
-- **Consultas de taxas**: matching **case-insensitive** para `forma_pagamento`.
-
-Dependências
-------------
-- streamlit
-- pandas
-- utils.utils (funções de formatação e helpers internos)
-
+Componentes reutilizáveis de interface e alguns helpers de banco/negócio
+compartilhados entre as páginas de lançamentos.
 """
+
+from __future__ import annotations
 
 import re
 import sqlite3
-from typing import Optional
+from typing import Optional, Any
 from datetime import date, timedelta
 
 import pandas as pd
@@ -45,16 +19,38 @@ import streamlit.components.v1 as components
 from html import escape
 
 # Imports internos do FlowDash
-from utils import formatar_valor
+# Preferir o pacote `utils` (que já faz alias se preciso); cair para utils.utils se necessário.
+try:
+    from utils import formatar_valor
+except Exception:
+    try:
+        from utils.utils import formatar_valor  # compatibilidade antiga
+    except Exception:
+        # Fallback defensivo: formata como BRL
+        def formatar_valor(v):
+            try:
+                n = float(v or 0.0)
+            except Exception:
+                n = 0.0
+            return f"R$ {n:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
 from shared.db import get_conn
 from shared.ids import uid_venda_liquidacao
 from repository.movimentacoes_repository import MovimentacoesRepository
 
 
-
 # ===========================
 # Helpers de DataFrames / UI
 # ===========================
+_TBL_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')  # whitelist p/ nomes de tabela
+
+def _validate_table_name(nome_tabela: str) -> str:
+    """Valida e retorna o nome de tabela seguro (whitelist)."""
+    nt = (nome_tabela or '').strip()
+    if not _TBL_RE.match(nt):
+        raise ValueError(f"Nome de tabela inválido: {nome_tabela!r}")
+    return nt
+
 def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
     """
     Carrega uma tabela do banco em DataFrame, converte coluna de data e
@@ -64,8 +60,9 @@ def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
         Usa `dayfirst=True` no parsing de datas para aderir ao padrão BR.
     """
     try:
+        nt = _validate_table_name(nome_tabela)
         with get_conn(caminho_banco) as conn:
-            df = pd.read_sql(f'SELECT * FROM "{nome_tabela}"', conn)
+            df = pd.read_sql(f'SELECT * FROM "{nt}"', conn)
 
         # Detecta coluna de data, qualquer variação de caixa
         col_data = next((c for c in df.columns if c.lower() == "data"), None)
@@ -76,7 +73,6 @@ def carregar_tabela(nome_tabela: str, caminho_banco: str) -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
-
 
 def bloco_resumo_dia(itens_ou_linhas, titulo: str = "📆 Resumo do Dia"):
     """
@@ -150,7 +146,6 @@ DIAS_COMPENSACAO = {
     "LINK_PAGAMENTO": 1,
 }
 
-
 def proximo_dia_util_br(data_base: date, dias: int) -> date:
     """
     Retorna a próxima data útil no Brasil (considera fins de semana e, se possível, feriados).
@@ -176,7 +171,6 @@ def proximo_dia_util_br(data_base: date, dias: int) -> date:
                 add += 1
         return d
 
-
 def inserir_mov_liquidacao_venda(
     caminho_banco: str,
     data_: str,
@@ -184,7 +178,7 @@ def inserir_mov_liquidacao_venda(
     valor_liquido: float,
     observacao: str,
     referencia_id: Optional[int]
-):
+) -> None:
     """
     Registra a liquidação da venda em movimentacoes_bancarias com idempotência:
 
@@ -223,8 +217,7 @@ def inserir_mov_liquidacao_venda(
         trans_uid=trans_uid
     )
 
-
-def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float):
+def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float) -> None:
     """Atualiza o saldo de `caixa_vendas` em `saldos_caixas` (soma na mesma data)."""
     if not valor or valor <= 0:
         return
@@ -251,7 +244,6 @@ def registrar_caixa_vendas(caminho_banco: str, data_: str, valor: float):
                     (data_, float(valor))
                 )
         conn.commit()
-
 
 def obter_banco_destino(
     caminho_banco: str,
@@ -322,7 +314,6 @@ def _normalize_bank(s: str) -> str:
     """Normaliza nome de banco (A-Z0-9)."""
     return re.sub(r"[^A-Z0-9]", "", (s or "").upper())
 
-
 def canonicalizar_banco(caminho_banco: str, nome_banco: str) -> Optional[str]:
     """
     Retorna o nome EXATO (como cadastrado) em `bancos_cadastrados` para o `nome_banco` informado.
@@ -350,15 +341,14 @@ def canonicalizar_banco(caminho_banco: str, nome_banco: str) -> Optional[str]:
         return aliases[alvo]
     return None
 
-
 def _date_col_name(conn: sqlite3.Connection, table: str) -> str:
-    """Descobre o nome da coluna de data ('data' ou 'Data') em uma tabela."""
-    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table});").fetchall()]
+    """Descobre o nome da coluna de data ('data' ou 'Data') em uma tabela (com validação do nome)."""
+    table_safe = _validate_table_name(table)
+    cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table_safe}");').fetchall()]
     for cand in ("data", "Data"):
         if cand in cols:
             return cand
     return "data"  # fallback
-
 
 def upsert_saldos_bancos(caminho_banco: str, data_str: str, banco_nome: str, valor: float) -> None:
     """
@@ -383,12 +373,12 @@ def upsert_saldos_bancos(caminho_banco: str, data_str: str, banco_nome: str, val
         if banco_nome not in nomes_cadastrados:
             raise ValueError(f"Banco '{banco_nome}' não está registrado em bancos_cadastrados.")
 
-        cols_info = cur.execute("PRAGMA table_info(saldos_bancos);").fetchall()
+        cols_info = cur.execute('PRAGMA table_info("saldos_bancos");').fetchall()
         existentes = {c[1] for c in cols_info}
         if banco_nome not in existentes:
             cur.execute(f'ALTER TABLE saldos_bancos ADD COLUMN "{banco_nome}" REAL NOT NULL DEFAULT 0.0')
             conn.commit()
-            cols_info = cur.execute("PRAGMA table_info(saldos_bancos);").fetchall()
+            cols_info = cur.execute('PRAGMA table_info("saldos_bancos");').fetchall()
             existentes = {c[1] for c in cols_info}
 
         date_col = _date_col_name(conn, "saldos_bancos")
@@ -424,5 +414,5 @@ __all__ = [
     "inserir_mov_liquidacao_venda", "registrar_caixa_vendas", "obter_banco_destino",
     "canonicalizar_banco", "upsert_saldos_bancos",
     "bloco_resumo_dia",
+    "formatar_valor",
 ]
-
