@@ -25,13 +25,14 @@ from __future__ import annotations
 # -----------------------------------------------------------------------------
 # Imports + bootstrap de caminho (robusto ao executar via Streamlit)
 # -----------------------------------------------------------------------------
+
 import calendar
 import logging
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
-from typing import Optional
-
+from typing import Optional, Any
+import uuid
 import os
 import sys
 
@@ -43,7 +44,8 @@ if _PROJECT_ROOT not in sys.path:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["_InfraLedgerMixin"]
+__all__ = ["_InfraLedgerMixin", "log_mov_bancaria"]
+
 
 
 class _InfraLedgerMixin:
@@ -200,3 +202,81 @@ class _InfraLedgerMixin:
             compra_dt, vencimento_dia, fechamento_date.date(), comp
         )
         return comp
+
+
+# --- Helpers padrão p/ lançamentos em 'movimentacoes_bancarias' ---
+
+def _resolve_usuario(u: Any) -> str:
+    """Aceita string, dict (nome/name/username/user/email/login) ou outros tipos e devolve uma string segura."""
+    try:
+        if isinstance(u, dict):
+            for k in ("nome", "name", "username", "user", "email", "login"):
+                v = u.get(k)
+                if v:
+                    return str(v).strip()
+            return "sistema"
+        s = str(u).strip() if u is not None else ""
+        return s or "sistema"
+    except Exception:
+        return "sistema"
+
+
+def _ensure_mov_cols(cur) -> None:
+    """Garante colunas 'usuario' e 'data_hora' em movimentacoes_bancarias (idempotente)."""
+    cols = {row[1] for row in cur.execute("PRAGMA table_info(movimentacoes_bancarias);").fetchall()}
+    if "usuario" not in cols:
+        cur.execute("ALTER TABLE movimentacoes_bancarias ADD COLUMN usuario TEXT;")
+    if "data_hora" not in cols:
+        cur.execute("ALTER TABLE movimentacoes_bancarias ADD COLUMN data_hora TEXT;")
+
+
+def log_mov_bancaria(
+    conn,
+    *,
+    data: str,               # 'YYYY-MM-DD'
+    banco: str,              # ex.: "Caixa 2"
+    tipo: str,               # "entrada" | "saida"
+    valor: float,
+    origem: str,             # ex.: "transferencia_caixa"
+    observacao: str,         # texto já padronizado (sem 'REF=...')
+    usuario: Optional[Any] = None,
+    referencia_id: Optional[int] = None,
+    referencia_tabela: Optional[str] = None,
+    trans_uid: Optional[str] = None,
+    data_hora: Optional[str] = None,   # default = agora
+    auto_self_reference: bool = True,  # se True e ref não for fornecida, faz self-reference
+) -> int:
+    """Insere linha padronizada no livro e retorna o id do movimento.
+    Obs.: não dá commit; o caller decide quando commitar.
+    """
+    cur = conn.cursor()
+    _ensure_mov_cols(cur)
+
+    uid = trans_uid or str(uuid.uuid4())
+    user = _resolve_usuario(usuario)
+    dh = data_hora or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute(
+        """
+        INSERT INTO movimentacoes_bancarias
+            (data, banco, tipo, valor, origem, observacao,
+             referencia_id, referencia_tabela, trans_uid, usuario, data_hora)
+        VALUES (?,    ?,     ?,    ?,     ?,      ?,
+                ?,            ?,                ?,       ?,        ?)
+        """,
+        (data, banco, tipo, valor, origem, observacao,
+         referencia_id, referencia_tabela, uid, user, dh),
+    )
+    mov_id = cur.lastrowid
+
+    if auto_self_reference and referencia_id is None:
+        cur.execute(
+            """
+            UPDATE movimentacoes_bancarias
+               SET referencia_id = ?, referencia_tabela = ?
+             WHERE id = ?
+            """,
+            (mov_id, "movimentacoes_bancarias", mov_id),
+        )
+
+    return mov_id
