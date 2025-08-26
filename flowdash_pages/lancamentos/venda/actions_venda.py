@@ -212,8 +212,7 @@ def _extrair_nome_simples(x: Any) -> str | None:
 def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None = None, **kwargs) -> dict:
     """
     Registra a venda (compatível com chamadas legadas).
-    Aceita tanto 'db_like' quanto o legado 'caminho_banco'.
-    Envia o NOME do usuário que fez o lançamento para a coluna Usuario.
+    Usa a data selecionada na tela como Data da VENDA.
     """
     # Compat: permitir chamadas antigas com 'caminho_banco'
     if db_like is None and "caminho_banco" in kwargs:
@@ -231,7 +230,9 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
     maquineta = (payload.get("maquineta") or "").strip()
     modo_pix = payload.get("modo_pix")
     banco_pix_direto = payload.get("banco_pix_direto")
-    taxa_pix_direto = float(payload.get("taxa_pix_direto") or 0.0)
+
+    # ⚠️ PIX direto: ignorar qualquer taxa do formulário (padroniza em 0.0)
+    taxa_pix_direto = 0.0
 
     # ------- validações -------
     if valor <= 0:
@@ -252,15 +253,20 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
         parcelas=parcelas,
         modo_pix=modo_pix,
         banco_pix_direto=banco_pix_direto,
-        taxa_pix_direto=taxa_pix_direto,
+        taxa_pix_direto=taxa_pix_direto,  # <- forçado 0.0 para PIX direto
     )
 
-    # ------- data de liquidação -------
+    # ------- datas -------
+    # Data da VENDA = data selecionada na tela
+    data_venda_str = pd.to_datetime(data_lanc).strftime("%Y-%m-%d")
+
+    # Data de liquidação = compensação + próximo dia útil (se houver), senão mesma data
     base = pd.to_datetime(data_lanc).date()
     dias = DIAS_COMPENSACAO.get(forma, 0)
-    data_liq = proximo_dia_util_br(base, dias) if dias > 0 else base
+    data_liq_date = proximo_dia_util_br(base, dias) if dias > 0 else base
+    data_liq_str = pd.to_datetime(data_liq_date).strftime("%Y-%m-%d")
 
-    # ------- obter NOME do usuário -------
+    # ------- usuário (nome simples) -------
     usuario_atual = payload.get("usuario")
     if not usuario_atual:
         try:
@@ -279,27 +285,23 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
     # ------- serviço -------
     if _VendasService is None:
         raise RuntimeError(
-            "Serviço de Vendas não encontrado. Certifique-se de ter `services.vendas.VendasService` "
+            "Serviço de Vendas não encontrado. Tenha `services.vendas.VendasService` "
             "ou `services.ledger.LedgerService` disponível."
         )
-
     try:
         service = _VendasService(db_like=db_like)
     except TypeError:
-        service = _VendasService(db_like)  # compat posicional
+        service = _VendasService(db_like)
 
     if not hasattr(service, "registrar_venda"):
-        raise RuntimeError(
-            "O serviço carregado não expõe `registrar_venda(...)`. "
-            "Implemente esse método no serviço ou adapte a chamada aqui."
-        )
+        raise RuntimeError("O serviço carregado não expõe `registrar_venda(...)`.")
 
-    # ------- chamada ao service -------
+    # ------- chamada ao service (força Data da VENDA) -------
     venda_id, mov_id = _chamar_service_registrar_venda(
         service,
         db_like=db_like,
-        data_venda=str(data_lanc),
-        data_liq=str(data_liq),
+        data_venda=data_venda_str,   # <- AQUI garantimos a Data da VENDA
+        data_liq=data_liq_str,
         valor=_r2(valor),
         forma=forma,
         parcelas=int(parcelas or 1),
@@ -307,18 +309,20 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
         maquineta=maquineta or "",
         banco_destino=banco_destino,
         taxa_percentual=_r2(taxa or 0.0),
-        usuario=usuario_atual,   # << gravado em Usuario
+        usuario=usuario_atual,
     )
 
     # ------- retorno -------
+    from utils.utils import formatar_valor
     if venda_id == -1:
         msg = "⚠️ Venda já registrada (idempotência)."
     else:
         valor_liq = _r2(float(valor) * (1 - float(taxa or 0.0) / 100.0))
         msg_liq = (
             f"Liquidação de {formatar_valor(valor_liq)} em {(banco_destino or 'Caixa_Vendas')}"
-            f" em {pd.to_datetime(data_liq).strftime('%d/%m/%Y')}"
+            f" em {pd.to_datetime(data_liq_str).strftime('%d/%m/%Y')}"
         )
         msg = f"✅ Venda registrada! {msg_liq}"
 
     return {"ok": True, "msg": msg}
+

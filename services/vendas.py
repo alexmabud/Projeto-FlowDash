@@ -122,6 +122,14 @@ class VendasService:
             (float(delta), data),
         )
 
+    def _garantir_cols_mov_bancarias(self, conn: sqlite3.Connection) -> None:
+        """Garante as colunas `usuario` e `data_hora` em movimentacoes_bancarias (idempotente)."""
+        cols = set(pd.read_sql("PRAGMA table_info(movimentacoes_bancarias);", conn)["name"].astype(str))
+        if "usuario" not in cols:
+            conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "usuario" TEXT;')
+        if "data_hora" not in cols:
+            conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "data_hora" TEXT;')
+
     # =============================
     # Insert em `entrada`
     # =============================
@@ -278,10 +286,9 @@ class VendasService:
         """Registra a venda, aplica a liquidação e grava log idempotente.
 
         Fluxo:
-          1. Insere em `entrada` (valor bruto e líquido).
-          2. Atualiza saldos na `data_liq` (caixa_vendas **ou** banco).
-          3. Registra **um** log de liquidação em `movimentacoes_bancarias`
-             protegido por idempotência (via `trans_uid`).
+        1. Insere em `entrada` (valor bruto e líquido).
+        2. Atualiza saldos na `data_liq` (caixa_vendas **ou** banco).
+        3. Registra **um** log na `movimentacoes_bancarias` protegido por idempotência.
         """
         # Validações básicas
         try:
@@ -308,9 +315,9 @@ class VendasService:
         usuario = sanitize(usuario)
 
         with get_conn(self.db_path_like) as conn:
-            # decidir taxa efetiva com base no fluxo
+            # decidir taxa efetiva
             if forma_u == "DINHEIRO" or (forma_u == "PIX" and not (maquineta and maquineta.strip())):
-                taxa_eff = 0.0
+                taxa_eff = 0.0  # PIX direto e DINHEIRO sem taxa
             else:
                 taxa_eff = float(taxa_percentual or 0.0)
                 if taxa_eff == 0.0:
@@ -384,23 +391,48 @@ class VendasService:
                 )
                 banco_label = banco_destino
 
-            # 3) Log idempotente em movimentacoes_bancarias
+            # 3) Log em movimentacoes_bancarias (OBS padronizada)
+            if forma_u == "PIX" and not (maquineta and maquineta.strip()):
+                detalhe_meio = f"Direto — {banco_destino or '—'}"      # PIX direto para banco
+            elif forma_u in ("CRÉDITO", "DÉBITO", "LINK_PAGAMENTO"):
+                detalhe_meio = f"{(bandeira or '—')}/{(maquineta or '—')}"
+            elif forma_u == "DINHEIRO":
+                detalhe_meio = "Caixa"
+            else:
+                detalhe_meio = f"{(bandeira or '—')}/{(maquineta or '—')}"
+
             obs = (
-                f"Liquidação venda {forma_u} {parcelas}x - "
-                f"{bandeira or ''}/{maquineta or ''} • Bruto R$ {valor_bruto:.2f} • "
+                f"Lançamento VENDA {forma_u} {parcelas}x / "
+                f"{detalhe_meio} • Bruto R$ {valor_bruto:.2f} • "
                 f"Taxa {taxa_eff:.2f}% -> Líquido R$ {valor_liquido:.2f}"
             ).strip()
 
-            cur.execute(
-                """
-                INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, ?, 'entrada', ?, 'vendas_liquidacao', ?, 'entrada', ?, ?)
-                """,
-                (data_liq, banco_label, float(valor_liquido), obs, int(venda_id), trans_uid),
-            )
+            # INSERT dinâmico: inclui data_hora/usuario apenas se as colunas existirem
+            cols_exist = {r[1] for r in conn.execute("PRAGMA table_info(movimentacoes_bancarias)")}
+            payload = {
+                "data": data_liq,                 # data contábil (liquidação)
+                "banco": banco_label,
+                "tipo": "entrada",
+                "valor": float(valor_liquido),
+                "origem": "lancamentos",          # padronizado
+                "observacao": obs,
+                "referencia_tabela": "entrada",
+                "referencia_id": int(venda_id),
+                "trans_uid": trans_uid,
+            }
+            if "data_hora" in cols_exist:
+                payload["data_hora"] = datetime.now().isoformat(timespec="seconds")
+            if "usuario" in cols_exist:
+                payload["usuario"] = usuario
+
+            cols_sql = ", ".join(f'"{k}"' for k in payload.keys())
+            ph_sql   = ", ".join("?" for _ in payload)
+            vals     = list(payload.values())
+
+            cur.execute(f"INSERT INTO movimentacoes_bancarias ({cols_sql}) VALUES ({ph_sql})", vals)
             mov_id = int(cur.lastrowid)
 
             conn.commit()
 
         return (int(venda_id), int(mov_id))
+

@@ -1,7 +1,8 @@
 # ===================== Actions: Página de Lançamentos =====================
 """
 Consulta o SQLite e calcula os dados do resumo do dia.
-Reproduz a mesma lógica do módulo original (sem alterações de regra).
+Reproduz a mesma lógica do módulo original, com salvaguardas
+contra DUPLICIDADES (dedupe por trans_uid/id).
 """
 
 from __future__ import annotations
@@ -9,7 +10,6 @@ from __future__ import annotations
 import pandas as pd
 from shared.db import get_conn
 from flowdash_pages.lancamentos.shared_ui import carregar_tabela
-
 
 
 # ---- helpers internos (iguais ao original) --------------------------------
@@ -48,37 +48,13 @@ def _coerce_date_col(df: pd.DataFrame, guess_names=("data","Data")) -> str | Non
 def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
     """
     Carrega totais e listas do dia selecionado, agregando:
-    - total_vendas / total_saidas
-    - snapshot de saldos (caixa / caixa 2)
-    - transferências/depósitos do dia
-    - mercadorias (compras/recebimentos do dia)
-    - saldos_bancos acumulados até a data
+    - total_vendas: SOMA de entrada.Valor onde DATE(Data)=data_lanc  (venda do dia)
+    - total_saidas: SOMA de saida.valor onde DATE(data)=data_lanc
+    - caixa_total/caixa2_total: soma acumulada até a data (saldos_caixas)
+    - saldos_bancos: soma acumulada por banco até a data (saldos_bancos)
+    - listas do dia (depósitos, transferências, mercadorias)
     """
-    # Entradas/Saídas (totais do dia)
-    df_e = _padronizar_cols_fin(carregar_tabela("entrada", caminho_banco))
-    df_s = _padronizar_cols_fin(carregar_tabela("saida", caminho_banco))
-
     total_vendas, total_saidas = 0.0, 0.0
-
-    # --- VENDAS: preferir Valor_Liquido; senão Valor; senão Valor_Bruto ---
-    if df_e is not None and not df_e.empty:
-        cols_low = {c.lower(): c for c in df_e.columns}
-        date_col = _coerce_date_col(df_e, guess_names=("data","Data"))
-        vcol = (
-            cols_low.get("valor_liquido")
-            or cols_low.get("valor")
-            or cols_low.get("valor_bruto")
-        )
-        if date_col and vcol:
-            df_e[vcol] = pd.to_numeric(df_e[vcol], errors="coerce").fillna(0.0)
-            mask_e = df_e[date_col].notna() & (df_e[date_col].dt.date == data_lanc)
-            total_vendas = float(df_e.loc[mask_e, vcol].sum())
-
-    # --- SAÍDAS: permanece como estava (coluna 'valor' padronizada) ---
-    if df_s is not None and not df_s.empty and {"data", "valor"}.issubset(df_s.columns):
-        mask_s = df_s["data"].notna() & (df_s["data"].dt.date == data_lanc)
-        total_saidas = float(df_s.loc[mask_s, "valor"].sum())
-
     caixa_total = 0.0
     caixa2_total = 0.0
     transf_caixa2_total = 0.0
@@ -88,76 +64,95 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
     receb_list: list[tuple[str, str, float]] = []
     saldos_bancos: dict[str, float] = {}
 
-    # Banco
+    from shared.db import get_conn
     with get_conn(caminho_banco) as conn:
         cur = conn.cursor()
 
-        # ⚠️ Fallback: se total_vendas ficou 0, usa o log idempotente da liquidação
-        if total_vendas == 0.0:
-            total_vendas = cur.execute("""
-                SELECT COALESCE(SUM(valor), 0.0)
-                  FROM movimentacoes_bancarias
-                 WHERE date(data)=?
-                   AND tipo='entrada'
-                   AND origem='vendas_liquidacao'
-            """, (str(data_lanc),)).fetchone()[0] or 0.0
-            total_vendas = float(total_vendas)
+        # ======= VENDAS do dia (Data da VENDA, coluna Valor) =======
+        total_vendas = float(cur.execute(
+            """
+            SELECT COALESCE(SUM(COALESCE(Valor,0)), 0.0)
+              FROM entrada
+             WHERE DATE(Data) = DATE(?)
+            """,
+            (str(data_lanc),),
+        ).fetchone()[0] or 0.0)
 
-        # Snapshot saldos_caixas
+        # ======= SAÍDAS do dia =======
+        total_saidas = float(cur.execute(
+            """
+            SELECT COALESCE(SUM(COALESCE(valor,0)), 0.0)
+              FROM saida
+             WHERE DATE(data) = DATE(?)
+            """,
+            (str(data_lanc),),
+        ).fetchone()[0] or 0.0)
+
+        # ======= Caixas: SOMAR caixa_total e caixa2_total ATÉ a data =======
         try:
-            df_caixas = pd.read_sql("SELECT * FROM saldos_caixas", conn)
-            if not df_caixas.empty:
-                cols_low = {c.lower(): c for c in df_caixas.columns}
-                date_col = _coerce_date_col(df_caixas, guess_names=("data","Data"))
-                c_caixa  = cols_low.get("caixa_total")  or "caixa_total"
-                c_caixa2 = cols_low.get("caixa2_total") or "caixa2_total"
-
-                if c_caixa in df_caixas.columns:
-                    df_caixas[c_caixa] = pd.to_numeric(df_caixas[c_caixa], errors="coerce").fillna(0.0)
-                if c_caixa2 in df_caixas.columns:
-                    df_caixas[c_caixa2] = pd.to_numeric(df_caixas[c_caixa2], errors="coerce").fillna(0.0)
-
-                snap = None
-                if date_col:
-                    same_day = df_caixas[df_caixas[date_col].dt.date == data_lanc]
-                    if not same_day.empty:
-                        snap = same_day.sort_values(date_col).tail(1)
-                    else:
-                        prev = df_caixas[df_caixas[date_col].dt.date <= data_lanc]
-                        if not prev.empty:
-                            snap = prev.sort_values(date_col).tail(1)
-                if snap is None or snap.empty:
-                    snap = df_caixas.tail(1)
-
-                if snap is not None and not snap.empty:
-                    caixa_total  = float(snap.iloc[0].get(c_caixa, 0.0)  or 0.0)
-                    caixa2_total = float(snap.iloc[0].get(c_caixa2, 0.0) or 0.0)
+            import pandas as pd
+            df_cx = pd.read_sql("SELECT data, caixa_total, caixa2_total FROM saldos_caixas", conn)
         except Exception:
-            pass
+            df_cx = pd.DataFrame()
 
-        # Transferência p/ Caixa 2 (dia)
-        transf_caixa2_total = cur.execute("""
-            SELECT COALESCE(SUM(valor), 0)
-              FROM movimentacoes_bancarias
-             WHERE date(data)=?
-               AND origem='transferencia_caixa'
-        """, (str(data_lanc),)).fetchone()[0] or 0.0
+        if not df_cx.empty:
+            df_cx["data"] = pd.to_datetime(df_cx["data"], errors="coerce")
+            df_cx = df_cx[df_cx["data"].dt.date <= data_lanc]
 
-        # Depósitos do dia
-        depositos_list = cur.execute("""
-            SELECT COALESCE(banco,''), COALESCE(valor,0.0)
-              FROM movimentacoes_bancarias
-             WHERE date(data)=? AND origem='deposito'
-             ORDER BY rowid
-        """, (str(data_lanc),)).fetchall()
+            if "caixa_total" in df_cx.columns:
+                caixa_total = float(pd.to_numeric(df_cx["caixa_total"], errors="coerce").fillna(0.0).sum())
+            if "caixa2_total" in df_cx.columns:
+                caixa2_total = float(pd.to_numeric(df_cx["caixa2_total"], errors="coerce").fillna(0.0).sum())
 
-        # Transferências banco→banco do dia (origem='transf_bancos')
-        transf_bancos_raw = cur.execute("""
-            SELECT COALESCE(banco,''), COALESCE(valor,0.0), COALESCE(observacao,'')
-              FROM movimentacoes_bancarias
-             WHERE date(data)=? AND origem='transf_bancos'
-             ORDER BY rowid
-        """, (str(data_lanc),)).fetchall()
+        # ======= Transferência p/ Caixa 2 (dia) — dedupe por trans_uid/id =======
+        transf_caixa2_total = cur.execute(
+            """
+            SELECT COALESCE(SUM(m.valor), 0.0)
+              FROM movimentacoes_bancarias m
+              JOIN (
+                    SELECT MAX(id) AS id
+                      FROM movimentacoes_bancarias
+                     WHERE DATE(data)=DATE(?)
+                       AND origem='transferencia_caixa'
+                     GROUP BY COALESCE(trans_uid, CAST(id AS TEXT))
+                   ) d ON d.id = m.id
+            """,
+            (str(data_lanc),),
+        ).fetchone()[0] or 0.0
+
+        # ======= Depósitos do dia — dedupe por trans_uid/id =======
+        depositos_list = cur.execute(
+            """
+            SELECT m.banco, m.valor
+              FROM movimentacoes_bancarias m
+              JOIN (
+                    SELECT MAX(id) AS id
+                      FROM movimentacoes_bancarias
+                     WHERE DATE(data)=DATE(?)
+                       AND origem='deposito'
+                     GROUP BY COALESCE(trans_uid, CAST(id AS TEXT))
+                   ) d ON d.id = m.id
+             ORDER BY m.id
+            """,
+            (str(data_lanc),),
+        ).fetchall()
+
+        # ======= Transferências banco→banco do dia — dedupe por trans_uid/id =======
+        transf_bancos_raw = cur.execute(
+            """
+            SELECT m.banco, m.valor, m.observacao
+              FROM movimentacoes_bancarias m
+              JOIN (
+                    SELECT MAX(id) AS id
+                      FROM movimentacoes_bancarias
+                     WHERE DATE(data)=DATE(?)
+                       AND origem='transf_bancos'
+                     GROUP BY COALESCE(trans_uid, CAST(id AS TEXT))
+                   ) d ON d.id = m.id
+             ORDER BY m.id
+            """,
+            (str(data_lanc),),
+        ).fetchall()
 
         transf_bancos_list = []
         for banco, valor, obs in transf_bancos_raw:
@@ -178,9 +173,10 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
                 para_val = banco or ""
             transf_bancos_list.append((de_val, para_val, float(valor or 0.0)))
 
-        # Mercadorias do dia
+        # ======= Mercadorias do dia =======
+        compras_list, receb_list = [], []
         try:
-            df_compras = pd.read_sql("SELECT * FROM mercadorias WHERE date(Data)=?", conn, params=(str(data_lanc),))
+            df_compras = pd.read_sql("SELECT * FROM mercadorias WHERE DATE(Data)=DATE(?)", conn, params=(str(data_lanc),))
             if not df_compras.empty:
                 cols = {c.lower(): c for c in df_compras.columns}
                 col_col = cols.get("colecao") or cols.get("coleção")
@@ -198,7 +194,7 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
         try:
             df_receb = pd.read_sql(
                 "SELECT * FROM mercadorias WHERE Recebimento IS NOT NULL "
-                "AND TRIM(Recebimento)<>'' AND date(Recebimento)=?",
+                "AND TRIM(Recebimento)<>'' AND DATE(Recebimento)=DATE(?)",
                 conn, params=(str(data_lanc),)
             )
             if not df_receb.empty:
@@ -217,35 +213,23 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> dict:
         except Exception:
             pass
 
-        # Saldos bancos (acumulado <= data) — mantém sua lógica
+        # ======= Saldos bancos (ACUMULADO <= data) — somar por coluna =======
         try:
-            df_bancos_raw = pd.read_sql("SELECT * FROM saldos_bancos", conn)
-            if not df_bancos_raw.empty:
-                df_bancos = df_bancos_raw.copy()
-                date_col = _coerce_date_col(df_bancos, guess_names=("data","Data"))
-
-                nome_col  = next((c for c in df_bancos.columns if c.lower() in ("nome","banco","banco_nome","instituicao")), None)
-                valor_col = next((c for c in df_bancos.columns if c.lower() in ("saldo","valor","saldo_atual","valor_atual")), None)
-
-                if date_col:
-                    df_bancos = df_bancos[df_bancos[date_col].dt.date <= data_lanc]
-
-                if not df_bancos.empty and nome_col and valor_col:
-                    df_bancos[valor_col] = pd.to_numeric(df_bancos[valor_col], errors="coerce").fillna(0.0)
-                    grouped = df_bancos.groupby(nome_col, dropna=True, as_index=False)[valor_col].sum()
-                    saldos_bancos = { str(r[nome_col]): float(r[valor_col] or 0.0) for _, r in grouped.iterrows() }
-                else:
-                    saldos_bancos = {}
-                    cols_sum = [c for c in df_bancos.columns if c != date_col] if date_col else list(df_bancos.columns)
-                    for c in cols_sum:
-                        try:
-                            sal = pd.to_numeric(df_bancos[c], errors="coerce").fillna(0.0).sum()
-                            if pd.notna(sal):
-                                saldos_bancos[str(c)] = float(sal)
-                        except Exception:
-                            pass
+            df_bk = pd.read_sql("SELECT * FROM saldos_bancos", conn)
         except Exception:
-            saldos_bancos = {}
+            df_bk = pd.DataFrame()
+
+        if not df_bk.empty:
+            date_col_name = next((c for c in df_bk.columns if c.lower() == "data"), None)
+            if date_col_name:
+                df_bk[date_col_name] = pd.to_datetime(df_bk[date_col_name], errors="coerce")
+                df_bk = df_bk[df_bk[date_col_name].dt.date <= data_lanc]
+
+            for c in df_bk.columns:
+                if c.lower() == "data":
+                    continue
+                soma = pd.to_numeric(df_bk[c], errors="coerce").fillna(0.0).sum()
+                saldos_bancos[str(c)] = float(soma)
 
     return {
         "total_vendas": total_vendas,
