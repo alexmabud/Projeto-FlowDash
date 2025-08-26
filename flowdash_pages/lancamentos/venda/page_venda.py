@@ -1,8 +1,7 @@
 # ===================== Page: Venda =====================
 """
-Página principal de Venda – monta layout e chama forms/actions.
-Preserva o comportamento do arquivo original: toggle, confirmação, validações,
-mensagens e rerun após sucesso.
+Página principal de Venda — monta layout e chama forms/actions.
+
 """
 
 from __future__ import annotations
@@ -24,24 +23,28 @@ def render_venda(state) -> None:
     """
     Renderiza a página de Venda.
 
-    Recebe um único objeto 'state' (compatível com _safe_call),
-    de onde extraímos caminho_banco e a data selecionada no topo da página.
+    Parâmetros
+    ----------
+    state : object
+        Objeto de estado (compatível com _safe_call) contendo:
+        - caminho_banco / db_path: caminho do SQLite
+        - data_lanc: data selecionada no topo da página
     """
-    # --- extrai do state ---
+    # --- Extrai do state -----------------------------------------------------
     caminho_banco = getattr(state, "caminho_banco", getattr(state, "db_path", None))
     data_lanc_raw = getattr(state, "data_lanc", None)
 
-    # --- Normaliza para datetime.date (evita erro de .strftime em string) ---
-    data_lanc: date = coerce_data(data_lanc_raw)
+    # --- Normaliza para datetime.date (evita erro de .strftime em string) ----
+    data_lanc: date = coerce_data(data_lanc_raw)  # [no-behavior-change]
 
-    # Toggle
+    # --- Toggle ---------------------------------------------------------------
     if st.button("🟢 Nova Venda", use_container_width=True, key="btn_venda_toggle"):
         toggle_form()
 
     if not form_visivel():
         return
 
-    # UI retorna todos os campos + 'confirmado'
+    # --- Formulário -----------------------------------------------------------
     try:
         form = render_form_venda(caminho_banco, data_lanc)
     except Exception as e:
@@ -49,9 +52,9 @@ def render_venda(state) -> None:
         return
 
     if not form:
-        return  # UI já deu aviso correspondente
+        return  # UI já exibiu o aviso correspondente
 
-    # Botão salvar (mesma trava do original: exige confirmação)
+    # --- Botão Salvar (mesma trava do original: exige confirmação) -----------
     if not form.get("confirmado"):
         st.button("💾 Salvar Venda", use_container_width=True, key="venda_salvar", disabled=True)
         return
@@ -59,11 +62,11 @@ def render_venda(state) -> None:
     if not st.button("💾 Salvar Venda", use_container_width=True, key="venda_salvar_ok"):
         return
 
-    # Execução
+    # --- Execução -------------------------------------------------------------
     try:
         res = registrar_venda(
             db_like=caminho_banco,   # alinhado com a nova API
-            data_lanc=data_lanc,     # <= usa a data selecionada no topo
+            data_lanc=data_lanc,     # usa a data selecionada no topo
             payload=form,
         )
 
@@ -72,11 +75,11 @@ def render_venda(state) -> None:
             st.session_state.form_venda = False
             st.success(res.get("msg", "Venda registrada com sucesso."))
 
-            # 🔄 força o Recarregamento do Resumo do Dia / cards
+            # 🔄 força recarregar o Resumo do Dia / cards
             st.session_state["_resumo_dirty"] = time.time()
 
             # ✅ limpa caches de @st.cache_data para garantir recomputo do resumo
-            st.cache_data.clear()
+            st.cache_data.clear()  # [no-behavior-change]
 
             st.rerun()
         else:

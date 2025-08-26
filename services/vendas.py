@@ -9,7 +9,7 @@ em `movimentacoes_bancarias`.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple
 import re
 import sqlite3
 from datetime import datetime
@@ -68,12 +68,12 @@ class VendasService:
     # ------------------------------------------------------------------ #
     # Setup
     # ------------------------------------------------------------------ #
-    def __init__(self, db_path_like: Any) -> None:
+    def __init__(self, db_path_like: object) -> None:
         """
         Inicializa o serviço.
 
         Args:
-            db_path_like (Any): Caminho do SQLite (str/Path) ou objeto com
+            db_path_like: Caminho do SQLite (str/Path) ou objeto com
                 atributo de caminho (ex.: SimpleNamespace(caminho_banco=...)).
         """
         self.db_path_like = db_path_like  # get_conn aceita db_path_like direto.
@@ -121,14 +121,6 @@ class VendasService:
             f'UPDATE saldos_bancos SET "{banco_col}" = COALESCE("{banco_col}", 0) + ? WHERE data = ?',
             (float(delta), data),
         )
-
-    def _garantir_cols_mov_bancarias(self, conn: sqlite3.Connection) -> None:
-        """Garante as colunas `usuario` e `data_hora` em movimentacoes_bancarias (idempotente)."""
-        cols = set(pd.read_sql("PRAGMA table_info(movimentacoes_bancarias);", conn)["name"].astype(str))
-        if "usuario" not in cols:
-            conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "usuario" TEXT;')
-        if "data_hora" not in cols:
-            conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "data_hora" TEXT;')
 
     # =============================
     # Insert em `entrada`
@@ -435,4 +427,3 @@ class VendasService:
             conn.commit()
 
         return (int(venda_id), int(mov_id))
-

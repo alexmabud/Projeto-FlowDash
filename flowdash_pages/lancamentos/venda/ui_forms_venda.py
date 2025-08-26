@@ -11,6 +11,7 @@ import pandas as pd
 from typing import Optional, List
 
 from shared.db import get_conn
+from utils.utils import formatar_moeda   # [unifica moeda]
 from .state_venda import invalidate_confirm
 
 
@@ -106,11 +107,11 @@ def render_form_venda(caminho_banco: str, data_lanc):
                 return None
 
             banco_pix_direto = st.selectbox(
-            "Banco que receberá o PIX",
-            bancos,
-            key="pix_banco",
-            on_change=invalidate_confirm,
-        )
+                "Banco que receberá o PIX",
+                bancos,
+                key="pix_banco",
+                on_change=invalidate_confirm,
+            )
 
         taxa_pix_direto = 0.0
 
@@ -210,13 +211,10 @@ def render_form_venda(caminho_banco: str, data_lanc):
         st.caption("🧾 Venda em **dinheiro** será registrada no **Caixa**.")
 
     # ================= Resumo (card azul) =================
-    def _format_brl(v: float) -> str:
-        return ("R$ " + format(float(v or 0.0), ",.2f")).replace(",", "X").replace(".", ",").replace("X", ".")
-
     linhas_md = [
         "**Confirme os dados da venda**",
         f"- **Data:** {data_venda_str}",
-        f"- **Valor:** {_format_brl(valor)}",
+        f"- **Valor:** {formatar_moeda(valor)}",   # [usa helper central]
         f"- **Forma de pagamento:** {forma}",
     ]
     if forma in ["DÉBITO", "CRÉDITO", "LINK_PAGAMENTO"]:

@@ -14,7 +14,6 @@ from typing import Optional, Tuple, Any
 import pandas as pd
 
 from shared.db import get_conn
-from utils.utils import formatar_valor
 from flowdash_pages.lancamentos.shared_ui import (
     DIAS_COMPENSACAO,
     proximo_dia_util_br,
@@ -40,6 +39,7 @@ def _r2(x) -> float:
 
 
 def _formas_equivalentes(forma: str):
+    """Normaliza formas equivalentes de pagamento (LINK_PAGAMENTO etc)."""
     f = (forma or "").upper()
     if f == "LINK_PAGAMENTO":
         return ["LINK_PAGAMENTO", "LINK PAGAMENTO", "LINK-DE-PAGAMENTO", "LINK DE PAGAMENTO"]
@@ -201,11 +201,8 @@ def _extrair_nome_simples(x: Any) -> str | None:
     if not x:
         return None
     s = str(x).strip()
-    # se vier e-mail, pega antes do @
-    if "@" in s and " " not in s:
+    if "@" in s and " " not in s:  # se vier e-mail, pega antes do @
         s = s.split("@", 1)[0]
-    # se quiser apenas o primeiro nome, descomente:
-    # s = s.split()[0]
     return s or None
 
 
@@ -257,10 +254,7 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
     )
 
     # ------- datas -------
-    # Data da VENDA = data selecionada na tela
     data_venda_str = pd.to_datetime(data_lanc).strftime("%Y-%m-%d")
-
-    # Data de liquidação = compensação + próximo dia útil (se houver), senão mesma data
     base = pd.to_datetime(data_lanc).date()
     dias = DIAS_COMPENSACAO.get(forma, 0)
     data_liq_date = proximo_dia_util_br(base, dias) if dias > 0 else base
@@ -296,11 +290,11 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
     if not hasattr(service, "registrar_venda"):
         raise RuntimeError("O serviço carregado não expõe `registrar_venda(...)`.")
 
-    # ------- chamada ao service (força Data da VENDA) -------
+    # ------- chamada ao service -------
     venda_id, mov_id = _chamar_service_registrar_venda(
         service,
         db_like=db_like,
-        data_venda=data_venda_str,   # <- AQUI garantimos a Data da VENDA
+        data_venda=data_venda_str,
         data_liq=data_liq_str,
         valor=_r2(valor),
         forma=forma,
@@ -325,4 +319,3 @@ def registrar_venda(*, db_like: Any = None, data_lanc=None, payload: dict | None
         msg = f"✅ Venda registrada! {msg_liq}"
 
     return {"ok": True, "msg": msg}
-
