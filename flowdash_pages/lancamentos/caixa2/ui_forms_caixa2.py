@@ -49,6 +49,9 @@ def _fmt_data_br(d: str | date) -> str:
 
 def render_form(data_lanc: str | date) -> dict:
     """Desenha o formulário de transferência para Caixa 2 e retorna os dados da submissão."""
+    # Título com novo emoji
+    st.markdown("#### ➡️ Lançar Transferência p/ Caixa 2")
+
     # Cabeçalho
     st.caption(f"Data do lançamento: **{_fmt_data_br(data_lanc)}**")
 

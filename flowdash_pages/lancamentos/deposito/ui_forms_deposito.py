@@ -35,7 +35,8 @@ def render_form_deposito(
             - "valor" (float): Valor do depósito.
             - "confirmado" (bool): Se o usuário confirmou os dados.
     """
-    # Título removido (o botão já exibe o nome da ação)
+    # Título abaixo do botão (pedido): 
+    st.markdown("#### 🧾 Lançar Depósito")
     st.caption(f"Data do lançamento: **{data_lanc}**")
 
     c1, c2 = st.columns(2)

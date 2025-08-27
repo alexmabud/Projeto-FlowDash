@@ -31,7 +31,7 @@ def render_form_venda(caminho_banco: str, data_lanc):
         modo_pix, banco_pix_direto, taxa_pix_direto, confirmado.
         Retorna None quando falta cadastro necessário para prosseguir.
     """
-    st.markdown("#### 📋 Nova Venda")
+    st.markdown("#### 📥 Lançar Nova Venda")
     data_venda_str = pd.to_datetime(data_lanc).strftime("%d/%m/%Y")
     st.caption(f"Data do lançamento: **{data_venda_str}**")
 
