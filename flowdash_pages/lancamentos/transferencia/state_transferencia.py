@@ -1,27 +1,44 @@
 # ===================== State: Transferência =====================
 """
-Gerencia estado/transientes da página Transferência (session_state e helpers).
+Gerencia o estado/transientes da página de Transferência (session_state e helpers).
 """
+
+from __future__ import annotations
 
 import streamlit as st
 
-def _ensure_keys():
-    st.session_state.setdefault("form_transferencia", False)
-    st.session_state.setdefault("transferencia_confirmada", False)
+__all__ = ["toggle_form", "form_visivel", "invalidate_confirm"]
 
-def toggle_form():
-    """Alterna visibilidade do formulário e reinicia confirmação."""
+# ---- Session keys ----
+_SS_FORM_FLAG = "form_transferencia"
+_SS_CONFIRMADA_KEY = "transferencia_confirmada"
+
+
+def _ensure_keys() -> None:
+    """Garante as chaves necessárias no session_state."""
+    st.session_state.setdefault(_SS_FORM_FLAG, False)
+    st.session_state.setdefault(_SS_CONFIRMADA_KEY, False)
+
+
+def toggle_form() -> None:
+    """Alterna a visibilidade do formulário e reinicia a confirmação."""
     _ensure_keys()
-    st.session_state.form_transferencia = not st.session_state.form_transferencia
-    if st.session_state.form_transferencia:
-        st.session_state.transferencia_confirmada = False
+    st.session_state[_SS_FORM_FLAG] = not bool(st.session_state[_SS_FORM_FLAG])
+    if st.session_state[_SS_FORM_FLAG]:
+        st.session_state[_SS_CONFIRMADA_KEY] = False
+
 
 def form_visivel() -> bool:
-    """Retorna se o formulário está visível."""
-    _ensure_keys()
-    return bool(st.session_state.form_transferencia)
+    """Indica se o formulário está visível.
 
-def invalidate_confirm():
-    """Invalida a confirmação quando campos críticos mudam."""
+    Returns:
+        True se o formulário deve ser exibido; False caso contrário.
+    """
     _ensure_keys()
-    st.session_state.transferencia_confirmada = False
+    return bool(st.session_state[_SS_FORM_FLAG])
+
+
+def invalidate_confirm() -> None:
+    """Invalida a confirmação (usar quando campos críticos forem alterados)."""
+    _ensure_keys()
+    st.session_state[_SS_CONFIRMADA_KEY] = False

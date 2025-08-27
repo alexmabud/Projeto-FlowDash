@@ -2,11 +2,27 @@
 """
 Componentes visuais (CSS + cartões) usados na página agregadora de Lançamentos.
 Sem regras de negócio.
+
+Notas:
+    - `render_card_row(...)`: renderiza um cartão com uma linha e N células.
+    - `render_card_mercadorias(...)`: exibe mini-tabelas para compras/recebimentos.
+    - `get_transferencias_bancos_lista(...)`: formata as transferências banco→banco
+      do dia (pareamento por token `TX=`; fallback em `id`).
 """
 
 from __future__ import annotations
-import streamlit as st
 
+import streamlit as st
+from .actions_pagina import listar_transferencias_bancos_do_dia
+
+# NEW: suporte a DataFrame
+try:
+    import pandas as pd  # type: ignore
+except Exception:
+    pd = None  # type: ignore
+
+
+# ===================== CSS =====================
 _CARD_TABLE_CSS = """
 <style>
 :root{
@@ -28,21 +44,39 @@ _CARD_TABLE_CSS = """
 .cell-empty{ font-size:.82rem; font-weight:600; color:var(--muted); }
 .cell-list{ display:flex; flex-direction:column; gap:4px; align-items:center; }
 .cell-item{ color:var(--accent); font-weight:800; font-size:.98rem; }
-.mini-table{ width:100%; border-collapse:collapse; }
+
+.mini-table{ width:100%; border-collapse:collapse; table-layout:fixed; }
 .mini-table thead th{
   color:#cfd3df; font-size:.8rem; font-weight:700; letter-spacing:.2px;
   padding:5px 6px; border-bottom:1px solid var(--stroke); text-align:left;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
 }
-.mini-table tbody td{ padding:5px 6px; border-bottom:1px solid var(--stroke); font-size:.88rem; vertical-align:top; }
+.mini-table tbody td{
+  padding:5px 6px; border-bottom:1px solid var(--stroke); font-size:.88rem; vertical-align:top;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
 .mini-table td.val{ color:var(--accent); font-weight:800; }
 .small{ font-size:.8rem; color:var(--muted); }
 </style>
 """
 
+
+# ===================== Helpers =====================
 def _coerce_number(value) -> float:
-    """
-    Converte valores variados (float, int, str em formato BR/EN) em float.
-    Exemplos aceitos: 1234.56, "1234.56", "1.234,56", "1,234.56", "1234,56".
+    """Converte valores variados (float, int, str BR/EN) em float.
+
+    Exemplos aceitos:
+        - 1234.56
+        - "1234.56"
+        - "1.234,56"
+        - "1,234.56"
+        - "1234,56"
+
+    Args:
+        value: Valor numérico ou string.
+
+    Returns:
+        Número convertido para float (0.0 em caso de falha).
     """
     if value is None:
         return 0.0
@@ -52,43 +86,90 @@ def _coerce_number(value) -> float:
         s = str(value).strip()
         if not s:
             return 0.0
-        # Normalização br/intl
-        # Caso 1: "1.234,56" (BR) -> "1234.56"
         if "," in s and "." in s:
-            s = s.replace(".", "").replace(",", ".")
-        # Caso 2: "1234,56" (BR simples) -> "1234.56"
+            s = s.replace(".", "").replace(",", ".")       # "1.234,56" -> "1234.56"
         elif "," in s:
-            s = s.replace(",", ".")
-        # Caso 3: "1,234.56" (EN com milhares) -> "1234.56"
+            s = s.replace(",", ".")                        # "1234,56"  -> "1234.56"
         elif s.count(",") == 1 and s.count(".") == 1 and s.find(",") < s.find("."):
-            s = s.replace(",", "")
+            s = s.replace(",", "")                         # "1,234.56" -> "1234.56"
         return float(s)
     except Exception:
         return 0.0
 
+
 def _fmt_val(v) -> str:
+    """Formata número/str para moeda BR.
+
+    Args:
+        v: Valor a ser formatado.
+
+    Returns:
+        Valor no formato "R$ 1.234,56".
+    """
     try:
         num = _coerce_number(v)
         return f"R$ {num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
         return "R$ 0,00"
 
-def render_card_row(title: str, items: list[tuple[str, float | list[str] | None, bool]]):
-    """
-    Renderiza um cartão com título + UMA faixa com N colunas.
+
+def _df_to_html_table(df) -> str:
+    """Converte um DataFrame em HTML (classe 'mini-table').
 
     Args:
-        title: título do cartão.
-        items: lista de tuplas (label, valor, number_always)
-            - Se valor for list[str], mostra lista (verde).
-            - Se float/None: number_always=True força exibir 0,00; senão mostra "Sem movimentações" para 0/None.
+        df: pandas.DataFrame contendo os dados.
+
+    Returns:
+        Tabela HTML renderizada no padrão mini-table. Se pandas ausente, retorna mensagem.
+    """
+    if pd is None:
+        return '<div class="cell-empty">Tabela indisponível (pandas ausente)</div>'
+    if df is None or len(df) == 0:
+        return '<div class="cell-empty">Sem movimentações</div>'
+
+    _df = df.copy()
+    cols = list(_df.columns)
+
+    thead = "<thead><tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr></thead>"
+
+    rows_html = []
+    for _, r in _df.iterrows():
+        tds = []
+        for c in cols:
+            val = r.get(c, "")
+            if str(c).strip().lower() == "valor":
+                tds.append(f"<td class='val'>{_fmt_val(val)}</td>")
+            else:
+                tds.append(f"<td>{'' if val is None else str(val)}</td>")
+        rows_html.append("<tr>" + "".join(tds) + "</tr>")
+    tbody = "<tbody>" + "".join(rows_html) + "</tbody>"
+
+    return f"<table class='mini-table'>{thead}{tbody}</table>"
+
+
+# ===================== Cards =====================
+def render_card_row(title: str, items: list[tuple[str, object, bool]]) -> None:
+    """Renderiza um cartão com título e N colunas.
+
+    Args:
+        title: Título do cartão.
+        items: Lista de tuplas (label, valor, number_always).
+            - Se valor for list[str], mostra lista em verde.
+            - Se for pandas.DataFrame, renderiza uma tabela HTML.
+            - Se float/None: number_always=True força exibir 0,00;
+              senão mostra "Sem movimentações".
+            - Outros tipos: str via st.markdown.
     """
     st.markdown(_CARD_TABLE_CSS, unsafe_allow_html=True)
-    items = list(items or [])  # robustez contra None/iteráveis não-lista
+    items = list(items or [])
     cells_html = []
 
+    is_df = (lambda v: (pd is not None and isinstance(v, pd.DataFrame)))
+
     for label, value, number_always in items:
-        if isinstance(value, (list, tuple)):
+        if is_df(value):
+            vhtml = _df_to_html_table(value)
+        elif isinstance(value, (list, tuple)):
             if len(value) == 0:
                 vhtml = '<div class="cell-empty">Sem movimentações</div>'
             else:
@@ -96,10 +177,9 @@ def render_card_row(title: str, items: list[tuple[str, float | list[str] | None,
                 vhtml = f'<div class="cell-list">{linhas}</div>'
         else:
             num = _coerce_number(value)
-            is_zero = (num == 0.0)
             vhtml = (
                 f'<div class="cell-value">{_fmt_val(num)}</div>'
-                if (number_always or not is_zero)
+                if (number_always or num != 0.0)
                 else '<div class="cell-empty">Sem movimentações</div>'
             )
 
@@ -113,8 +193,14 @@ def render_card_row(title: str, items: list[tuple[str, float | list[str] | None,
     """
     st.markdown(html, unsafe_allow_html=True)
 
-def render_card_mercadorias(compras: list | None, recebimentos: list | None):
-    """Cartão de Mercadorias com mini-tabelas (compras e recebimentos do dia)."""
+
+def render_card_mercadorias(compras: list | None, recebimentos: list | None) -> None:
+    """Renderiza cartão de Mercadorias (compras e recebimentos do dia).
+
+    Args:
+        compras: Lista de tuplas (coleção, fornecedor, valor).
+        recebimentos: Lista de tuplas (coleção, fornecedor, valor).
+    """
     st.markdown(_CARD_TABLE_CSS, unsafe_allow_html=True)
 
     def _table(rows):
@@ -147,3 +233,63 @@ def render_card_mercadorias(compras: list | None, recebimentos: list | None):
       </div>
     """
     st.markdown(html, unsafe_allow_html=True)
+
+
+# ===================== Transferências =====================
+def get_transferencias_bancos_lista(caminho_banco: str, data_lanc_str: str) -> list[str]:
+    """Retorna linhas prontas para o card "Transferência entre bancos".
+
+    Args:
+        caminho_banco: Caminho para o SQLite.
+        data_lanc_str: Data de referência (YYYY-MM-DD).
+
+    Returns:
+        Lista no formato ["R$ 5,00 • Bradesco → Inter", ...].
+    """
+    try:
+        itens = listar_transferencias_bancos_do_dia(caminho_banco, data_lanc_str)
+    except Exception:
+        return []
+
+    linhas: list[str] = []
+    for it in itens:
+        valor = _fmt_val(it.get("valor", 0.0))
+        origem = str(it.get("origem") or "").strip()
+        destino = str(it.get("destino") or "").strip()
+        linhas.append(f"{valor} • {origem} → {destino}")
+    return linhas
+
+
+def render_transferencias_bancos(transf_bancos_list: list[tuple[str, str, float]]) -> None:
+    """Renderiza resumo de transferências entre bancos.
+
+    Mostra total do dia, quantidade de movimentações e tabela detalhada.
+
+    Args:
+        transf_bancos_list: Lista de tuplas (origem, destino, valor).
+    """
+    from utils.utils import formatar_moeda
+
+    if not transf_bancos_list:
+        st.caption("Sem movimentações.")
+        return
+
+    df = pd.DataFrame(transf_bancos_list, columns=["origem", "destino", "valor"])
+    df["origem"] = df["origem"].replace("", "—")
+    df["destino"] = df["destino"].replace("", "—")
+
+    total = float(df["valor"].fillna(0).sum())
+    qnt = int(len(df))
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.metric("Total transferido (dia)", formatar_moeda(total))
+    with c2:
+        st.metric("Movimentações", qnt)
+
+    df_view = (
+        df[["valor", "origem", "destino"]]
+        .rename(columns={"valor": "Valor", "origem": "Origem", "destino": "Destino"})
+    )
+    df_view["Valor"] = df_view["Valor"].map(lambda v: formatar_moeda(float(v or 0)))
+    st.dataframe(df_view, use_container_width=True, hide_index=True)
