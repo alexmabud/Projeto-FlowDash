@@ -25,6 +25,7 @@ from shared.db import get_conn
 from utils.utils import formatar_valor
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 from flowdash_pages.lancamentos.shared_ui import canonicalizar_banco, upsert_saldos_bancos
+from flowdash_pages.lancamentos.caixa2.actions_caixa2 import _ensure_snapshot_herdado
 
 
 class ResultadoDeposito(TypedDict):
@@ -240,13 +241,16 @@ def registrar_deposito(
     valor_f = _r2(valor)
 
     with get_conn(caminho_banco) as conn:
+        # >>> garante snapshot herdado antes de validar o saldo
+        _ensure_snapshot_herdado(conn, data_str)
+
         cur = conn.cursor()
 
         # Bases de saldos
         df_caixas = _read_saldos_caixas(conn)
         snap_id, base_caixa, base_caixa2, base_vendas, base_caixa2dia = _bases_para_data(df_caixas, data_str)
 
-        # Validação de saldo
+        # Validação de saldo (Caixa 2 do dia + saldo acumulado)
         base_total_cx2 = _r2(base_caixa2 + base_caixa2dia)
         if valor_f > base_total_cx2:
             raise ValueError(
@@ -302,7 +306,8 @@ def registrar_deposito(
                 trans_uid=trans_uid,
             )
         except Exception:
-            pass  # não bloqueia o fluxo principal
+            # Qualquer falha nessa tabela opcional não bloqueia o fluxo principal
+            pass
 
         conn.commit()
 
