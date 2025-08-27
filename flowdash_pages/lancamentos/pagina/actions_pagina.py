@@ -1,14 +1,28 @@
 # ===================== Actions: Página de Lançamentos =====================
 """
-Consulta o SQLite e calcula os dados do resumo do dia.
+Resumo
+------
+Consulta o SQLite e calcula os dados do resumo do dia (vendas, saídas, saldos,
+transferências e mercadorias).
 
-Notas:
-    - Deduplicação por transações em alguns blocos usa COALESCE(trans_uid, CAST(id AS TEXT)).
-    - Para transferências banco→banco, o pareamento SAÍDA/ENTRADA é feito por:
-        1) referência cruzada via referencia_id (usa MIN(id, referencia_id) como chave)
-        2) fallback TX= existente na observação (lançamentos antigos)
-        3) fallback trans_uid (se existir na tabela)
-        4) fallback final: id (não pareia, mas não quebra)
+Decisões/Convenções
+-------------------
+- `saldos_caixas`: os cartões de saldos exibem **apenas o último snapshot** com
+  `DATE(data) <= data selecionada` (não somamos múltiplas linhas).
+- Deduplicação de linhas do dia em `movimentacoes_bancarias` usa a chave
+  `COALESCE(trans_uid, CAST(id AS TEXT))`.
+- Pareamento de transferência banco→banco:
+    1) `MIN(id, referencia_id)` quando `referencia_id` existir (novo fluxo);
+    2) fallback token `TX=` na observação (retrocompatibilidade);
+    3) fallback `trans_uid`;
+    4) fallback final: `id` (não pareia, mas não quebra).
+
+Retorno
+-------
+Dict com:
+    total_vendas, total_saidas, caixa_total, caixa2_total,
+    transf_caixa2_total, depositos_list, transf_bancos_list,
+    compras_list, receb_list, saldos_bancos
 """
 
 from __future__ import annotations
@@ -22,21 +36,22 @@ from shared.db import get_conn
 
 # ===================== API =====================
 def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
-    """Carrega totais e listas do dia selecionado.
+    """
+    Carrega totais e listas do dia selecionado.
 
     Agrega:
-        - total_vendas: soma de `entrada.Valor` (DATE(Data) = DATE(data_lanc))
-        - total_saidas: soma de `saida.valor` (DATE(data) = DATE(data_lanc))
-        - caixa_total/caixa2_total: soma acumulada até a data (tabela `saldos_caixas`)
-        - saldos_bancos: soma acumulada por banco até a data (tabela `saldos_bancos`)
-        - listas do dia: depósitos, transferências, mercadorias (compras/recebimentos)
+      - total_vendas: soma de `entrada.Valor` (DATE(Data) = DATE(data_lanc))
+      - total_saidas: soma de `saida.valor` (DATE(data) = DATE(data_lanc))
+      - caixa_total/caixa2_total: **último snapshot** <= data (tabela `saldos_caixas`)
+      - saldos_bancos: soma acumulada por banco <= data (tabela `saldos_bancos`)
+      - listas do dia: depósitos, transferências, mercadorias (compras/recebimentos)
 
     Args:
         caminho_banco: Caminho do arquivo SQLite.
         data_lanc: Data do lançamento (date/datetime/str compatível com DATE()).
 
     Returns:
-        Dicionário com métricas e listas para o resumo do dia.
+        Dict[str, Any]: métricas e listas para o resumo do dia.
     """
     total_vendas, total_saidas = 0.0, 0.0
     caixa_total = 0.0
@@ -48,10 +63,17 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
     receb_list: List[Tuple[str, str, float]] = []
     saldos_bancos: Dict[str, float] = {}
 
+    # Normaliza a data para string (SQL) e date (filtro local)
+    data_str = str(data_lanc)
+    try:
+        data_ref_date = pd.to_datetime(data_str, errors="coerce").date()
+    except Exception:
+        data_ref_date = None
+
     with get_conn(caminho_banco) as conn:
         cur = conn.cursor()
 
-        # ===== VENDAS do dia (Data da VENDA) =====
+        # ===== VENDAS do dia =====
         total_vendas = float(
             cur.execute(
                 """
@@ -59,9 +81,8 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
                   FROM entrada
                  WHERE DATE(Data) = DATE(?)
                 """,
-                (str(data_lanc),),
-            ).fetchone()[0]
-            or 0.0
+                (data_str,),
+            ).fetchone()[0] or 0.0
         )
 
         # ===== SAÍDAS do dia =====
@@ -72,32 +93,30 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
                   FROM saida
                  WHERE DATE(data) = DATE(?)
                 """,
-                (str(data_lanc),),
-            ).fetchone()[0]
-            or 0.0
+                (data_str,),
+            ).fetchone()[0] or 0.0
         )
 
-        # ===== Caixas: somatório acumulado <= data =====
+        # ===== Caixas: último snapshot <= data (sem somar linhas) =====
         try:
-            df_cx = pd.read_sql(
-                "SELECT data, caixa_total, caixa2_total FROM saldos_caixas", conn
-            )
+            row = cur.execute(
+                """
+                SELECT 
+                    COALESCE(caixa_total, 0.0)  AS cx_total,
+                    COALESCE(caixa2_total, 0.0) AS cx2_total
+                FROM saldos_caixas
+                WHERE DATE(data) <= DATE(?)
+                ORDER BY DATE(data) DESC, id DESC
+                LIMIT 1
+                """,
+                (data_str,),
+            ).fetchone()
+            if row:
+                caixa_total = float(row[0] or 0.0)
+                caixa2_total = float(row[1] or 0.0)
         except Exception:
-            df_cx = pd.DataFrame()
-
-        if not df_cx.empty:
-            df_cx["data"] = pd.to_datetime(df_cx["data"], errors="coerce")
-            df_cx = df_cx[df_cx["data"].dt.date <= data_lanc]
-            if "caixa_total" in df_cx.columns:
-                caixa_total = float(
-                    pd.to_numeric(df_cx["caixa_total"], errors="coerce").fillna(0.0).sum()
-                )
-            if "caixa2_total" in df_cx.columns:
-                caixa2_total = float(
-                    pd.to_numeric(df_cx["caixa2_total"], errors="coerce")
-                    .fillna(0.0)
-                    .sum()
-                )
+            # mantém zero se tabela não existe/consulta falhar
+            pass
 
         # ===== Transferência p/ Caixa 2 (dia) — dedupe por trans_uid/id =====
         transf_caixa2_total = float(
@@ -113,9 +132,8 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
                          GROUP BY COALESCE(trans_uid, CAST(id AS TEXT))
                        ) d ON d.id = m.id
                 """,
-                (str(data_lanc),),
-            ).fetchone()[0]
-            or 0.0
+                (data_str,),
+            ).fetchone()[0] or 0.0
         )
 
         # ===== Depósitos do dia — dedupe por trans_uid/id =====
@@ -132,11 +150,11 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
                    ) d ON d.id = m.id
              ORDER BY m.id
             """,
-            (str(data_lanc),),
+            (data_str,),
         ).fetchall()
 
         # ===== Transferências banco→banco do dia (pareadas) =====
-        pares = listar_transferencias_bancos_do_dia(caminho_banco, data_lanc)
+        pares = listar_transferencias_bancos_do_dia(caminho_banco, data_str)
         transf_bancos_list = [
             (p["origem"], p["destino"], float(p["valor"] or 0.0)) for p in pares
         ]
@@ -146,7 +164,7 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
             df_compras = pd.read_sql(
                 "SELECT * FROM mercadorias WHERE DATE(Data)=DATE(?)",
                 conn,
-                params=(str(data_lanc),),
+                params=(data_str,),
             )
         except Exception:
             df_compras = pd.DataFrame()
@@ -175,7 +193,7 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
                    AND DATE(Recebimento) = DATE(?)
                 """,
                 conn,
-                params=(str(data_lanc),),
+                params=(data_str,),
             )
         except Exception:
             df_receb = pd.DataFrame()
@@ -209,10 +227,9 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
         if not df_bk.empty:
             date_col_name = next((c for c in df_bk.columns if c.lower() == "data"), None)
             if date_col_name:
-                df_bk[date_col_name] = pd.to_datetime(
-                    df_bk[date_col_name], errors="coerce"
-                )
-                df_bk = df_bk[df_bk[date_col_name].dt.date <= data_lanc]
+                df_bk[date_col_name] = pd.to_datetime(df_bk[date_col_name], errors="coerce")
+                if data_ref_date is not None:
+                    df_bk = df_bk[df_bk[date_col_name].dt.date <= data_ref_date]
 
             for c in df_bk.columns:
                 if c.lower() == "data":
@@ -239,20 +256,14 @@ def carregar_resumo_dia(caminho_banco: str, data_lanc) -> Dict[str, Any]:
 
 
 def listar_transferencias_bancos_do_dia(caminho_banco: str, data_ref) -> List[Dict[str, Any]]:
-    """Lista pares de transferências banco→banco do dia.
+    """
+    Lista pares de transferências banco→banco do dia.
 
-    Pareamento pela chave `tx`:
-        - MIN(id, referencia_id) quando referencia_id estiver preenchido (novo)
-        - senão, token `TX=` da observação (retrocompatibilidade)
-        - senão, `trans_uid` (se existir)
-        - senão, `id` (não pareia, mas não quebra)
-
-    Args:
-        caminho_banco: Caminho para o SQLite.
-        data_ref: Data de referência (date/datetime/str).
-
-    Returns:
-        Lista de dicts: {"origem": str, "destino": str, "valor": float}.
+    Chave de pareamento (tx):
+      1) MIN(id, referencia_id) quando `referencia_id` estiver preenchido (novo fluxo)
+      2) token `TX=` na observação (retrocompatibilidade)
+      3) `trans_uid` (quando existir)
+      4) fallback final: `id`
     """
     from utils.utils import coerce_data
 

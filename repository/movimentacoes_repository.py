@@ -1,38 +1,3 @@
-"""
-Módulo Movimentações (Repositório)
-==================================
-
-Este módulo define a classe `MovimentacoesRepository`, responsável por gerenciar
-a tabela **`movimentacoes_bancarias`** no SQLite. Centraliza criação de schema,
-registro idempotente de entradas/saídas e consultas utilitárias.
-
-Funcionalidades principais
---------------------------
-- Criação automática do schema e índices (idempotente).
-- Registro de **entradas** e **saídas** com metadados (origem, observação).
-- Suporte a **idempotência** via `trans_uid` (explícito ou determinístico).
-- Verificação de existência/duplicidade por `trans_uid`.
-
-Detalhes técnicos
------------------
-- Conexão SQLite com:
-  - `PRAGMA journal_mode=WAL;`
-  - `PRAGMA busy_timeout=30000;`
-  - `PRAGMA foreign_keys=ON;`
-  - `PRAGMA synchronous=NORMAL;`
-  - `detect_types = PARSE_DECLTYPES | PARSE_COLNAMES` (DATE/DATETIME)
-  - `row_factory = sqlite3.Row` (acesso por nome de coluna)
-- Índices por data e banco.
-- `trans_uid` com restrição UNIQUE para evitar duplicações.
-
-Dependências
-------------
-- sqlite3
-- hashlib
-- typing (Optional, Dict, Any)
-- utils.utils.resolve_db_path
-"""
-
 from __future__ import annotations
 
 import sqlite3
@@ -52,7 +17,7 @@ class MovimentacoesRepository:
     def __init__(self, db_path_like: Any):
         # Aceita string/Path/objeto com atributo de caminho
         self.db_path: str = resolve_db_path(db_path_like)
-        self.garantir_schema()  # garante tabela/índices na inicialização
+        self.garantir_schema()  # garante tabela/índices/colunas na inicialização
 
     def _get_conn(self) -> sqlite3.Connection:
         """
@@ -72,12 +37,18 @@ class MovimentacoesRepository:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _colunas_existentes(self, conn: sqlite3.Connection) -> set:
+        rows = conn.execute("PRAGMA table_info(movimentacoes_bancarias);").fetchall()
+        return {str(r["name"]) if isinstance(r, sqlite3.Row) else str(r[1]) for r in rows}
+
     def garantir_schema(self) -> None:
         """
         Cria a tabela `movimentacoes_bancarias` e índices, se não existirem.
-        Idempotente: pode ser chamado várias vezes sem efeitos colaterais.
+        Também garante colunas opcionais novas (usuario, data_hora).
+        Idempotente.
         """
         with self._get_conn() as conn:
+            # Tabela base
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS movimentacoes_bancarias (
@@ -96,6 +67,14 @@ class MovimentacoesRepository:
                 CREATE INDEX IF NOT EXISTS idx_mov_banco ON movimentacoes_bancarias(banco);
                 """
             )
+
+            # Migração leve: garantir colunas novas
+            existentes = self._colunas_existentes(conn)
+            if "usuario" not in existentes:
+                conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "usuario" TEXT;')
+            if "data_hora" not in existentes:
+                conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "data_hora" TEXT;')
+
             conn.commit()
 
     # ---------- existentes ----------
@@ -130,22 +109,30 @@ class MovimentacoesRepository:
         referencia_tabela: Optional[str],
         referencia_id: Optional[int],
         trans_uid: Optional[str],
+        *,
+        usuario: Optional[str] = None,
+        data_hora: Optional[str] = None,
     ) -> int:
         """
         Insere uma linha bruta em `movimentacoes_bancarias`.
         Mantém retrocompatibilidade com chamadas antigas.
-
-        Retorno:
-            int: `id` da linha inserida.
         """
         with self._get_conn() as conn:
+            # Garantir que as colunas novas existem (execuções antigas em runtime)
+            existentes = self._colunas_existentes(conn)
+            if "usuario" not in existentes:
+                conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "usuario" TEXT;')
+            if "data_hora" not in existentes:
+                conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "data_hora" TEXT;')
+
             cur = conn.cursor()
             cur.execute(
                 """
                 INSERT INTO movimentacoes_bancarias
                     (data, banco, tipo, valor, origem, observacao,
-                     referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     referencia_tabela, referencia_id, trans_uid,
+                     usuario, data_hora)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data,
@@ -157,6 +144,8 @@ class MovimentacoesRepository:
                     referencia_tabela,
                     referencia_id,
                     trans_uid,
+                    usuario,
+                    data_hora,
                 ),
             )
             conn.commit()
@@ -168,6 +157,8 @@ class MovimentacoesRepository:
         """
         Gera um UID determinístico a partir dos campos essenciais.
         Usado quando o caller não fornece `trans_uid` explicitamente.
+
+        (Não inclui usuario/data_hora no hash para não quebrar idempotência.)
         """
         base = (
             str(payload.get("data", "")),
@@ -193,6 +184,8 @@ class MovimentacoesRepository:
         referencia_tabela: Optional[str] = None,
         referencia_id: Optional[int] = None,
         trans_uid: Optional[str] = None,
+        usuario: Optional[str] = None,
+        data_hora: Optional[str] = None,
     ) -> int:
         """
         Insere uma movimentação com **idempotência**.
@@ -202,9 +195,6 @@ class MovimentacoesRepository:
               a partir do payload (hash SHA-256).
             - Se já houver uma linha com o mesmo `trans_uid`, não duplica e
               retorna o `id` existente (ou `-1` se não localizar, por segurança).
-
-        Retorno:
-            int: `id` da movimentação (nova ou existente).
         """
         if not valor or float(valor) == 0.0:
             raise ValueError("Valor não pode ser zero.")
@@ -241,6 +231,8 @@ class MovimentacoesRepository:
             referencia_tabela=referencia_tabela,
             referencia_id=referencia_id,
             trans_uid=uid,
+            usuario=usuario,
+            data_hora=data_hora,
         )
 
     def registrar_entrada(
@@ -254,12 +246,11 @@ class MovimentacoesRepository:
         referencia_tabela: Optional[str] = None,
         referencia_id: Optional[int] = None,
         trans_uid: Optional[str] = None,
+        usuario: Optional[str] = None,
+        data_hora: Optional[str] = None,
     ) -> int:
         """
         Atalho semântico para registrar **entrada** (valor > 0).
-
-        Retorno:
-            int: `id` da movimentação (nova ou existente).
         """
         if valor <= 0:
             raise ValueError("Entrada deve ter valor > 0.")
@@ -273,6 +264,8 @@ class MovimentacoesRepository:
             referencia_tabela=referencia_tabela,
             referencia_id=referencia_id,
             trans_uid=trans_uid,
+            usuario=usuario,
+            data_hora=data_hora,
         )
 
     def registrar_saida(
@@ -286,12 +279,11 @@ class MovimentacoesRepository:
         referencia_tabela: Optional[str] = None,
         referencia_id: Optional[int] = None,
         trans_uid: Optional[str] = None,
+        usuario: Optional[str] = None,
+        data_hora: Optional[str] = None,
     ) -> int:
         """
         Atalho semântico para registrar **saída** (valor > 0).
-
-        Retorno:
-            int: `id` da movimentação (nova ou existente).
         """
         if valor <= 0:
             raise ValueError("Saída deve ter valor > 0.")
@@ -305,8 +297,9 @@ class MovimentacoesRepository:
             referencia_tabela=referencia_tabela,
             referencia_id=referencia_id,
             trans_uid=trans_uid,
+            usuario=usuario,
+            data_hora=data_hora,
         )
 
 
-# (Opcional) API pública explícita
 __all__ = ["MovimentacoesRepository"]

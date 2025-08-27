@@ -1,19 +1,134 @@
-import streamlit as st
-import pandas as pd
+import re
 import sqlite3
 from datetime import date, datetime
+from typing import Optional
+
+import pandas as pd
+import streamlit as st
 
 from flowdash_pages.cadastros.cadastro_classes import EmprestimoRepository
-from utils.utils import formatar_valor, limpar_valor_formatado
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
 from repository.movimentacoes_repository import MovimentacoesRepository
-from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository  # ⬅️ NOVO
-from shared.db import get_conn  # ⬅️ NOVO
+from shared.db import get_conn
+from utils.utils import formatar_valor, limpar_valor_formatado
 
 TIPOS_EMPRESTIMO = ["Empréstimo", "Financiamento", "Crédito Pessoal", "Outro"]
 STATUS_OPCOES = ["Em aberto", "Quitado", "Renegociado"]
 
 
+# ===================== helpers de usuário e observação =====================
+def _derive_nome_from_email(login: str) -> str:
+    base = (login or "").strip()
+    if not base:
+        return ""
+    base = base.split("@", 1)[0]
+    base = base.replace(".", " ").replace("_", " ").replace("-", " ")
+    return base.strip().title()
+
+
+def _walk_extract_names(obj) -> str:
+    """Percorre dicts/listas e tenta achar campos de nome ou e-mails."""
+    try:
+        if isinstance(obj, dict):
+            for key in ("nome", "name", "display_name", "full_name"):
+                v = obj.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+            for key in ("email", "user_email", "usuario_email", "username", "login"):
+                v = obj.get(key)
+                if isinstance(v, str) and v.strip():
+                    nm = _derive_nome_from_email(v)
+                    if nm:
+                        return nm
+            for v in obj.values():
+                nm = _walk_extract_names(v)
+                if nm:
+                    return nm
+        elif isinstance(obj, (list, tuple, set)):
+            for v in obj:
+                nm = _walk_extract_names(v)
+                if nm:
+                    return nm
+        elif isinstance(obj, str):
+            if re.search(r".+@.+\..+", obj):
+                nm = _derive_nome_from_email(obj)
+                if nm:
+                    return nm
+        return ""
+    except Exception:
+        return ""
+
+
+def _resolver_usuario_logado() -> str:
+    """Obtém nome do usuário (auth → session_state → email/login → input)."""
+    # 1) Tenta módulo auth, se existir
+    try:
+        from auth import auth as _auth
+        for fn_name in ("get_usuario_logado", "usuario_logado", "get_current_user"):
+            fn = getattr(_auth, fn_name, None)
+            if callable(fn):
+                val = fn()
+                nm = _walk_extract_names(val) if not isinstance(val, str) else (val.strip() or "")
+                if nm:
+                    return nm
+        for attr in ("usuario_atual", "current_user", "usuario"):
+            val = getattr(_auth, attr, None)
+            nm = _walk_extract_names(val) if not isinstance(val, str) else (val.strip() or "")
+            if nm:
+                return nm
+    except Exception:
+        pass
+
+    # 2) Chaves diretas no session_state
+    for k in [
+        "nome_usuario", "usuario_nome", "user_nome", "user_name",
+        "nome", "nomeCompleto", "usuario_atual_nome", "current_user_name",
+        "display_name", "full_name",
+    ]:
+        v = st.session_state.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    # 3) Estruturas aninhadas / varredura completa
+    for k in ["usuario", "user", "current_user", "auth_user", "logged_user", "auth"]:
+        nm = _walk_extract_names(st.session_state.get(k))
+        if nm:
+            return nm
+    for k in list(st.session_state.keys()):
+        nm = _walk_extract_names(st.session_state.get(k))
+        if nm:
+            return nm
+
+    # 4) Fallback por email/login
+    for k in ("usuario_email", "user_email", "email", "login", "username"):
+        v = st.session_state.get(k)
+        if isinstance(v, str) and v.strip():
+            nm = _derive_nome_from_email(v)
+            if nm:
+                return nm
+
+    # 5) Confirmação na UI
+    usuario_atual = st.text_input(
+        "Usuário logado",
+        value=st.session_state.get("usuario_confirmado", ""),
+        placeholder="Digite seu nome para registrar nos lançamentos",
+        help="Não consegui capturar seu nome automaticamente. Confirme aqui para gravar corretamente."
+    ).strip()
+    if usuario_atual:
+        st.session_state["usuario_confirmado"] = usuario_atual
+    return usuario_atual
+
+
+def _obs_deposito_padrao(valor: float, extra: str = "") -> str:
+    """Observação padronizada para depósito de empréstimo."""
+    obs = f"Cadastro REGISTRO MANUAL DE DEPÓSITO DE EMPRÉSTIMO | Valor {formatar_valor(valor)}"
+    return f"{obs} | {extra}" if extra else obs
+# ========================================================================
+
+
+# =============================== I/O banco ===============================
 def carregar_bancos_cadastrados(caminho_banco: str) -> pd.DataFrame:
+    """Lê tabela bancos_cadastrados (id, nome)."""
     with sqlite3.connect(caminho_banco) as conn:
         return pd.read_sql("SELECT id, nome FROM bancos_cadastrados ORDER BY nome", conn)
 
@@ -24,28 +139,38 @@ def inserir_movimentacao_bancaria(
     banco_nome: str,
     valor: float,
     emprestimo_id: int,
-    observacao: str = ""
+    observacao: str = "",
+    *,
+    usuario: Optional[str] = None,
+    data_hora: Optional[str] = None,
 ):
+    """Registra ENTRADA em movimentacoes_bancarias (origem='emprestimo')."""
     try:
         if not banco_nome or valor is None or float(valor) <= 0:
             return None
+
+        observacao_final = _obs_deposito_padrao(valor, extra=observacao or "")
         mov_repo = MovimentacoesRepository(caminho_banco)
         mov_id = mov_repo.registrar_entrada(
             data=str(data_),
             banco=str(banco_nome).strip(),
             valor=float(valor),
             origem="emprestimo",
-            observacao=observacao or "Crédito de empréstimo",
+            observacao=observacao_final,
             referencia_tabela="emprestimos",
-            referencia_id=int(emprestimo_id) if emprestimo_id else None
+            referencia_id=int(emprestimo_id) if emprestimo_id else None,
+            usuario=usuario,
+            data_hora=data_hora,
         )
         return mov_id
     except Exception as e:
         st.warning(f"Não foi possível registrar a movimentação bancária do empréstimo: {e}")
         return None
+# ========================================================================
 
 
 def pagina_emprestimos_financiamentos(caminho_banco: str):
+    """Página de Cadastro e Gestão de Empréstimos / Financiamentos."""
     st.subheader("🏦 Cadastro de Empréstimos e Financiamentos")
     repo = EmprestimoRepository(caminho_banco)
 
@@ -53,6 +178,7 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
         st.success("✅ Empréstimo salvo com sucesso!")
         del st.session_state["sucesso_emprestimo"]
 
+    # ----------------------- Cadastrar novo empréstimo -----------------------
     with st.expander("➕ Cadastrar Novo Empréstimo / Financiamento", expanded=True):
         with st.form("form_emprestimo"):
             # Linha 1 - Datas
@@ -95,9 +221,13 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
             with col14:
                 origem = st.text_input("Origem dos Recursos", key="input_origem")
 
-            usuario = st.session_state.get("usuario_logado", {}).get("nome", "Sistema")
+            # 🔐 usuário do cadastro (agora usando o mesmo resolver)
+            usuario_cadastro = _resolver_usuario_logado()
+            if not usuario_cadastro:
+                st.warning("⚠️ Confirme o campo **Usuário logado** acima para salvar o empréstimo.")
+            data_lancamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            submit = st.form_submit_button("📋 Salvar Empréstimo")
+            submit = st.form_submit_button("📋 Salvar Empréstimo", disabled=(not usuario_cadastro))
 
             if submit:
                 try:
@@ -106,12 +236,11 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
 
                     valor_pago = valor_parcela * parcelas_pagas
                     valor_em_aberto = valor_total - valor_pago
-                    data_lancamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     dados = (
                         str(data_contratacao), valor_total, tipo, banco, int(parcelas_total),
                         int(parcelas_pagas), valor_parcela, taxa_juros_am, int(vencimento_dia),
-                        status, usuario, str(data_quitacao) if data_quitacao else None, origem,
+                        status, usuario_cadastro, str(data_quitacao) if data_quitacao else None, origem,
                         valor_pago, valor_em_aberto, None, descricao,
                         str(data_inicio_pagamento), data_lancamento
                     )
@@ -134,7 +263,7 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                                 resultado = cap_repo.gerar_parcelas_emprestimo(
                                     conn,
                                     emprestimo_id=novo_id,
-                                    usuario=usuario
+                                    usuario=usuario_cadastro
                                 )
                                 st.success(
                                     f"🧾 Parcelas programadas no Contas a Pagar: {resultado.get('criadas', 0)} "
@@ -143,7 +272,7 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                             except Exception as e:
                                 st.error(f"Falha ao programar parcelas no Contas a Pagar: {e}")
 
-                    # 3) Limpa inputs
+                    # 3) Limpa inputs do form
                     for chave in list(st.session_state.keys()):
                         if chave.startswith("input_"):
                             del st.session_state[chave]
@@ -151,7 +280,7 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                 except Exception as e:
                     st.error(f"Erro ao salvar: {e}")
 
-    # LISTAGEM + AÇÕES
+    # ---------------------------- Listagem + ações ----------------------------
     st.markdown("### 📋 Empréstimos Registrados")
     try:
         df = repo.listar_emprestimos()
@@ -160,7 +289,8 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
             df["Situação"] = df.apply(
                 lambda row: "Novo" if row["parcelas_pagas"] == 0 else (
                     "Quitado" if row["parcelas_pagas"] >= row["parcelas_total"] else "Em andamento"
-                ), axis=1
+                ),
+                axis=1
             )
             df["valor_total"] = df["valor_total"].apply(formatar_valor)
             df["valor_parcela"] = df["valor_parcela"].apply(lambda x: formatar_valor(x) if pd.notnull(x) else "")
@@ -221,13 +351,19 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                                 key=f"dep_valor_{id_selecionado}"
                             )
 
-                        observacao = st.text_input(
+                        observacao_extra = st.text_input(
                             "Observação (opcional)",
                             value=f"Depósito do empréstimo ID {id_selecionado}",
                             key=f"dep_obs_{id_selecionado}"
                         )
 
-                        if st.button("💾 Salvar saldo bancário", key=f"btn_dep_{id_selecionado}"):
+                        # 🔐 usuário + timestamp (mesma regra do cadastro)
+                        usuario_dep = _resolver_usuario_logado()
+                        if not usuario_dep:
+                            st.warning("⚠️ Confirme o campo **Usuário logado** acima para continuar.")
+                        agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                        if st.button("💾 Salvar saldo bancário", key=f"btn_dep_{id_selecionado}", disabled=(not usuario_dep)):
                             if valor_deposito <= 0:
                                 st.warning("Informe um valor válido.")
                             else:
@@ -238,7 +374,9 @@ def pagina_emprestimos_financiamentos(caminho_banco: str):
                                         banco_nome=banco_nome,
                                         valor=valor_deposito,
                                         emprestimo_id=id_selecionado,
-                                        observacao=observacao
+                                        observacao=observacao_extra,
+                                        usuario=usuario_dep,
+                                        data_hora=agora_str,
                                     )
                                     st.success("✅ Depósito registrado em `movimentacoes_bancarias`!")
                                 except Exception as e:
