@@ -1,14 +1,45 @@
+"""
+Página: Cadastro de Caixa
+=========================
+
+Responsável por cadastrar/atualizar os saldos de **Caixa** e **Caixa 2** na data
+selecionada, bem como registrar os lançamentos correspondentes em
+`movimentacoes_bancarias` via repositório, com observação padronizada e inclusão
+de metadados de usuário e timestamp.
+
+Principais comportamentos
+-------------------------
+- Mostra saldos já cadastrados na data e permite somar novos valores.
+- Persiste o snapshot do dia em `saldos_caixas` (via `CaixaRepository`).
+- Registra entradas em `movimentacoes_bancarias` com:
+  - observação: "Cadastro REGISTRO MANUAL DE CAIXA | Valor R$ X"
+  - `usuario` = nome do usuário logado (resolvido automaticamente; se não for possível, pede confirmação na UI)
+  - `data_hora` = timestamp atual (YYYY-MM-DD HH:MM:SS)
+- Exibe uma lista dos últimos registros (saldos) formatados.
+"""
+
+import re
 import streamlit as st
-from datetime import date
+from datetime import date, datetime
 import pandas as pd
 
 from utils.utils import formatar_valor
 from .cadastro_classes import CaixaRepository
-from repository.movimentacoes_repository import MovimentacoesRepository 
+from repository.movimentacoes_repository import MovimentacoesRepository
 
 
-# === Página de Cadastro de Caixa =======================================================================
-def pagina_caixa(caminho_banco: str):
+def pagina_caixa(caminho_banco: str) -> None:
+    """Renderiza a página de **Cadastro de Caixa**.
+
+    Esta função permite selecionar uma data de referência, visualizar os saldos
+    existentes de Caixa e Caixa 2, somar novos valores e salvar o resultado
+    (snapshot do dia) no banco. Além disso, registra automaticamente as entradas
+    na tabela `movimentacoes_bancarias` com observação padronizada e metadados
+    de usuário e timestamp.
+
+    Args:
+        caminho_banco (str): Caminho absoluto ou relativo para o arquivo SQLite.
+    """
     st.subheader("💰 Cadastro de Caixa")
     repo = CaixaRepository(caminho_banco)
     mov_repo = MovimentacoesRepository(caminho_banco)
@@ -49,17 +80,137 @@ def pagina_caixa(caminho_banco: str):
         valor_novo_caixa_2 = valor_final_caixa_2
         atualizar = False
 
+    # ------------------- resolver usuário e timestamp -------------------
+    def _derive_nome_from_email(login: str) -> str:
+        base = (login or "").strip()
+        if not base:
+            return ""
+        base = base.split("@", 1)[0]
+        base = base.replace(".", " ").replace("_", " ").replace("-", " ")
+        return base.strip().title()
+
+    def _walk_extract_names(obj) -> str:
+        """Percorre dicts/listas e tenta achar campos de nome ou e-mails."""
+        try:
+            if isinstance(obj, dict):
+                # prioridade: chaves de nome
+                for key in ("nome", "name", "display_name", "full_name"):
+                    v = obj.get(key)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+                # fallback: alguma chave com email
+                for key in ("email", "user_email", "usuario_email", "username", "login"):
+                    v = obj.get(key)
+                    if isinstance(v, str) and v.strip():
+                        nm = _derive_nome_from_email(v)
+                        if nm:
+                            return nm
+                # varre recursivamente
+                for v in obj.values():
+                    nm = _walk_extract_names(v)
+                    if nm:
+                        return nm
+            elif isinstance(obj, (list, tuple, set)):
+                for v in obj:
+                    nm = _walk_extract_names(v)
+                    if nm:
+                        return nm
+            elif isinstance(obj, str):
+                # string que pode ser email
+                if re.search(r".+@.+\..+", obj):
+                    nm = _derive_nome_from_email(obj)
+                    if nm:
+                        return nm
+            return ""
+        except Exception:
+            return ""
+
+    def _usuario_logado() -> str:
+        """Obtém o nome do usuário logado (session_state/auth) ou pede confirmação."""
+        # 1) Tentativa via módulo auth (se existir)
+        try:
+            from auth import auth as _auth  # Projeto FlowDash/auth/auth.py
+            for fn_name in ("get_usuario_logado", "usuario_logado", "get_current_user"):
+                fn = getattr(_auth, fn_name, None)
+                if callable(fn):
+                    val = fn()
+                    nm = _walk_extract_names(val) if not isinstance(val, str) else (val.strip() or "")
+                    if nm:
+                        return nm
+            for attr in ("usuario_atual", "current_user", "usuario"):
+                val = getattr(_auth, attr, None)
+                nm = _walk_extract_names(val) if not isinstance(val, str) else (val.strip() or "")
+                if nm:
+                    return nm
+        except Exception:
+            pass
+
+        # 2) Chaves diretas
+        for k in [
+            "nome_usuario", "usuario_nome", "user_nome", "user_name",
+            "nome", "nomeCompleto", "usuario_atual_nome", "current_user_name",
+            "display_name", "full_name",
+        ]:
+            v = st.session_state.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+        # 3) Objetos/dicts aninhados + varredura completa do session_state
+        for k in ["usuario", "user", "current_user", "auth_user", "logged_user", "auth"]:
+            nm = _walk_extract_names(st.session_state.get(k))
+            if nm:
+                return nm
+
+        # varredura em todas as chaves do session_state
+        for k in list(st.session_state.keys()):
+            nm = _walk_extract_names(st.session_state.get(k))
+            if nm:
+                return nm
+
+        # 4) Derivar de email/login em qualquer chave string
+        for k in ("usuario_email", "user_email", "email", "login", "username"):
+            v = st.session_state.get(k)
+            if isinstance(v, str) and v.strip():
+                nm = _derive_nome_from_email(v)
+                if nm:
+                    return nm
+
+        return ""  # retorna vazio para que a UI peça confirmação
+
+    usuario_atual = _usuario_logado()
+    # Se ainda não temos usuário, peça confirmação explícita na UI
+    if not usuario_atual:
+        usuario_atual = st.text_input(
+            "Usuário logado",
+            value=st.session_state.get("usuario_confirmado", ""),
+            placeholder="Digite seu nome para registrar nos lançamentos",
+            help="Não consegui capturar seu nome automaticamente. Confirme aqui para gravar corretamente."
+        ).strip()
+        if usuario_atual:
+            st.session_state["usuario_confirmado"] = usuario_atual
+
+    if not usuario_atual:
+        # Evita salvar como 'desconhecido'
+        st.warning("⚠️ Confirme o campo **Usuário logado** acima para continuar.")
+    agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # --------------------------------------------------------------------
+
     # Botão para salvar
-    if st.button("💾 Salvar Valores", use_container_width=True):
+    disabled_save = not bool(usuario_atual)  # bloqueia salvar sem usuário
+    if st.button("💾 Salvar Valores", use_container_width=True, disabled=disabled_save):
         try:
             # salva/atualiza e CAPTURA o id/rowid do registro em saldos_caixas
             saldo_id = repo.salvar_saldo(data_caixa_str, valor_final_caixa, valor_final_caixa_2, atualizar)
 
             # lançamentos em movimentacoes_bancarias via repositório (entrada), amarrando referência
             origem = "saldos_caixas"
-            observacao = "Registro manual de caixa"
             referencia_tabela = "saldos_caixas"
             referencia_id = saldo_id if saldo_id and saldo_id > 0 else None
+
+            # ===== observação padronizada =====
+            obs_caixa  = f"Cadastro REGISTRO MANUAL DE CAIXA | Valor {formatar_valor(valor_novo_caixa)}"
+            obs_caixa2 = f"Cadastro REGISTRO MANUAL DE CAIXA | Valor {formatar_valor(valor_novo_caixa_2)}"
+            # ==================================
 
             if valor_novo_caixa and valor_novo_caixa > 0:
                 mov_repo.registrar_entrada(
@@ -67,9 +218,11 @@ def pagina_caixa(caminho_banco: str):
                     banco="Caixa",
                     valor=float(valor_novo_caixa),
                     origem=origem,
-                    observacao=observacao,
+                    observacao=obs_caixa,
                     referencia_tabela=referencia_tabela,
-                    referencia_id=referencia_id
+                    referencia_id=referencia_id,
+                    usuario=usuario_atual,
+                    data_hora=agora_str,
                 )
 
             if valor_novo_caixa_2 and valor_novo_caixa_2 > 0:
@@ -78,9 +231,11 @@ def pagina_caixa(caminho_banco: str):
                     banco="Caixa 2",
                     valor=float(valor_novo_caixa_2),
                     origem=origem,
-                    observacao=observacao,
+                    observacao=obs_caixa2,
                     referencia_tabela=referencia_tabela,
-                    referencia_id=referencia_id
+                    referencia_id=referencia_id,
+                    usuario=usuario_atual,
+                    data_hora=agora_str,
                 )
 
             # Mensagens no formato solicitado
