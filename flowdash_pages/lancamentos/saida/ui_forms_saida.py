@@ -9,7 +9,7 @@ from __future__ import annotations
 import streamlit as st
 import pandas as pd
 from datetime import date
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
 ORIGENS_DINHEIRO = ["Caixa", "Caixa 2"]
@@ -21,25 +21,12 @@ def render_form_saida(
     nomes_cartoes: list[str],
     categorias_df,  # DataFrame com colunas (id, nome)
     listar_subcategorias_fn,  # fn(cat_id)->DataFrame
-    listar_destinos_fatura_em_aberto_fn,  # fn()->list[dict]
-    carregar_opcoes_pagamentos_fn,  # fn(tipo)->list[str]
+    listar_destinos_fatura_em_aberto_fn: Callable[[], list],  # fn()->list[dict]
+    carregar_opcoes_pagamentos_fn,  # legacy (mantido p/ compat)
+    # >>> NOVOS (opcionais): devem retornar list[dict] com pelo menos: {"label": str, "obrigacao_id": int, ...}
+    listar_boletos_em_aberto_fn: Optional[Callable[[], list]] = None,
+    listar_empfin_em_aberto_fn: Optional[Callable[[], list]] = None,
 ):
-    """
-    Desenha o formulário de Saída e retorna um dicionário com todos os dados necessários.
-
-    Args:
-        data_lanc: Data do lançamento.
-        invalidate_cb: callback para invalidar confirmação quando campos mudam.
-        nomes_bancos: lista de bancos para PIX/DÉBITO.
-        nomes_cartoes: lista de cartões para CRÉDITO.
-        categorias_df: DataFrame de categorias (id, nome).
-        listar_subcategorias_fn: função para obter subcategorias por categoria.
-        listar_destinos_fatura_em_aberto_fn: função que retorna faturas em aberto.
-        carregar_opcoes_pagamentos_fn: função que retorna opções para "Boletos" e "Empréstimos".
-
-    Returns:
-        dict com todos os campos preenchidos pelo usuário.
-    """
     st.markdown("#### 📤 Lançar Saída")
     st.caption(f"Data do lançamento: **{data_lanc}**")
 
@@ -81,12 +68,12 @@ def render_form_saida(
     # >>> BOLETO <<<
     parcela_boleto_escolhida: Optional[dict] = None
     multa_boleto = juros_boleto = desconto_boleto = 0.0
-    obrigacao_id_boleto: Optional[int] = None  # <-- novo campo opcional
+    obrigacao_id_boleto: Optional[int] = None
 
     # >>> EMPRÉSTIMO <<<
     parcela_emp_escolhida: Optional[dict] = None
     multa_emp = juros_emp = desconto_emp = 0.0
-    obrigacao_id_emp: Optional[int] = None  # <-- novo campo opcional
+    obrigacao_id_emp: Optional[int] = None
 
     if is_pagamentos:
         tipo_pagamento_sel = st.selectbox(
@@ -95,126 +82,134 @@ def render_form_saida(
             key="tipo_pagamento_pagamentos", on_change=invalidate_cb
         )
 
-        # ===== Fatura Cartão =====
+        # ---------- FATURA CARTÃO DE CRÉDITO ----------
         if tipo_pagamento_sel == "Fatura Cartão de Crédito":
-            faturas = listar_destinos_fatura_em_aberto_fn()  # [{label, cartao, competencia, obrigacao_id, saldo}, ...]
-            opcoes = [f["label"] for f in faturas]
-            escolha = st.selectbox("Fatura (cartão • mês • saldo)", opcoes, key="destino_fatura_comp", on_change=invalidate_cb)
-            if escolha:
-                f_sel = next(f for f in faturas if f["label"] == escolha)
-                destino_pagamento_sel = f_sel["cartao"]
-                competencia_fatura_sel = f_sel["competencia"]
-                obrigacao_id_fatura = int(f_sel["obrigacao_id"])
-                st.caption(f"Selecionado: {destino_pagamento_sel} — {competencia_fatura_sel} • obrigação #{obrigacao_id_fatura}")
-
-                st.number_input(
-                    "Valor do pagamento (pode ser parcial)",
-                    value=float(valor_saida),
-                    step=0.01,
-                    format="%.2f",
-                    disabled=True,
-                    key="valor_pagamento_fatura_ro",
-                    help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
+            faturas = listar_destinos_fatura_em_aberto_fn() or []
+            if not faturas:
+                st.warning("Não há faturas de cartão em aberto.")
+            else:
+                opcoes = [f["label"] for f in faturas]
+                escolha = st.selectbox(
+                    "Fatura (cartão • mês • saldo)",
+                    opcoes, key="destino_fatura_comp", on_change=invalidate_cb
                 )
-                colf1, colf2, colf3 = st.columns(3)
-                with colf1:
-                    multa_fatura = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_fatura")
-                with colf2:
-                    juros_fatura = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_fatura")
-                with colf3:
-                    desconto_fatura = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_fatura")
+                if escolha:
+                    f_sel = next(f for f in faturas if f["label"] == escolha)
+                    destino_pagamento_sel = f_sel.get("cartao", "")
+                    competencia_fatura_sel = f_sel.get("competencia", "")
+                    obrigacao_id_fatura = int(f_sel.get("obrigacao_id"))
+                    st.caption(
+                        f"Selecionado: {destino_pagamento_sel} — {competencia_fatura_sel} • obrigação #{obrigacao_id_fatura}"
+                    )
 
-                total_saida_fatura = float(valor_saida) + float(multa_fatura) + float(juros_fatura) - float(desconto_fatura)
-                st.caption(f"Total da saída (caixa/banco): R$ {total_saida_fatura:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                    st.number_input(
+                        "Valor do pagamento (pode ser parcial)",
+                        value=float(valor_saida),
+                        step=0.01,
+                        format="%.2f",
+                        disabled=True,
+                        key="valor_pagamento_fatura_ro",
+                        help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
+                    )
+                    colf1, colf2, colf3 = st.columns(3)
+                    with colf1:
+                        multa_fatura = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_fatura")
+                    with colf2:
+                        juros_fatura = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_fatura")
+                    with colf3:
+                        desconto_fatura = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_fatura")
 
-        # ===== Boletos =====
+                    total_saida_fatura = float(valor_saida) + float(multa_fatura) + float(juros_fatura) - float(desconto_fatura)
+                    st.caption(f"Total da saída (caixa/banco): R$ {total_saida_fatura:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        # ---------- EMPRÉSTIMOS E FINANCIAMENTOS ----------
+        elif tipo_pagamento_sel == "Empréstimos e Financiamentos":
+            if listar_empfin_em_aberto_fn is None:
+                st.error("Faltando provider: `listar_empfin_em_aberto_fn()` não foi informado.")
+            else:
+                itens = listar_empfin_em_aberto_fn() or []
+                if not itens:
+                    st.warning("Não há parcelas de empréstimos/financiamentos em aberto.")
+                else:
+                    # Esperado: cada item com "label" (ex: "Banco X • Parcela 3/12 • Venc 10/09 • R$ 500,00")
+                    # e "obrigacao_id" (id da obrigação/parcelamento). Opcional: "parcela_id".
+                    opcoes = [i["label"] for i in itens]
+                    escolha = st.selectbox("Selecione a parcela em aberto", opcoes, key="emp_parcela_em_aberto", on_change=invalidate_cb)
+                    if escolha:
+                        it = next(i for i in itens if i["label"] == escolha)
+                        destino_pagamento_sel = it.get("credor") or it.get("banco") or it.get("descricao") or ""
+                        obrigacao_id_emp = int(it.get("obrigacao_id"))
+                        parcela_emp_escolhida = it  # guarda o dict inteiro (tem infos úteis)
+                        st.caption(
+                            f"Selecionado: {destino_pagamento_sel} • obrigação #{obrigacao_id_emp}"
+                            + (f" • parcela #{it.get('parcela_id')}" if it.get("parcela_id") else "")
+                        )
+
+                        st.number_input(
+                            "Valor do pagamento (pode ser parcial)",
+                            value=float(valor_saida),
+                            step=0.01,
+                            format="%.2f",
+                            disabled=True,
+                            key="valor_pagamento_emp_ro",
+                            help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
+                        )
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            multa_emp = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_emp")
+                        with c2:
+                            juros_emp = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_emp")
+                        with c3:
+                            desconto_emp = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_emp")
+
+                        total_saida_emp = float(valor_saida) + float(multa_emp) + float(juros_emp) - float(desconto_emp)
+                        st.caption(f"Total da saída (caixa/banco): R$ {total_saida_emp:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        # ---------- BOLETOS ----------
         elif tipo_pagamento_sel == "Boletos":
-            destinos = carregar_opcoes_pagamentos_fn("Boletos")
-            destino_pagamento_sel = (
-                st.selectbox("Credor", destinos, key="destino_pagamentos", on_change=invalidate_cb)
-                if destinos else
-                st.text_input("Credor (digite)", key="destino_pagamentos_text")
-            )
+            if listar_boletos_em_aberto_fn is None:
+                st.error("Faltando provider: `listar_boletos_em_aberto_fn()` não foi informado.")
+            else:
+                boletos = listar_boletos_em_aberto_fn() or []
+                if not boletos:
+                    st.warning("Não há boletos em aberto.")
+                else:
+                    # Esperado: cada item com "label" (ex: "Fornecedor Y • Parc 2/6 • Venc 12/09 • R$ 320,00")
+                    # e "obrigacao_id". Opcional: "parcela_id", "credor".
+                    opcoes = [b["label"] for b in boletos]
+                    escolha = st.selectbox("Selecione o boleto/parcela em aberto", opcoes, key="boleto_em_aberto", on_change=invalidate_cb)
+                    if escolha:
+                        b = next(i for i in boletos if i["label"] == escolha)
+                        destino_pagamento_sel = b.get("credor") or b.get("descricao") or ""
+                        obrigacao_id_boleto = int(b.get("obrigacao_id"))
+                        parcela_boleto_escolhida = b
+                        st.caption(
+                            f"Selecionado: {destino_pagamento_sel} • obrigação #{obrigacao_id_boleto}"
+                            + (f" • parcela #{b.get('parcela_id')}" if b.get("parcela_id") else "")
+                        )
 
-            if destino_pagamento_sel and str(destino_pagamento_sel).strip():
-                st.number_input(
-                    "Valor do pagamento (pode ser parcial)",
-                    value=float(valor_saida),
-                    step=0.01,
-                    format="%.2f",
-                    disabled=True,
-                    key="valor_pagamento_boleto_ro",
-                    help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
-                )
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    multa_boleto = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_boleto")
-                with col2:
-                    juros_boleto = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_boleto")
-                with col3:
-                    desconto_boleto = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_boleto")
+                        st.number_input(
+                            "Valor do pagamento (pode ser parcial)",
+                            value=float(valor_saida),
+                            step=0.01,
+                            format="%.2f",
+                            disabled=True,
+                            key="valor_pagamento_boleto_ro",
+                            help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
+                        )
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            multa_boleto = st.number_input("Multa (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_boleto")
+                        with col2:
+                            juros_boleto = st.number_input("Juros (+)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_boleto")
+                        with col3:
+                            desconto_boleto = st.number_input("Desconto (−)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_boleto")
 
-                # A seleção real da parcela pode ser feita por ID; se você souber o ID da obrigação, informe abaixo:
-                obrigacao_txt = st.text_input(
-                    "ID da obrigação (opcional, ajuda a localizar a parcela exata)",
-                    key="obrigacao_id_boleto_text"
-                )
-                try:
-                    obrigacao_id_boleto = int(obrigacao_txt) if obrigacao_txt.strip() else None
-                except Exception:
-                    obrigacao_id_boleto = None
-
-                # Alternativamente, passe um "hint" textual (actions tentará fallbacks)
-                escolha_textual = st.text_input("Identificador/descrição da parcela (igual ao painel detalhado)", key="parcela_boleto_hint")
-                parcela_boleto_escolhida = {"hint": (escolha_textual or "").strip()} if (escolha_textual or "").strip() else None
-
-                total_saida_calc = float(valor_saida) + float(juros_boleto) + float(multa_boleto) - float(desconto_boleto)
-                st.caption(f"Total da saída (caixa/banco): R$ {total_saida_calc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-        # ===== Empréstimos e Financiamentos =====
-        else:
-            destinos = carregar_opcoes_pagamentos_fn("Empréstimos e Financiamentos")
-            destino_pagamento_sel = st.selectbox(
-                "Selecione o Banco/Descrição do Empréstimo",
-                options=destinos,
-                index=0 if destinos else None,
-                key="destino_pagamentos_emprestimo",
-                on_change=invalidate_cb
-            )
-
-            st.number_input(
-                "Valor do pagamento (pode ser parcial)",
-                value=float(valor_saida),
-                step=0.01,
-                format="%.2f",
-                disabled=True,
-                key="valor_pagamento_emp_ro",
-                help="Este valor vem de 'Valor da Saída'. Para alterar, edite o campo acima."
-            )
-            colE1, colE2, colE3 = st.columns(3)
-            with colE1:
-                multa_emp = st.number_input("Multa (R$)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="multa_emp")
-            with colE2:
-                juros_emp = st.number_input("Juros (R$)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="juros_emp")
-            with colE3:
-                desconto_emp = st.number_input("Desconto (R$)", min_value=0.0, step=1.0, format="%.2f", value=0.0, key="desconto_emp")
-
-            # Se souber o ID da obrigação/parcela, informe aqui:
-            obrigacao_txt_emp = st.text_input(
-                "ID da obrigação (opcional, ajuda a localizar a parcela exata)",
-                key="obrigacao_id_emp_text"
-            )
-            try:
-                obrigacao_id_emp = int(obrigacao_txt_emp) if obrigacao_txt_emp.strip() else None
-            except Exception:
-                obrigacao_id_emp = None
-
-            # Ou passe um hint textual (actions mantém fallbacks):
-            escolha_emp = st.text_input("Identificador/descrição da parcela do empréstimo (igual ao painel)", key="parcela_emp_hint")
-            parcela_emp_escolhida = {"hint": (escolha_emp or "").strip()} if (escolha_emp or "").strip() else None
+                        total_saida_calc = float(valor_saida) + float(juros_boleto) + float(multa_boleto) - float(desconto_boleto)
+                        st.caption(f"Total da saída (caixa/banco): R$ {total_saida_calc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
     else:
-        # Subcategoria comum
+        # Subcategoria comum (fora de Pagamentos)
         if cat_id:
             df_sub = listar_subcategorias_fn(cat_id)
             if df_sub is not None and not df_sub.empty:
@@ -225,13 +220,21 @@ def render_form_saida(
             subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
 
     # ===================== CAMPOS CONDICIONAIS À FORMA =====================
+    # Sinalizador: esconder campo de descrição quando for Pagamentos desses 3 tipos
+    esconder_descricao = bool(
+        is_pagamentos and (tipo_pagamento_sel in ["Fatura Cartão de Crédito", "Empréstimos e Financiamentos", "Boletos"])
+    )
+
     parcelas = 1
     cartao_escolhido = ""
     banco_escolhido = ""
     origem_dinheiro = ""
     venc_1: Optional[date] = None
-    fornecedor = ""
-    documento = ""
+    credor_boleto = ""
+    documento = ""  # compatibilidade
+
+    # descrição digitada (usada para CONTAS A PAGAR quando permitido)
+    descricao_digitada = ""
 
     if forma_pagamento == "CRÉDITO":
         parcelas = st.selectbox("Parcelas", list(range(1, 13)), key="parcelas_saida", on_change=invalidate_cb)
@@ -239,34 +242,38 @@ def render_form_saida(
             cartao_escolhido = st.selectbox("Cartão de Crédito", nomes_cartoes, key="saida_cartao_credito", on_change=invalidate_cb)
         else:
             st.warning("⚠️ Nenhum cartão de crédito cadastrado.")
+        if not esconder_descricao:
+            descricao_digitada = st.text_input("Descrição (opcional)", key="descricao_saida_credito")
 
     elif forma_pagamento == "DINHEIRO":
         origem_dinheiro = st.selectbox("Origem do Dinheiro", ORIGENS_DINHEIRO, key="origem_dinheiro", on_change=invalidate_cb)
+        if not esconder_descricao:
+            descricao_digitada = st.text_input("Descrição (opcional)", key="descricao_saida_dinheiro")
 
     elif forma_pagamento in ["PIX", "DÉBITO"]:
         if nomes_bancos:
             banco_escolhido = st.selectbox("Banco da Saída", nomes_bancos, key="saida_banco_saida", on_change=invalidate_cb)
         else:
             banco_escolhido = st.text_input("Banco da Saída (digite)", key="saida_banco_saida_text", on_change=invalidate_cb)
+        if not esconder_descricao:
+            descricao_digitada = st.text_input("Descrição (opcional)", key="descricao_saida_banco")
 
     elif forma_pagamento == "BOLETO":
+        # Este bloco é para PROGRAMAR boletos (fora de Pagamentos)
         parcelas = st.selectbox("Parcelas", list(range(1, 37)), index=0, key="parcelas_boleto", on_change=invalidate_cb)
         venc_1 = st.date_input("Vencimento da 1ª parcela", value=date.today(), key="venc1_boleto")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            fornecedor = st.text_input("Fornecedor (opcional)", key="forn_boleto")
-        with col_b:
-            documento = st.text_input("Documento/Nº (opcional)", key="doc_boleto")
+        credor_boleto = st.text_input("Credor (Fornecedor)", key="credor_boleto")
+        if not esconder_descricao:
+            descricao_digitada = st.text_input("Descrição (opcional)", key="descricao_saida_boleto")
 
-    descricao = st.text_input("Descrição (opcional)", key="descricao_saida")
-
-    # Monta descrição final com meta de Pagamentos (evita espaço duplo)
+    # ===================== DESCRIÇÃO (para CONTAS A PAGAR) =====================
     meta_tag = ""
     if is_pagamentos:
         tipo_txt = tipo_pagamento_sel or "-"
         dest_txt = (destino_pagamento_sel or "-").strip()
         meta_tag = f"[PAGAMENTOS: tipo={tipo_txt}; destino={dest_txt}]"
-    descricao_final = " ".join([(descricao or "").strip(), meta_tag]).strip()
+
+    descricao_final = " ".join([(descricao_digitada or "").strip(), meta_tag]).strip() if not esconder_descricao else meta_tag
 
     # ===================== RESUMO =====================
     data_saida_str = data_lanc.strftime("%d/%m/%Y")
@@ -281,7 +288,7 @@ def render_form_saida(
         f"- **Descrição:** {descricao_final or 'N/A'}",
     ]
     if forma_pagamento == "CRÉDITO":
-        linhas_md += [f"- **Parcelas:** {parcelas}x", f"- **Cartão de Crédito:** {cartao_escolhido or '—'}"]
+        linhas_md += [f"- **Parcelas:** {parcelas}x", f"- **Cartão de Crédito (credor):** {cartao_escolhido or '—'}"]
     elif forma_pagamento == "DINHEIRO":
         linhas_md += [f"- **Origem do Dinheiro:** {origem_dinheiro or '—'}"]
     elif forma_pagamento in ["PIX", "DÉBITO"]:
@@ -290,16 +297,19 @@ def render_form_saida(
         linhas_md += [
             f"- **Parcelas:** {parcelas}x",
             f"- **Vencimento 1ª Parcela:** {venc_1.strftime('%d/%m/%Y') if venc_1 else '—'}",
-            f"- **Fornecedor:** {fornecedor or '—'}",
-            f"- **Documento:** {documento or '—'}",
-            (f"- **Obrigação ID:** {obrigacao_id_boleto}") if obrigacao_id_boleto else "",
+            f"- **Credor:** {credor_boleto or '—'}",
         ]
-    if is_pagamentos and tipo_pagamento_sel == "Empréstimos e Financiamentos" and obrigacao_id_emp:
-        linhas_md += [f"- **Obrigação ID:** {obrigacao_id_emp}"]
 
     st.info("\n".join([l for l in linhas_md if l != ""]))
 
     confirmado = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
+
+    # --------- mapear 'credor' por forma ----------
+    credor_val = ""
+    if forma_pagamento == "CRÉDITO":
+        credor_val = (cartao_escolhido or "").strip()
+    elif forma_pagamento == "BOLETO":
+        credor_val = (credor_boleto or "").strip()
 
     return {
         "valor_saida": float(valor_saida or 0.0),
@@ -320,19 +330,19 @@ def render_form_saida(
         "juros_fatura": float(juros_fatura),
         "desconto_fatura": float(desconto_fatura),
 
-        # Boletos
-        "obrigacao_id": obrigacao_id_boleto,  # actions usa como prioridade se existir
+        # Boletos (AGORA: selecionados da lista de abertos)
+        "obrigacao_id": obrigacao_id_boleto,
         "parcela_boleto_escolhida": parcela_boleto_escolhida,
         "multa_boleto": float(multa_boleto),
         "juros_boleto": float(juros_boleto),
         "desconto_boleto": float(desconto_boleto),
 
-        # Empréstimos
+        # Empréstimos (AGORA: selecionados da lista de abertos)
         "parcela_emp_escolhida": parcela_emp_escolhida,
         "multa_emp": float(multa_emp),
         "juros_emp": float(juros_emp),
         "desconto_emp": float(desconto_emp),
-        "parcela_obrigacao_id": obrigacao_id_emp,  # fallback aceito pelo actions
+        "parcela_obrigacao_id": obrigacao_id_emp,
 
         # Comuns/forma
         "parcelas": int(parcelas or 1),
@@ -340,9 +350,14 @@ def render_form_saida(
         "banco_escolhido": (banco_escolhido or "").strip(),
         "origem_dinheiro": (origem_dinheiro or "").strip(),
         "venc_1": venc_1,
-        "fornecedor": (fornecedor or "").strip(),
-        "documento": (documento or "").strip(),
+
+        # Credor e Descrição (para CONTAS A PAGAR)
+        "credor": credor_val,
         "descricao_final": descricao_final,
+
+        # Compat antigos
+        "documento": "",
+        "fornecedor": credor_boleto,  # mantém por compat, mas o valor real está em "credor"
 
         "confirmado": bool(confirmado),
     }

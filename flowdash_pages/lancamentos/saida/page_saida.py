@@ -7,6 +7,11 @@ Mantém o comportamento do arquivo original:
 - Campos e fluxos idênticos (incluindo Pagamentos: Fatura/Boletos/Empréstimos)
 - Validações e mensagens
 - st.rerun() após sucesso
+
+Compatibilidade:
+- Funciona com versões NOVAS (carregar_listas_para_form retorna 8 itens
+  e render_form_saida aceita 2 providers novos) e com versões ANTIGAS
+  (6 itens / sem os dois kwargs).
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from typing import Any, Optional, Tuple
 import datetime as _dt
 import streamlit as st
 
-from utils.utils import coerce_data  # <<< normaliza/garante datetime.date
+from utils.utils import coerce_data  # normaliza para datetime.date
 
 from .state_saida import toggle_form, form_visivel, invalidate_confirm
 from .ui_forms_saida import render_form_saida
@@ -29,11 +34,7 @@ __all__ = ["render_saida"]
 
 # ----------------- helpers -----------------
 def _norm_date(d: Any) -> _dt.date:
-    """
-    Normaliza data para datetime.date.
-    Aceita: date/datetime/string ('YYYY-MM-DD', ISO, 'DD/MM/YYYY', 'DD-MM-YYYY') ou None (usa hoje).
-    """
-    # usa utilitário central do projeto (já cobre os formatos comuns)
+    """Normaliza data para datetime.date."""
     return coerce_data(d)
 
 
@@ -56,7 +57,6 @@ def _coalesce_state(
     dt = dt or data_lanc
     if not db:
         raise ValueError("Caminho do banco não informado (state.db_path / caminho_banco).")
-    # Se dt vier None, coerce_data usa hoje por padrão
     return str(db), _norm_date(dt)
 
 
@@ -67,11 +67,8 @@ def render_saida(
     data_lanc: Optional[Any] = None,
 ) -> None:
     """
-    Preferencial:
-        render_saida(state)
-
-    Compatível:
-        render_saida(None, caminho_banco='...', data_lanc=date|'YYYY-MM-DD')
+    Preferencial: render_saida(state)
+    Compatível:   render_saida(None, caminho_banco='...', data_lanc=date|'YYYY-MM-DD')
     """
     # Resolver entradas
     try:
@@ -91,31 +88,63 @@ def render_saida(
     usuario = st.session_state.get("usuario_logado", {"nome": "Sistema"})
     usuario_nome = usuario.get("nome", "Sistema")
 
-    # Carrega listas/repos necessárias para o formulário
+    # Carrega listas/repos necessárias para o formulário (compatível 6 OU 8 retornos)
     try:
-        (
-            nomes_bancos,
-            nomes_cartoes,
-            df_categorias,
-            listar_subcategorias_fn,
-            listar_destinos_fatura_em_aberto_fn,
-            carregar_opcoes_pagamentos_fn,
-        ) = carregar_listas_para_form(_db_path)
+        carregado = carregar_listas_para_form(_db_path)
+        # Versão nova: 8 itens
+        if isinstance(carregado, (list, tuple)) and len(carregado) >= 8:
+            (
+                nomes_bancos,
+                nomes_cartoes,
+                df_categorias,
+                listar_subcategorias_fn,
+                listar_destinos_fatura_em_aberto_fn,
+                carregar_opcoes_pagamentos_fn,   # legado/compat
+                listar_boletos_em_aberto_fn,     # NOVO
+                listar_empfin_em_aberto_fn,      # NOVO
+            ) = carregado[:8]
+        # Versão antiga: 6 itens -> criar providers vazios
+        else:
+            (
+                nomes_bancos,
+                nomes_cartoes,
+                df_categorias,
+                listar_subcategorias_fn,
+                listar_destinos_fatura_em_aberto_fn,
+                carregar_opcoes_pagamentos_fn,
+            ) = carregado[:6]
+            listar_boletos_em_aberto_fn = lambda: []
+            listar_empfin_em_aberto_fn = lambda: []
     except Exception as e:
         st.error(f"❌ Falha ao preparar formulário: {e}")
         return
 
-    # Render UI (retorna payload com todos os campos)
-    payload = render_form_saida(
-        data_lanc=_data_lanc,  # <<< agora é datetime.date, não string
-        invalidate_cb=invalidate_confirm,
-        nomes_bancos=nomes_bancos,
-        nomes_cartoes=nomes_cartoes,
-        categorias_df=df_categorias,
-        listar_subcategorias_fn=listar_subcategorias_fn,
-        listar_destinos_fatura_em_aberto_fn=listar_destinos_fatura_em_aberto_fn,
-        carregar_opcoes_pagamentos_fn=lambda tipo: carregar_opcoes_pagamentos_fn(tipo),
-    )
+    # Render UI (retorna payload). Tentar com providers novos; se a função não aceitar, cair para chamada antiga.
+    try:
+        payload = render_form_saida(
+            data_lanc=_data_lanc,  # datetime.date
+            invalidate_cb=invalidate_confirm,
+            nomes_bancos=nomes_bancos,
+            nomes_cartoes=nomes_cartoes,
+            categorias_df=df_categorias,
+            listar_subcategorias_fn=listar_subcategorias_fn,
+            listar_destinos_fatura_em_aberto_fn=listar_destinos_fatura_em_aberto_fn,
+            carregar_opcoes_pagamentos_fn=carregar_opcoes_pagamentos_fn,
+            listar_boletos_em_aberto_fn=listar_boletos_em_aberto_fn,   # pode não existir em versão antiga
+            listar_empfin_em_aberto_fn=listar_empfin_em_aberto_fn,     # pode não existir em versão antiga
+        )
+    except TypeError as te:
+        # Fallback para assinatura antiga (sem os dois kwargs finais)
+        payload = render_form_saida(
+            data_lanc=_data_lanc,
+            invalidate_cb=invalidate_confirm,
+            nomes_bancos=nomes_bancos,
+            nomes_cartoes=nomes_cartoes,
+            categorias_df=df_categorias,
+            listar_subcategorias_fn=listar_subcategorias_fn,
+            listar_destinos_fatura_em_aberto_fn=listar_destinos_fatura_em_aberto_fn,
+            carregar_opcoes_pagamentos_fn=carregar_opcoes_pagamentos_fn,
+        )
 
     # Botão salvar: mesma trava do original
     save_disabled = not st.session_state.get("confirmar_saida", False)
@@ -131,7 +160,7 @@ def render_saida(
     try:
         res = registrar_saida(
             caminho_banco=_db_path,
-            data_lanc=_data_lanc,  # <<< passa date para quem for usar .strftime(...)
+            data_lanc=_data_lanc,
             usuario_nome=usuario_nome,
             payload=payload,
         )
