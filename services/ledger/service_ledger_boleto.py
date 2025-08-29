@@ -32,6 +32,7 @@ from __future__ import annotations
 # -----------------------------------------------------------------------------
 import logging
 from typing import Optional
+from datetime import datetime  # <-- para data_hora
 
 import os
 import sys
@@ -50,6 +51,7 @@ import pandas as pd  # noqa: E402
 try:
     from shared.db import get_conn  # noqa: E402
     from shared.ids import sanitize, uid_boleto_programado  # noqa: E402
+    from services.ledger.service_ledger_infra import _ensure_mov_cols  # <-- garante colunas usuario/data_hora
 except Exception as e:
     raise ImportError(
         "Falha ao importar módulos internos. Verifique se a estrutura do projeto contém a pasta "
@@ -159,18 +161,29 @@ class _BoletoLedgerMixin:
                        cartao_id=NULL,
                        emprestimo_id=NULL,
                        status = COALESCE(NULLIF(status,''), 'Em aberto')
-                 WHERE obrigacao_id BETWEEN ? AND ?"""
-                ,
+                 WHERE obrigacao_id BETWEEN ? AND ?""",
                 (base_obrig_id, base_obrig_id + int(parcelas) - 1),
             )
 
+            # (3) Log — inclui usuario e data_hora
+            _ensure_mov_cols(cur)
             obs = f"Boleto {parcelas}x - {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute(
                 """
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, 'Boleto', 'saida', ?, 'saidas_boleto_programada', ?, 'contas_a_pagar_mov', ?, ?)""",
-                (str(compra.date()), float(valor), obs, ids_mov_cap[0] if ids_mov_cap else None, trans_uid),
+                    (data, banco, tipo, valor, origem, observacao,
+                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                VALUES (?, 'Boleto', 'saida', ?, 'saidas_boleto_programada', ?, 'contas_a_pagar_mov', ?, ?, ?, ?)
+                """,
+                (
+                    str(compra.date()),
+                    float(valor),
+                    obs,
+                    ids_mov_cap[0] if ids_mov_cap else None,
+                    trans_uid,
+                    usuario,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
             )
             id_mov = int(cur.lastrowid)
 
@@ -270,13 +283,26 @@ class _BoletoLedgerMixin:
                     (total_saida, data),
                 )
 
+                # Log do pagamento em DINHEIRO — inclui usuario e data_hora
+                _ensure_mov_cols(cur)
                 obs = (f"Pagamento Boleto {cat}/{sub or ''}".strip() + (f" - {desc}" if desc else "") + obs_extra)
                 cur.execute(
                     """
                     INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                    VALUES (?, ?, 'saida', ?, 'saidas_boleto_pagamento', ?, 'saida', ?, ?)""",
-                    (data, org, total_saida, obs, id_saida, trans_uid),
+                        (data, banco, tipo, valor, origem, observacao,
+                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                    VALUES (?, ?, 'saida', ?, 'saidas_boleto_pagamento', ?, 'saida', ?, ?, ?, ?)
+                    """,
+                    (
+                        data,
+                        org,  # "Caixa" ou "Caixa 2"
+                        total_saida,
+                        obs,
+                        id_saida,
+                        trans_uid,
+                        usu,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
                 )
                 id_mov = int(cur.lastrowid)
 
@@ -293,13 +319,26 @@ class _BoletoLedgerMixin:
                 )
                 id_saida = int(cur.lastrowid)
 
+                # Log do pagamento via banco — inclui usuario e data_hora
+                _ensure_mov_cols(cur)
                 obs = (f"Pagamento Boleto {cat}/{sub or ''}".strip() + (f" - {desc}" if desc else "") + obs_extra)
                 cur.execute(
                     """
                     INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                    VALUES (?, ?, 'saida', ?, 'saidas_boleto_pagamento', ?, 'saida', ?, ?)""",
-                    (data, org, total_saida, obs, id_saida, trans_uid),
+                        (data, banco, tipo, valor, origem, observacao,
+                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                    VALUES (?, ?, 'saida', ?, 'saidas_boleto_pagamento', ?, 'saida', ?, ?, ?, ?)
+                    """,
+                    (
+                        data,
+                        org,  # nome do banco
+                        total_saida,
+                        obs,
+                        id_saida,
+                        trans_uid,
+                        usu,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
                 )
                 id_mov = int(cur.lastrowid)
 

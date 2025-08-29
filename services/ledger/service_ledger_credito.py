@@ -51,6 +51,7 @@ import pandas as pd  # noqa: E402
 # Internos
 from shared.db import get_conn  # noqa: E402
 from shared.ids import sanitize, uid_credito_programado  # noqa: E402
+from services.ledger.service_ledger_infra import _ensure_mov_cols  # <-- garante colunas usuario/data_hora
 
 logger = logging.getLogger(__name__)
 
@@ -192,11 +193,16 @@ class _CreditoLedgerMixin:
         cartao_nome = sanitize(cartao_nome)
         categoria = sanitize(categoria)
         sub_categoria = sanitize(sub_categoria)
-        descricao = sanitize(descricao)
+        # descricao digitada no formulário (detalhada para itens)
+        descricao_item = sanitize(descricao)
         usuario = sanitize(usuario)
 
+        # descrição genérica a ser gravada no LANCAMENTO (CAP)
+        descricao_cap = "Descrição na Fatura"
+
+        # Mantemos a idempotência considerando a descrição detalhada (descricao_item)
         trans_uid = trans_uid or uid_credito_programado(
-            data_compra, valor, parcelas, cartao_nome, categoria, sub_categoria, descricao, usuario
+            data_compra, valor, parcelas, cartao_nome, categoria, sub_categoria, descricao_item, usuario
         )
         if self.mov_repo.ja_existe_transacao(trans_uid):
             logger.info("registrar_saida_credito: trans_uid já existe (%s) — ignorando", trans_uid)
@@ -244,6 +250,7 @@ class _CreditoLedgerMixin:
 
                 vparc = round(valor_parc + (ajuste if p == int(parcelas) else 0.0), 2)
 
+                # LANCAMENTO na CAP com descrição genérica
                 lanc_id = self._add_valor_fatura(
                     conn,
                     cartao_nome=cartao_nome,
@@ -252,14 +259,14 @@ class _CreditoLedgerMixin:
                     data_evento=str(compra.date()),
                     vencimento=str(vcto_date),
                     usuario=usuario,
-                    descricao=descricao or f"Fatura {cartao_nome} {competencia}",
+                    descricao=descricao_cap or f"Fatura {cartao_nome} {competencia}",
                     parcela_num=p,
                     parcelas_total=int(parcelas),
                 )
                 lanc_ids.append(int(lanc_id))
                 total_programado = round(total_programado + float(vparc), 2)
 
-                # item da compra, útil para auditoria da fatura
+                # item da compra (fatura_cartao_itens) COM a descrição DETALHADA do formulário
                 cur.execute(
                     """
                     INSERT INTO fatura_cartao_itens
@@ -272,7 +279,7 @@ class _CreditoLedgerMixin:
                         cartao_nome,
                         competencia,
                         str(compra.date()),
-                        descricao or "",
+                        descricao_item or "",  # <- descrição detalhada vai para a fatura
                         (f"{categoria or ''}" + (f" / {sub_categoria}" if sub_categoria else "")).strip(" /"),
                         int(p),
                         int(parcelas),
@@ -281,12 +288,19 @@ class _CreditoLedgerMixin:
                     ),
                 )
 
-            obs = f"Despesa CREDITO {cartao_nome} {parcelas}x - {categoria}/{sub_categoria}"
+            # (3) Log — inclui usuario e data_hora
+            _ensure_mov_cols(cur)
+            obs = (
+                f"Despesa CRÉDITO {cartao_nome} {parcelas}x"
+                + (f" - {categoria}/{sub_categoria}" if (categoria or sub_categoria) else "")
+                + (f" - {descricao_item}" if descricao_item else "")
+            )
             cur.execute(
                 """
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, ?, 'saida', ?, 'saidas_credito_programada', ?, 'contas_a_pagar_mov', ?, ?)
+                    (data, banco, tipo, valor, origem, observacao,
+                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                VALUES (?, ?, 'saida', ?, 'saidas_credito_programada', ?, 'contas_a_pagar_mov', ?, ?, ?, ?)
                 """,
                 (
                     str(compra.date()),
@@ -295,6 +309,8 @@ class _CreditoLedgerMixin:
                     obs,
                     lanc_ids[0] if lanc_ids else None,
                     trans_uid,
+                    usuario,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
             id_mov = int(cur.lastrowid)

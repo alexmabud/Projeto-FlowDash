@@ -29,6 +29,7 @@ from __future__ import annotations
 # -----------------------------------------------------------------------------
 import logging
 from typing import Optional, Tuple
+from datetime import datetime  # ⬅️ para data_hora
 
 import os
 import sys
@@ -42,6 +43,7 @@ if _PROJECT_ROOT not in sys.path:
 # Internos
 from shared.db import get_conn  # noqa: E402
 from shared.ids import sanitize  # noqa: E402
+from services.ledger.service_ledger_infra import _ensure_mov_cols  # ⬅️ garante colunas no log
 
 logger = logging.getLogger(__name__)
 
@@ -149,19 +151,30 @@ class _FaturaLedgerMixin:
                     (float(total_saida), data),
                 )
 
+                # Log do pagamento em DINHEIRO — inclui usuario e data_hora
+                _ensure_mov_cols(cur)
                 obs = (f"Pagamento Fatura • {cat}/{sub or ''}").strip() + (f" - {desc}" if desc else "") + obs_extra
                 cur.execute(
                     """
                     INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                    VALUES (?, ?, 'saida', ?, 'saidas_fatura_pagamento', ?, 'saida', ?, ?)
+                        (data, banco, tipo, valor, origem, observacao,
+                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                    VALUES (?, ?, 'saida', ?, 'saidas_fatura_pagamento', ?, 'saida', ?, ?, ?, ?)
                     """,
-                    (data, org, float(total_saida), obs, id_saida, trans_uid),
+                    (
+                        data,
+                        org,  # "Caixa" ou "Caixa 2"
+                        float(total_saida),
+                        obs,
+                        id_saida,
+                        trans_uid,
+                        usu,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
                 )
                 id_mov = int(cur.lastrowid)
             else:
                 # Banco: validação/ajuste dentro de _ajustar_banco_dynamic
-                # (Opcional: garantir linha de saldos de bancos)
                 try:
                     self._garantir_linha_saldos_bancos(conn, data)  # se existir no serviço
                 except Exception:
@@ -179,14 +192,26 @@ class _FaturaLedgerMixin:
                 )
                 id_saida = int(cur.lastrowid)
 
+                # Log do pagamento via banco — inclui usuario e data_hora
+                _ensure_mov_cols(cur)
                 obs = (f"Pagamento Fatura • {cat}/{sub or ''}").strip() + (f" - {desc}" if desc else "") + obs_extra
                 cur.execute(
                     """
                     INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                    VALUES (?, ?, 'saida', ?, 'saidas_fatura_pagamento', ?, 'saida', ?, ?)
+                        (data, banco, tipo, valor, origem, observacao,
+                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                    VALUES (?, ?, 'saida', ?, 'saidas_fatura_pagamento', ?, 'saida', ?, ?, ?, ?)
                     """,
-                    (data, org, float(total_saida), obs, id_saida, trans_uid),
+                    (
+                        data,
+                        org,  # nome do banco
+                        float(total_saida),
+                        obs,
+                        id_saida,
+                        trans_uid,
+                        usu,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
                 )
                 id_mov = int(cur.lastrowid)
 

@@ -43,10 +43,12 @@ if _PROJECT_ROOT not in sys.path:
 
 # Terceiros
 import pandas as pd  # noqa: E402
+from datetime import datetime  # <-- para data_hora
 
 # Internos
 from shared.db import get_conn  # noqa: E402
 from shared.ids import sanitize  # noqa: E402
+from services.ledger.service_ledger_infra import _ensure_mov_cols  # <-- garante colunas usuario/data_hora
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,8 @@ class _EmprestimoLedgerMixin:
                     (float(total_saida), data),
                 )
 
+                # Log do pagamento em DINHEIRO — inclui usuario e data_hora
+                _ensure_mov_cols(cur)
                 obs = (
                     (f"Pagamento Empréstimo {cat}/{sub or ''}").strip()
                     + (f" - {desc}" if desc else "")
@@ -138,10 +142,20 @@ class _EmprestimoLedgerMixin:
                 cur.execute(
                     """
                     INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                    VALUES (?, ?, 'saida', ?, 'saidas_emprestimo_pagamento', ?, 'saida', ?, ?)
+                        (data, banco, tipo, valor, origem, observacao,
+                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                    VALUES (?, ?, 'saida', ?, 'saidas_emprestimo_pagamento', ?, 'saida', ?, ?, ?, ?)
                     """,
-                    (data, org, float(total_saida), obs, id_saida, trans_uid),
+                    (
+                        data,
+                        org,  # "Caixa" ou "Caixa 2"
+                        float(total_saida),
+                        obs,
+                        id_saida,
+                        trans_uid,
+                        usu,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
                 )
                 id_mov = int(cur.lastrowid)
 
@@ -161,6 +175,8 @@ class _EmprestimoLedgerMixin:
                 )
                 id_saida = int(cur.lastrowid)
 
+                # Log do pagamento via banco — inclui usuario e data_hora
+                _ensure_mov_cols(cur)
                 obs = (
                     (f"Pagamento Empréstimo {cat}/{sub or ''}").strip()
                     + (f" - {desc}" if desc else "")
@@ -171,10 +187,20 @@ class _EmprestimoLedgerMixin:
                 cur.execute(
                     """
                     INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                    VALUES (?, ?, 'saida', ?, 'saidas_emprestimo_pagamento', ?, 'saida', ?, ?)
+                        (data, banco, tipo, valor, origem, observacao,
+                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                    VALUES (?, ?, 'saida', ?, 'saidas_emprestimo_pagamento', ?, 'saida', ?, ?, ?, ?)
                     """,
-                    (data, org, float(total_saida), obs, id_saida, trans_uid),
+                    (
+                        data,
+                        org,  # nome do banco
+                        float(total_saida),
+                        obs,
+                        id_saida,
+                        trans_uid,
+                        usu,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
                 )
                 id_mov = int(cur.lastrowid)
 
@@ -380,13 +406,15 @@ class _EmprestimoLedgerMixin:
                     (base_obrig_id, base_obrig_id + k - 1),
                 )
 
-            # log informativo de programação
+            # log informativo de programação — inclui usuario e data_hora
+            _ensure_mov_cols(cur)
             cur.execute(
                 """
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
+                    (data, banco, tipo, valor, origem, observacao,
+                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
                 VALUES (?, ?, 'info', 0, 'emprestimo_programado',
-                        ?, 'contas_a_pagar_mov', ?, NULL)
+                        ?, 'contas_a_pagar_mov', ?, NULL, ?, ?)
                 """,
                 (
                     str(base_dt.date()),
@@ -394,6 +422,8 @@ class _EmprestimoLedgerMixin:
                     f"Empréstimo programado {parcelas_total}x de R$ {valor_parcela:.2f} - "
                     f"{credor} (pagas na origem: {k})",
                     ids_lanc[0] if ids_lanc else None,
+                    usuario,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             )
 

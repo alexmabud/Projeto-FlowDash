@@ -5,8 +5,8 @@ Resumo:
     Regras para registrar saídas de dinheiro (Caixa/Caixa 2) e saídas bancárias
     (PIX/DÉBITO), com logs em movimentacoes_bancarias e integrações com CAP:
     - vínculo direto a um título (obrigacao_id/tipo_obrigacao),
-    - auto‑classificação por destino (cartão/boletos/emprestimos),
-    - auto‑baixa de pagamentos,
+    - auto-classificação por destino (cartão/boletos/emprestimos),
+    - auto-baixa de pagamentos,
     - atalho de pagamento direto de fatura por obrigacao_id_fatura.
 
 Depende de:
@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from typing import Dict, Optional, Tuple
+from datetime import datetime  # ⬅️ para data_hora
 
 import os
 import sys
@@ -43,6 +44,7 @@ if _PROJECT_ROOT not in sys.path:
 # Internos
 from shared.db import get_conn  # noqa: E402
 from shared.ids import sanitize, uid_saida_bancaria, uid_saida_dinheiro  # noqa: E402
+from services.ledger.service_ledger_infra import _ensure_mov_cols  # ⬅️ garante colunas no log
 
 logger = logging.getLogger(__name__)
 
@@ -121,15 +123,26 @@ class _SaidasLedgerMixin:
                 (float(valor), data),
             )
 
-            # (3) Log
+            # (3) Log  ✅ grava usuario e data_hora
+            _ensure_mov_cols(cur)  # garante colunas usuario/data_hora se necessário
             obs = f"Saída {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute(
                 """
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?)
+                    (data, banco, tipo, valor, origem, observacao,
+                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?, ?, ?)
                 """,
-                (data, origem_dinheiro, float(valor), obs, id_saida, trans_uid),
+                (
+                    data,
+                    origem_dinheiro,
+                    float(valor),
+                    obs,
+                    id_saida,
+                    trans_uid,
+                    usuario,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
             )
             id_mov = int(cur.lastrowid)
 
@@ -177,7 +190,7 @@ class _SaidasLedgerMixin:
                 )
                 self._atualizar_status_por_obrigacao(conn, obrig_id)
 
-            # (5) Classificação + Auto‑baixa por destino/tipo (Fatura/Boletos/Empréstimos)
+            # (5) Classificação + Auto-baixa por destino/tipo (Fatura/Boletos/Empréstimos)
             if pagamento_tipo and pagamento_destino:
                 self._classificar_conta_a_pagar_por_destino(conn, pagamento_tipo, pagamento_destino)
                 restante = self._auto_baixar_pagamentos(
@@ -275,15 +288,26 @@ class _SaidasLedgerMixin:
             self._garantir_linha_saldos_bancos(conn, data)
             self._ajustar_banco_dynamic(conn, banco_col=banco_nome, delta=-float(valor), data=data)
 
-            # (3) Log
+            # (3) Log  ✅ grava usuario e data_hora
+            _ensure_mov_cols(cur)  # garante colunas usuario/data_hora se necessário
             obs = f"Saída {categoria}/{sub_categoria}" + (f" - {descricao}" if descricao else "")
             cur.execute(
                 """
                 INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao, referencia_tabela, referencia_id, trans_uid)
-                VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?)
+                    (data, banco, tipo, valor, origem, observacao,
+                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?, ?, ?)
                 """,
-                (data, banco_nome, float(valor), obs, id_saida, trans_uid),
+                (
+                    data,
+                    banco_nome,
+                    float(valor),
+                    obs,
+                    id_saida,
+                    trans_uid,
+                    usuario,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
             )
             id_mov = int(cur.lastrowid)
 
@@ -331,7 +355,7 @@ class _SaidasLedgerMixin:
                 )
                 self._atualizar_status_por_obrigacao(conn, obrig_id)
 
-            # (5) Classificação + Auto‑baixa por destino/tipo (Fatura/Boletos/Empréstimos)
+            # (5) Classificação + Auto-baixa por destino/tipo (Fatura/Boletos/Empréstimos)
             if pagamento_tipo and pagamento_destino:
                 self._classificar_conta_a_pagar_por_destino(conn, pagamento_tipo, pagamento_destino)
                 restante = self._auto_baixar_pagamentos(

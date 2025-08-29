@@ -143,6 +143,7 @@ class LoansMixin(object):
             ja_pagas = max(0, min(total_parc, int(d.get("parcelas_pagas") or 0)))
             vparc = float(d.get("valor_parcela") or 0.0)
             credor = self._label_emprestimo(d)
+            descricao_emp = (d.get("descricao") or "").strip()  # <<< MESMA descrição do cadastro
 
             if total_parc <= 0 or vparc <= 0:
                 raise ValueError("Empréstimo sem 'parcelas_total' ou 'valor_parcela' válido.")
@@ -172,6 +173,7 @@ class LoansMixin(object):
                 obrig_id = self.proximo_obrigacao_id(c)  # BaseRepo
 
                 # cria o LANCAMENTO (EventsMixin)
+                # >>> IMPORTANTE: usar a mesma descrição do cadastro
                 lancamento_id = self.registrar_lancamento(
                     c,
                     obrigacao_id=obrig_id,
@@ -179,7 +181,7 @@ class LoansMixin(object):
                     valor_total=float(vparc),
                     data_evento=base.strftime("%Y-%m-%d"),
                     vencimento=venc_str,
-                    descricao=f"Parcela {p}/{total_parc}",
+                    descricao=descricao_emp,        # <<< AQUI trocado (antes era "Parcela X/Y")
                     credor=credor,
                     competencia=venc_str[:7],
                     parcela_num=p,
