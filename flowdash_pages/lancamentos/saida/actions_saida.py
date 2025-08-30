@@ -722,12 +722,80 @@ def _listar_faturas_cartao_abertas_dropdown(caminho_banco: str) -> list[dict]:
 
 
 
-def _listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
+# --- AÇÃO: Pagar parcela de BOLETO -------------------------------------------
+
+def pagar_boleto_action(
+    *,
+    db_path: str,
+    data: str,                     # 'YYYY-MM-DD'
+    obrigacao_id: int,
+    forma_pagamento: str,          # "DINHEIRO" | "PIX" | "DÉBITO"
+    origem: str,                   # "Caixa"/"Caixa 2" ou nome do banco
+    valor: float,
+    usuario: str,
+    categoria: str = "Pagamentos",
+    sub_categoria: str = "Boletos",
+    descricao: str | None = None,
+    juros: float = 0.0,
+    multa: float = 0.0,
+    desconto: float = 0.0,
+) -> dict:
     """
-    Lista parcelas de BOLETO em aberto/parcial, mostrando o VALOR EM ABERTO.
+    Encaminha o pagamento de parcela de BOLETO para o LedgerService,
+    no mesmo padrão da Fatura (usuario e data_hora são gravados no service).
+    Retorna ids para conferência.
+    """
+    # normalizações leves
+    forma = (forma_pagamento or "").strip().upper()
+    if forma == "DEBITO":
+        forma = "DÉBITO"
+
+    if forma == "DINHEIRO" and origem not in ("Caixa", "Caixa 2"):
+        raise ValueError("Para forma 'DINHEIRO', a origem deve ser 'Caixa' ou 'Caixa 2'.")
+
+    # idempotência simples (mesma assinatura → não duplica)
+    trans_uid = (
+        f"PAG_BOLETO:{data}:{int(obrigacao_id)}:"
+        f"{float(valor):.2f}:{float(juros or 0):.2f}:{float(multa or 0):.2f}:{float(desconto or 0):.2f}:"
+        f"{forma}:{origem}"
+    )
+
+    svc = LedgerService(db_path=db_path)
+    id_saida, id_mov, id_evento = svc.pagar_parcela_boleto(
+        data=data,
+        valor=float(valor),
+        forma_pagamento=forma,
+        origem=origem,
+        obrigacao_id=int(obrigacao_id),
+        usuario=usuario,
+        categoria="Boletos",            # cabeçalho da saída
+        sub_categoria=sub_categoria,     # exibe na saída
+        descricao=descricao,
+        trans_uid=trans_uid,
+        juros=float(juros or 0.0),
+        multa=float(multa or 0.0),
+        desconto=float(desconto or 0.0),
+    )
+
+    return {
+        "ok": True,
+        "id_saida": id_saida,
+        "id_mov_bancaria": id_mov,
+        "id_evento_cap": id_evento,
+        "trans_uid": trans_uid,
+    }
+
+
+# --- LISTAGEM: Boletos em aberto ---------------------------------------------
+def listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
+    """
+    Lista parcelas de BOLETO em aberto, mostrando o VALOR EM ABERTO.
     em_aberto = valor_evento - valor_pago_acumulado
     Saída: [{label, obrigacao_id, parcela_id, credor, vencimento, valor_evento, pago_acumulado, em_aberto}]
+    Requer: _resolver_colunas_evento_e_pago(conn) já definido no módulo.
     """
+    eps = 0.005
+
     with get_conn(caminho_banco) as conn:
         col_evento, col_pago = _resolver_colunas_evento_e_pago(conn)
         sel_pago = f", COALESCE({col_pago}, 0.0) AS valor_pago_acum" if col_pago else ", 0.0 AS valor_pago_acum"
@@ -745,7 +813,8 @@ def _listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
                 {sel_pago},
                 UPPER(TRIM(COALESCE(tipo_obrigacao,''))) AS u_tipo
             FROM contas_a_pagar_mov
-            WHERE UPPER(COALESCE(status, 'EM ABERTO')) IN ('EM ABERTO', 'PARCIAL')
+            WHERE categoria_evento = 'LANCAMENTO'
+              AND UPPER(COALESCE(status, 'EM ABERTO')) IN ('EM ABERTO', 'PARCIAL')
             ORDER BY DATE(vencimento) ASC, credor ASC, parcela_num ASC
             """,
             conn,
@@ -754,14 +823,14 @@ def _listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
     if df is None or df.empty:
         return []
 
-    # aceita BOLETO ou variações
+    # aceita BOLETO ou variações (ex: 'BOLETO XYZ')
     df = df[(df["u_tipo"] == "BOLETO") | (df["u_tipo"].str.startswith("BOLETO"))]
     if df.empty:
         return []
 
     # em_aberto = max(valor_evento - valor_pago_acum, 0)
     df["em_aberto"] = (df["valor_evento"] - df["valor_pago_acum"]).clip(lower=0.0)
-    df = df[df["em_aberto"] > 0.0]
+    df = df[df["em_aberto"] > eps]  # evita listar valores residuais por arredondamento
 
     def _fmt_row(r):
         credor = (r["credor"] or "").strip() or "(sem credor)"
@@ -788,3 +857,10 @@ def _listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
         }
 
     return [_fmt_row(r) for _, r in df.iterrows()]
+
+
+__all__ = [
+    "pagar_boleto_action",
+    "listar_boletos_em_aberto",
+    "_listar_boletos_em_aberto",
+]
