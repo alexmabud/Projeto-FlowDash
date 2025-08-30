@@ -123,7 +123,7 @@ def render_transferencia(
         return
 
     # Toggle do formulário
-    if st.button("🔁 Transferência entre Bancos", use_container_width=True, key=_BTN_TOGGLE_KEY):
+    if st.button("🔁 Transferência Bancos", use_container_width=True, key=_BTN_TOGGLE_KEY):
         toggle_form()
 
     if not form_visivel():

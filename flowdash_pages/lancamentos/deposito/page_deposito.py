@@ -133,7 +133,7 @@ def render_deposito(
         return
 
     # Toggle do formulário
-    if st.button("🏦 Depósito (Caixa 2 → Banco)", use_container_width=True, key="btn_dep_toggle"):
+    if st.button("🏦 Depósito Bancário", use_container_width=True, key="btn_dep_toggle"):
         toggle_form()
 
     if not form_visivel():
