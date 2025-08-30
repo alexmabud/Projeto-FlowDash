@@ -131,15 +131,13 @@ def render_form_saida(
                 if not itens:
                     st.warning("Não há parcelas de empréstimos/financiamentos em aberto.")
                 else:
-                    # Esperado: cada item com "label" (ex: "Banco X • Parcela 3/12 • Venc 10/09 • R$ 500,00")
-                    # e "obrigacao_id" (id da obrigação/parcelamento). Opcional: "parcela_id".
                     opcoes = [i["label"] for i in itens]
                     escolha = st.selectbox("Selecione a parcela em aberto", opcoes, key="emp_parcela_em_aberto", on_change=invalidate_cb)
                     if escolha:
                         it = next(i for i in itens if i["label"] == escolha)
                         destino_pagamento_sel = it.get("credor") or it.get("banco") or it.get("descricao") or ""
                         obrigacao_id_emp = int(it.get("obrigacao_id"))
-                        parcela_emp_escolhida = it  # guarda o dict inteiro (tem infos úteis)
+                        parcela_emp_escolhida = it
                         st.caption(
                             f"Selecionado: {destino_pagamento_sel} • obrigação #{obrigacao_id_emp}"
                             + (f" • parcela #{it.get('parcela_id')}" if it.get("parcela_id") else "")
@@ -174,8 +172,6 @@ def render_form_saida(
                 if not boletos:
                     st.warning("Não há boletos em aberto.")
                 else:
-                    # Esperado: cada item com "label" (ex: "Fornecedor Y • Parc 2/6 • Venc 12/09 • R$ 320,00")
-                    # e "obrigacao_id". Opcional: "parcela_id", "credor".
                     opcoes = [b["label"] for b in boletos]
                     escolha = st.selectbox("Selecione o boleto/parcela em aberto", opcoes, key="boleto_em_aberto", on_change=invalidate_cb)
                     if escolha:
@@ -220,7 +216,6 @@ def render_form_saida(
             subcat_nome = st.text_input("Subcategoria (digite)", key="subcategoria_saida_text")
 
     # ===================== CAMPOS CONDICIONAIS À FORMA =====================
-    # Sinalizador: esconder campo de descrição quando for Pagamentos desses 3 tipos
     esconder_descricao = bool(
         is_pagamentos and (tipo_pagamento_sel in ["Fatura Cartão de Crédito", "Empréstimos e Financiamentos", "Boletos"])
     )
@@ -233,7 +228,6 @@ def render_form_saida(
     credor_boleto = ""
     documento = ""  # compatibilidade
 
-    # descrição digitada (usada para CONTAS A PAGAR quando permitido)
     descricao_digitada = ""
 
     if forma_pagamento == "CRÉDITO":
@@ -303,6 +297,9 @@ def render_form_saida(
     st.info("\n".join([l for l in linhas_md if l != ""]))
 
     confirmado = st.checkbox("Está tudo certo com os dados acima?", key="confirmar_saida")
+
+    # Mensagem fixa sob o checkbox (não some, não muda)
+    st.info("Confirme os dados para habilitar o botão de salvar.")
 
     # --------- mapear 'credor' por forma ----------
     credor_val = ""

@@ -1,38 +1,26 @@
 """
-service_ledger_fatura.py — Fatura de cartão (pagamento).
+Fatura de cartão (pagamento).
 
-Resumo:
-    Pagamento de fatura de cartão de crédito (FATURA_CARTAO), com suporte a
-    multa/juros/desconto, atualização de saldos (caixa/banco) e registros
-    contábeis (saida, movimentacoes_bancarias, CAP).
+Pagamento de fatura de cartão de crédito (`FATURA_CARTAO`), com suporte a
+multa/juros/desconto, atualização de saldos (caixa/banco) e registros
+contábeis (`saida`, `movimentacoes_bancarias`, CAP).
 
 Responsabilidades:
-    - Debitar do caixa ou banco a saída correspondente (com ajustes).
-    - Registrar evento de pagamento em CAP e aplicar detalhamento na parcela.
-    - Manter status/consistência da obrigação.
-
-Depende de:
-    - shared.db.get_conn
-    - shared.ids.sanitize
-    - self.cap_repo (obter_saldo_obrigacao, registrar_pagamento, aplicar_pagamento_parcela)
-    - self._garantir_linha_saldos_caixas, self._ajustar_banco_dynamic (e, opcionalmente, _garantir_linha_saldos_bancos)
-
-Notas de segurança:
-    - SQL apenas com parâmetros (?).
-    - Atualização do saldo de caixas com coluna **whitelist** (evita injeção).
+- Debitar do caixa ou banco a saída correspondente (com ajustes).
+- Aplicar pagamento parcial ou total via `aplicar_pagamento_parcela` (NÃO forçar quitação).
+- Manter status/consistência da obrigação (PARCIAL até atingir QUITADO).
 """
 
 from __future__ import annotations
 
 # -----------------------------------------------------------------------------
-# Imports + bootstrap de caminho (robusto em execuções via Streamlit)
+# Imports
 # -----------------------------------------------------------------------------
 import logging
-from typing import Optional, Tuple
-from datetime import datetime  # ⬅️ para data_hora
-
 import os
 import sys
+from datetime import datetime
+from typing import Optional, Tuple
 
 # Garante que a raiz do projeto (<raiz>/services/ledger/..) esteja no sys.path
 _CURRENT_DIR = os.path.dirname(__file__)
@@ -43,7 +31,10 @@ if _PROJECT_ROOT not in sys.path:
 # Internos
 from shared.db import get_conn  # noqa: E402
 from shared.ids import sanitize  # noqa: E402
-from services.ledger.service_ledger_infra import _ensure_mov_cols  # ⬅️ garante colunas no log
+from services.ledger.service_ledger_infra import (  # noqa: E402
+    _fmt_obs_saida,
+    log_mov_bancaria,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +48,9 @@ class _FaturaLedgerMixin:
         self,
         *,
         data: str,
-        valor: float,
-        forma_pagamento: str,
-        origem: str,
+        valor: float,                 # valor BASE que deseja pagar (sem ajustes)
+        forma_pagamento: str,         # "DINHEIRO" | "PIX" | "DÉBITO"
+        origem: str,                  # "Caixa"/"Caixa 2" OU nome do banco
         obrigacao_id: int,
         usuario: str,
         categoria: Optional[str] = "Fatura Cartão de Crédito",
@@ -69,33 +60,31 @@ class _FaturaLedgerMixin:
         multa: float = 0.0,
         juros: float = 0.0,
         desconto: float = 0.0,
-    ) -> tuple[int, int, int]:
-        """
-        Paga a fatura (obrigacao_id) e registra todos os efeitos financeiros.
-
-        Retorna:
-            (id_saida, id_mov_bancaria, id_evento_cap)
-        """
-        v_pg = max(0.0, float(valor))
+        retornar_info: bool = False,  # <-- NOVO: retorna (restante, status) se True
+    ) -> Tuple[int, int, int]:
+        # Sanitização/normalização
+        v_pg    = max(0.0, float(valor))
         v_multa = max(0.0, float(multa or 0.0))
         v_juros = max(0.0, float(juros or 0.0))
-        v_desc = max(0.0, float(desconto or 0.0))
+        v_desc  = max(0.0, float(desconto or 0.0))
 
-        cat = sanitize(categoria)
-        sub = sanitize(sub_categoria)
+        cat  = sanitize(categoria)
+        sub  = sanitize(sub_categoria)
         desc = sanitize(descricao)
-        usu = sanitize(usuario)
-        org = sanitize(origem)
+        usu  = sanitize(usuario)
+        org  = sanitize(origem)
 
-        eps = 0.005  # tolerância p/ ponto flutuante
+        eps = 0.005  # tolerância
 
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
-            # localizar a parcela/LANCAMENTO da fatura
+            # 1) Localiza a parcela/LANCAMENTO base
             row = cur.execute(
                 """
-                SELECT id, COALESCE(valor_evento,0.0) AS valor_parcela
+                SELECT id,
+                       COALESCE(valor_evento,0.0)         AS valor_parcela,
+                       COALESCE(valor_pago_acumulado,0.0) AS valor_pago_acumulado
                   FROM contas_a_pagar_mov
                  WHERE obrigacao_id = ?
                    AND categoria_evento = 'LANCAMENTO'
@@ -107,154 +96,184 @@ class _FaturaLedgerMixin:
             if not row:
                 raise ValueError(f"Fatura (obrigacao_id={obrigacao_id}) não encontrada.")
 
-            parcela_id = int(row[0])
-            valor_parcela = float(row[1])
+            parcela_id            = int(row[0])
+            valor_parcela         = float(row[1])
+            valor_pago_acumulado  = float(row[2])
 
-            # calcular total a debitar considerando ajustes
-            saldo_atual = self.cap_repo.obter_saldo_obrigacao(conn, int(obrigacao_id))
-            valor_a_pagar = min(v_pg, max(saldo_atual, 0.0))
-            total_saida = max(round(valor_a_pagar + v_multa + v_juros - v_desc, 2), 0.0)
+            # 2) Totais — CLAMP pelo RESTANTE da própria parcela (não pelo saldo do repo)
+            restante_antes     = max(0.0, valor_parcela - valor_pago_acumulado)
+            principal_a_pagar  = min(v_pg, restante_antes)  # aplica no acumulado até o restante
 
-            # OBS textual de ajustes
-            resumo_aj = []
-            if v_multa > 0:
-                resumo_aj.append(f"multa R$ {v_multa:.2f}")
-            if v_juros > 0:
-                resumo_aj.append(f"juros R$ {v_juros:.2f}")
-            if v_desc > 0:
-                resumo_aj.append(f"desconto R$ {v_desc:.2f}")
-            obs_extra = (" | " + ", ".join(resumo_aj)) if resumo_aj else ""
+            # LÍQUIDO que sai do caixa/banco (nunca negativo)
+            total_saida  = round(principal_a_pagar + v_juros + v_multa - v_desc, 2)
+            if total_saida < 0:
+                total_saida = 0.0
 
-            # --- saída e ajuste de saldos
-            if forma_pagamento == "DINHEIRO":
-                self._garantir_linha_saldos_caixas(conn, data)
-                # coluna validada via whitelist
-                col_map = {"Caixa": "caixa", "Caixa 2": "caixa_2"}
-                col = col_map.get(org)
-                if not col:
-                    raise ValueError(f"Origem de dinheiro inválida para DINHEIRO: {org}")
+            # IDs padrão
+            id_saida  = -1
+            id_mov    = -1
 
-                cur.execute(
-                    """
-                    INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
-                                       Forma_de_Pagamento, Parcelas, Valor, Usuario,
-                                       Origem_Dinheiro, Banco_Saida)
-                    VALUES (?, ?, ?, ?, 'DINHEIRO', 1, ?, ?, ?, '')
-                    """,
-                    (data, cat, sub, desc, float(total_saida), usu, org),
-                )
-                id_saida = int(cur.lastrowid)
+            # 3) Observação para log (use o valor efetivamente desembolsado)
+            obs = _fmt_obs_saida(
+                forma=(forma_pagamento if total_saida > eps else "AJUSTE"),
+                valor=float(total_saida if total_saida > eps else 0.0),
+                categoria=cat,
+                subcategoria=sub,
+                descricao=desc,
+                banco=(org if (total_saida > eps and forma_pagamento == "DÉBITO") else None),
+            )
 
-                # Atualiza coluna validada
-                cur.execute(
-                    f"UPDATE saldos_caixas SET {col} = COALESCE({col},0) - ? WHERE data = ?",
-                    (float(total_saida), data),
-                )
-
-                # Log do pagamento em DINHEIRO — inclui usuario e data_hora
-                _ensure_mov_cols(cur)
-                obs = (f"Pagamento Fatura • {cat}/{sub or ''}").strip() + (f" - {desc}" if desc else "") + obs_extra
-                cur.execute(
-                    """
-                    INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao,
-                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
-                    VALUES (?, ?, 'saida', ?, 'saidas_fatura_pagamento', ?, 'saida', ?, ?, ?, ?)
-                    """,
-                    (
-                        data,
-                        org,  # "Caixa" ou "Caixa 2"
-                        float(total_saida),
-                        obs,
-                        id_saida,
-                        trans_uid,
-                        usu,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
-                )
-                id_mov = int(cur.lastrowid)
-            else:
-                # Banco: validação/ajuste dentro de _ajustar_banco_dynamic
-                try:
-                    self._garantir_linha_saldos_bancos(conn, data)  # se existir no serviço
-                except Exception:
-                    pass
-                self._ajustar_banco_dynamic(conn, banco_col=org, delta=-float(total_saida), data=data)
-
-                cur.execute(
-                    """
-                    INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
-                                       Forma_de_Pagamento, Parcelas, Valor, Usuario,
-                                       Origem_Dinheiro, Banco_Saida)
-                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', ?)
-                    """,
-                    (data, cat, sub, desc, forma_pagamento, float(total_saida), usu, org),
-                )
-                id_saida = int(cur.lastrowid)
-
-                # Log do pagamento via banco — inclui usuario e data_hora
-                _ensure_mov_cols(cur)
-                obs = (f"Pagamento Fatura • {cat}/{sub or ''}").strip() + (f" - {desc}" if desc else "") + obs_extra
-                cur.execute(
-                    """
-                    INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao,
-                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
-                    VALUES (?, ?, 'saida', ?, 'saidas_fatura_pagamento', ?, 'saida', ?, ?, ?, ?)
-                    """,
-                    (
-                        data,
-                        org,  # nome do banco
-                        float(total_saida),
-                        obs,
-                        id_saida,
-                        trans_uid,
-                        usu,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
-                )
-                id_mov = int(cur.lastrowid)
-
-            # Se o usuário informou valor maior que o saldo, anotar no log
-            if v_pg > saldo_atual + eps:
-                cur.execute(
-                    """
-                    UPDATE movimentacoes_bancarias
-                       SET observacao = COALESCE(observacao,'') || ' [valor ajustado ao saldo: R$ ' || printf('%.2f', ?) || ']'
-                     WHERE id = ?
-                    """,
-                    (float(total_saida), id_mov),
-                )
-
-            # --- CAP: evento de pagamento + detalhamento na parcela
-            evento_id = 0
+            # 4) Efeito financeiro — só quando houver saída (> 0)
             if total_saida > eps:
-                evento_id = self.cap_repo.registrar_pagamento(
-                    conn,
-                    obrigacao_id=int(obrigacao_id),
-                    tipo_obrigacao="FATURA_CARTAO",
-                    valor_pago=float(total_saida),
-                    data_evento=data,
-                    forma_pagamento=forma_pagamento,
-                    origem=org,
-                    ledger_id=id_saida,
-                    usuario=usu,
-                )
+                if forma_pagamento == "DINHEIRO":
+                    self._garantir_linha_saldos_caixas(conn, data)
+                    col_map = {"Caixa": "caixa", "Caixa 2": "caixa_2"}
+                    col = col_map.get(org)
+                    if not col:
+                        raise ValueError(f"Origem de dinheiro inválida para DINHEIRO: {org}")
 
-            self.cap_repo.aplicar_pagamento_parcela(
+                    # saida
+                    cur.execute(
+                        """
+                        INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
+                                           Forma_de_Pagamento, Parcelas, Valor, Usuario,
+                                           Origem_Dinheiro, Banco_Saida)
+                        VALUES (?, ?, ?, ?, 'DINHEIRO', 1, ?, ?, ?, '')
+                        """,
+                        (data, cat, sub, desc, float(total_saida), usu, org),
+                    )
+                    id_saida = int(cur.lastrowid)
+
+                    # saldo caixa
+                    cur.execute(
+                        f"UPDATE saldos_caixas SET {col} = COALESCE({col},0) - ? WHERE data = ?",
+                        (float(total_saida), data),
+                    )
+
+                    # log
+                    id_mov = log_mov_bancaria(
+                        conn,
+                        data=data,
+                        banco=org,
+                        tipo="saida",
+                        valor=float(total_saida),
+                        origem="saidas_fatura_pagamento",
+                        observacao=obs,
+                        usuario=usu,
+                        referencia_tabela="saida",
+                        referencia_id=id_saida,
+                        trans_uid=trans_uid,
+                        data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                else:
+                    # Bancos
+                    try:
+                        self._garantir_linha_saldos_bancos(conn, data)
+                    except Exception:
+                        pass
+
+                    self._ajustar_banco_dynamic(conn, banco_col=org, delta=-float(total_saida), data=data)
+
+                    cur.execute(
+                        """
+                        INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
+                                           Forma_de_Pagamento, Parcelas, Valor, Usuario,
+                                           Origem_Dinheiro, Banco_Saida)
+                        VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', ?)
+                        """,
+                        (data, cat, sub, desc, forma_pagamento, float(total_saida), usu, org),
+                    )
+                    id_saida = int(cur.lastrowid)
+
+                    id_mov = log_mov_bancaria(
+                        conn,
+                        data=data,
+                        banco=org,
+                        tipo="saida",
+                        valor=float(total_saida),
+                        origem="saidas_fatura_pagamento",
+                        observacao=obs,
+                        usuario=usu,
+                        referencia_tabela="saida",
+                        referencia_id=id_saida,
+                        trans_uid=trans_uid,
+                        data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+
+                # anotação extra quando pediu mais do que o restante
+                if v_pg > restante_antes + eps and id_mov != -1:
+                    cur.execute(
+                        """
+                        UPDATE movimentacoes_bancarias
+                           SET observacao = COALESCE(observacao,'') || ' [valor ajustado ao restante: R$ ' || printf('%.2f', ?) || ']'
+                         WHERE id = ?
+                        """,
+                        (float(total_saida), id_mov),
+                    )
+
+            # 5) APLICAÇÃO NA CAP — PARCIAL/TOTAL (não forçar quitação)
+            res = self.cap_repo.aplicar_pagamento_parcela(
                 conn,
-                parcela_id=parcela_id,
-                valor_parcela=float(valor_parcela),
-                valor_pago_total=float(total_saida),
+                parcela_id=int(parcela_id),
+                valor_base=float(principal_a_pagar),
                 juros=float(v_juros),
                 multa=float(v_multa),
                 desconto=float(v_desc),
+                data_evento=data,
+                forma_pagamento=forma_pagamento,
+                origem=org,
+                ledger_id=(id_saida if id_saida != -1 else 0),
+                usuario=usu,
             )
+            evento_id = int((res.get("id_evento_cap") or -1)) if isinstance(res, dict) else -1
+
+            # 6) Coletar restante/status para a UI (sem quebrar se o repo não retornar)
+            if isinstance(res, dict):
+                restante = float(res.get("restante")) if res.get("restante") is not None else None
+                status   = str(res.get("status"))   if res.get("status")   is not None else None
+            else:
+                restante = None
+                status   = None
+
+            if restante is None or status is None:
+                # Fallback: consulta a mesma parcela p/ calcular
+                row2 = cur.execute(
+                    "SELECT COALESCE(valor_evento,0), COALESCE(valor_pago_acumulado,0) FROM contas_a_pagar_mov WHERE id=?",
+                    (parcela_id,),
+                ).fetchone()
+                if row2:
+                    valor_evento_atual, pago_acum_atual = float(row2[0]), float(row2[1])
+                    restante_calc = max(0.0, valor_evento_atual - pago_acum_atual)
+                    restante = round(restante_calc, 2)
+                    if pago_acum_atual >= valor_evento_atual - eps:
+                        status = "QUITADO"
+                    elif pago_acum_atual > 0:
+                        status = "Parcial"
+                    else:
+                        status = "Em aberto"
+                else:
+                    # não encontrou a linha (não deveria acontecer)
+                    restante = 0.0
+                    status = "Em aberto"
 
             conn.commit()
 
         logger.debug(
-            "pagar_fatura_cartao: obrig=%s total=%.2f forma=%s origem=%s saida=%s mov=%s evento=%s",
-            obrigacao_id, total_saida, forma_pagamento, org, id_saida, id_mov, evento_id
+            "pagar_fatura_cartao: obrig=%s total_saida=%.2f principal_aplicado=%.2f forma=%s origem=%s saida=%s mov=%s evento=%s restante=%.2f status=%s",
+            obrigacao_id,
+            total_saida,
+            principal_a_pagar,
+            forma_pagamento,
+            org,
+            id_saida,
+            id_mov,
+            evento_id,
+            float(restante or 0.0),
+            status,
         )
-        return (id_saida, id_mov, int(evento_id))
+
+        if retornar_info:
+            # (id_saida, id_mov, evento_id, restante, status)
+            return (id_saida, id_mov, evento_id, float(restante), str(status))
+        # compat: retorno antigo
+        return (id_saida, id_mov, evento_id)

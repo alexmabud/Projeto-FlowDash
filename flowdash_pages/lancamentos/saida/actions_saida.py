@@ -23,7 +23,10 @@ import pandas as pd
 
 from shared.db import get_conn
 from services.ledger import LedgerService
-from repository.cartoes_repository import CartoesRepository, listar_destinos_fatura_em_aberto
+
+from repository.cartoes_repository import CartoesRepository
+
+
 from repository.categorias_repository import CategoriasRepository
 from flowdash_pages.cadastros.cadastro_classes import BancoRepository
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository  # compat
@@ -148,74 +151,8 @@ def _resolver_colunas_evento_e_pago(conn) -> tuple[str, Optional[str]]:
 
 
 # ---------------- Providers NOVOS (mostram VALOR EM ABERTO no label)
-def _listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
-    """
-    Lista parcelas de BOLETO em aberto/parcial, mostrando o VALOR EM ABERTO no label.
-    em_aberto = valor_evento - valor_pago_acumulado
-    Saída: [{label, obrigacao_id, parcela_id, credor, vencimento, valor_evento, pago_acumulado, em_aberto}]
-    """
-    with get_conn(caminho_banco) as conn:
-        col_evento, col_pago = _resolver_colunas_evento_e_pago(conn)
-        sel_pago = f", COALESCE({col_pago}, 0.0) AS valor_pago_acum" if col_pago else ", 0.0 AS valor_pago_acum"
 
-        df = pd.read_sql(
-            f"""
-            SELECT
-                id                           AS parcela_id,
-                COALESCE(obrigacao_id, 0)    AS obrigacao_id,
-                TRIM(COALESCE(credor, ''))   AS credor,
-                COALESCE(parcela_num, 1)     AS parcela_num,
-                COALESCE(parcelas_total, 1)  AS parcelas_total,
-                DATE(vencimento)             AS vencimento,
-                COALESCE({col_evento}, 0.0)  AS valor_evento
-                {sel_pago},
-                UPPER(TRIM(COALESCE(tipo_obrigacao,''))) AS u_tipo
-            FROM contas_a_pagar_mov
-            WHERE UPPER(COALESCE(status, 'EM ABERTO')) IN ('EM ABERTO', 'PARCIAL')
-            ORDER BY DATE(vencimento) ASC, credor ASC, parcela_num ASC
-            """,
-            conn,
-        )
 
-    if df is None or df.empty:
-        return []
-
-    # aceita BOLETO ou variações que começam com 'BOLETO'
-    df = df[(df["u_tipo"] == "BOLETO") | (df["u_tipo"].str.startswith("BOLETO"))]
-    if df.empty:
-        return []
-
-    # calcula em_aberto = max(valor_evento - valor_pago_acum, 0)
-    df["em_aberto"] = (df["valor_evento"] - df["valor_pago_acum"]).clip(lower=0.0)
-
-    # 🔒 Hotfix: remover registros “fantasma” com em_aberto <= 0
-    df = df[df["em_aberto"] > 0.0]
-
-    def _fmt_row(r):
-        credor = (r["credor"] or "").strip() or "(sem credor)"
-        par    = int(r["parcela_num"] or 1)
-        tot    = int(r["parcelas_total"] or par)
-        venc   = str(r["vencimento"] or "")
-        try:
-            venc_pt = pd.to_datetime(venc).strftime("%d/%m/%Y") if venc else "—"
-        except Exception:
-            venc_pt = "—"
-        em_aberto = float(r["em_aberto"] or 0.0)
-        rotulo = f"{credor} • Parc {par}/{tot} • Venc {venc_pt} • R$ {em_aberto:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return {
-            "label": rotulo,
-            "obrigacao_id": int(r["obrigacao_id"] or 0),
-            "parcela_id": int(r["parcela_id"]),
-            "credor": credor,
-            "vencimento": venc,
-            "valor_evento": float(r["valor_evento"] or 0.0),
-            "pago_acumulado": float(r["valor_pago_acum"] or 0.0),
-            "em_aberto": em_aberto,
-            "parcela_num": par,
-            "parcelas_total": tot,
-        }
-
-    return [_fmt_row(r) for _, r in df.iterrows()]
 
 
 def _listar_empfin_em_aberto(caminho_banco: str) -> list[dict]:
@@ -297,6 +234,37 @@ class ResultadoSaida(TypedDict):
     ok: bool
     msg: str
 
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+
+def _listar_faturas_cartao_abertas_dropdown(caminho_banco: str) -> list[dict]:
+    repo = ContasAPagarMovRepository(caminho_banco)
+    faturas = repo.listar_faturas_cartao_abertas()
+    opcoes = []
+    for f in faturas:
+        credor = (f.get("credor") or "").strip()
+        comp   = (f.get("competencia") or "").strip()
+        if credor or comp:
+            titulo = f"{credor} {comp}".strip()
+        else:
+            desc = (f.get("descricao") or "").strip()
+            data = (f.get("data_evento") or "").strip()
+            titulo = f"{desc} {data}".strip()
+        rotulo = f"Fatura  {titulo} — R$ {float(f.get('saldo_restante', 0.0)):.2f}"
+        opcoes.append({
+            "label": rotulo,
+            "parcela_id": int(f["parcela_id"]),
+            "obrigacao_id": int(f["obrigacao_id"]),
+            "saldo_restante": float(f.get("saldo_restante", 0.0)),
+            "valor_total": float(f.get("valor_total", 0.0)),
+            "status": f.get("status", "Em aberto"),
+            "credor": credor,
+            "competencia": comp,
+            "raw": f,
+        })
+    return opcoes
+
+
+
 
 # ---------------- Carregamentos para a UI (listas)
 def carregar_listas_para_form(
@@ -334,12 +302,13 @@ def carregar_listas_para_form(
         nomes_bancos,
         nomes_cartoes,
         df_categorias,
-        cats_repo.listar_subcategorias,                       # fn(cat_id)->DataFrame
-        lambda: listar_destinos_fatura_em_aberto(caminho_banco),  # fn()->list[dict]
-        lambda tipo: _opcoes_pagamentos(caminho_banco, tipo),     # legacy/compat
-        lambda: _listar_boletos_em_aberto(caminho_banco),         # fn()->list[dict]
-        lambda: _listar_empfin_em_aberto(caminho_banco),          # fn()->list[dict]
+        cats_repo.listar_subcategorias,
+        lambda: _listar_faturas_cartao_abertas_dropdown(caminho_banco),  # <- aqui
+        lambda tipo: _opcoes_pagamentos(caminho_banco, tipo),
+        lambda: _listar_boletos_em_aberto(caminho_banco),
+        lambda: _listar_empfin_em_aberto(caminho_banco),
     )
+
 
 
 # ---------------- Dispatcher principal (mantém as mesmas regras do original)
@@ -397,9 +366,51 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             raise ValueError("Informe um valor de pagamento > 0 ou ajustes (multa/juros/desconto).")
 
     if is_pagamentos and tipo_pagamento_sel == "Fatura Cartão de Crédito":
-        valor_digitado = float(valor_saida)
-        if valor_digitado <= 0 and (multa_fatura + juros_fatura - desconto_fatura) <= 0:
-            raise ValueError("Informe um valor de pagamento > 0 ou ajustes (multa/juros/desconto).")
+        origem = origem_dinheiro if forma_pagamento == "DINHEIRO" else _canonicalizar_banco_safe(caminho_banco, banco_escolhido_in)
+
+        # tentar pegar restante/status do Ledger (retornar_info=True)
+        res = ledger.pagar_fatura_cartao(
+            data=data_str,
+            valor=float(valor_saida),
+            forma_pagamento=forma_pagamento,
+            origem=origem,
+            obrigacao_id=int(obrigacao_id_fatura),
+            usuario=usuario_nome,
+            categoria="Fatura Cartão de Crédito",
+            sub_categoria=subcat_nome,
+            descricao=descricao_final,
+            multa=float(multa_fatura),
+            juros=float(juros_fatura),
+            desconto=float(desconto_fatura),
+            retornar_info=True,  # <<-- NOVO
+        )
+
+        # compat: lidar com retorno (3 ou 5 itens)
+        if isinstance(res, tuple) and len(res) >= 3:
+            id_saida, id_mov, id_cap = res[0], res[1], res[2]
+            if len(res) >= 5:
+                restante, status = float(res[3]), str(res[4])
+            else:
+                # fallback: consulta o restante direto da parcela
+                repo = ContasAPagarMovRepository(caminho_banco)
+                row = next((x for x in repo.listar_faturas_cartao_abertas() if int(x["obrigacao_id"]) == int(obrigacao_id_fatura)), None)
+                if row:
+                    restante = float(row["saldo_restante"])
+                    status = row.get("status", "Parcial")
+                else:
+                    restante, status = 0.0, "QUITADO"
+        else:
+            raise RuntimeError("Retorno inesperado do Ledger no pagamento de fatura.")
+
+        return {
+            "ok": True,
+            "msg": (
+                "ℹ️ Transação já registrada (idempotência)."
+                if id_saida == -1 or id_mov == -1 or id_cap == -1
+                else f"✅ Pagamento de fatura registrado! Pago (principal): R$ {float(valor_saida):.2f} | Restante: R$ {restante:.2f} | Status: {status} | Saída: {id_saida or '—'} | Log: {id_mov or '—'} | Evento CAP: {id_cap or '—'}"
+            ),
+        }
+
 
     if is_pagamentos and tipo_pagamento_sel == "Empréstimos e Financiamentos":
         valor_digitado = float(valor_saida)
@@ -629,3 +640,151 @@ def _canonicalizar_banco_safe(caminho_banco: str, banco_in: str) -> str:
         return canonicalizar_banco(caminho_banco, (banco_in or "").strip()) or (banco_in or "").strip()
     except Exception:
         return (banco_in or "").strip()
+
+
+def _listar_faturas_cartao_abertas_dropdown(caminho_banco: str) -> list[dict]:
+    """
+    Lê direto de contas_a_pagar_mov para montar o dropdown de faturas
+    usando credor + competencia (fallback: descricao + data_evento).
+    """
+    import pandas as pd
+    from shared.db import get_conn
+
+    SQL = """
+    SELECT
+        id                                        AS parcela_id,
+        obrigacao_id,
+        TRIM(COALESCE(credor, ''))                AS credor,
+        CASE
+            WHEN TRIM(COALESCE(competencia, '')) <> ''
+                THEN TRIM(competencia)
+            WHEN TRIM(COALESCE(data_evento, '')) <> ''
+                THEN strftime('%Y-%m', DATE(data_evento))
+            ELSE ''
+        END                                        AS competencia,
+        COALESCE(descricao, '')                    AS descricao,
+        COALESCE(data_evento, '')                  AS data_evento,
+        COALESCE(valor_evento, 0.0)                AS valor_total,
+        COALESCE(valor_pago_acumulado, 0.0)        AS valor_pago,
+        ROUND(
+            CASE
+                WHEN (COALESCE(valor_evento,0) - COALESCE(valor_pago_acumulado,0)) < 0
+                    THEN 0
+                ELSE (COALESCE(valor_evento,0) - COALESCE(valor_pago_acumulado,0))
+            END, 2
+        )                                          AS saldo_restante,
+        COALESCE(status, 'Em aberto')              AS status
+    FROM contas_a_pagar_mov
+    WHERE categoria_evento = 'LANCAMENTO'
+      AND (tipo_obrigacao = 'FATURA_CARTAO' OR tipo_origem = 'FATURA_CARTAO')
+      AND (COALESCE(valor_evento,0) - COALESCE(valor_pago_acumulado,0)) > 0.005
+    ORDER BY date(COALESCE(data_evento, '1970-01-01')) ASC, id ASC
+    """
+
+    opcoes: list[dict] = []
+    with get_conn(caminho_banco) as conn:
+        df = pd.read_sql(SQL, conn)
+
+    if df is None or df.empty:
+        return opcoes
+
+    for _, r in df.iterrows():
+        credor = (str(r.get("credor") or "")).strip()
+        comp   = (str(r.get("competencia") or "")).strip()
+        # opcional: formatar competencia YYYY-MM -> MM/YYYY
+        if len(comp) == 7 and comp[4] == "-":
+            comp_fmt = f"{comp[5:7]}/{comp[0:4]}"
+        else:
+            comp_fmt = comp
+
+        if credor or comp_fmt:
+            titulo = f"{credor} {comp_fmt}".strip()
+        else:
+            desc = (str(r.get("descricao") or "")).strip()
+            data = (str(r.get("data_evento") or "")).strip()
+            titulo = f"{desc} {data}".strip()
+
+        rotulo = f"Fatura  {titulo} — R$ {float(r.get('saldo_restante', 0.0)):.2f}"
+
+        opcoes.append({
+            "label": rotulo,
+            "parcela_id": int(r["parcela_id"]),
+            "obrigacao_id": int(r["obrigacao_id"]),
+            "saldo_restante": float(r.get("saldo_restante", 0.0)),
+            "valor_total": float(r.get("valor_total", 0.0)),
+            "status": r.get("status", "Em aberto"),
+            "credor": credor,
+            "competencia": comp_fmt,
+            "raw": {k: (None if pd.isna(v) else v) for k, v in r.items()},
+        })
+
+    return opcoes
+
+
+
+def _listar_boletos_em_aberto(caminho_banco: str) -> list[dict]:
+    """
+    Lista parcelas de BOLETO em aberto/parcial, mostrando o VALOR EM ABERTO.
+    em_aberto = valor_evento - valor_pago_acumulado
+    Saída: [{label, obrigacao_id, parcela_id, credor, vencimento, valor_evento, pago_acumulado, em_aberto}]
+    """
+    with get_conn(caminho_banco) as conn:
+        col_evento, col_pago = _resolver_colunas_evento_e_pago(conn)
+        sel_pago = f", COALESCE({col_pago}, 0.0) AS valor_pago_acum" if col_pago else ", 0.0 AS valor_pago_acum"
+
+        df = pd.read_sql(
+            f"""
+            SELECT
+                id                           AS parcela_id,
+                COALESCE(obrigacao_id, 0)    AS obrigacao_id,
+                TRIM(COALESCE(credor, ''))   AS credor,
+                COALESCE(parcela_num, 1)     AS parcela_num,
+                COALESCE(parcelas_total, 1)  AS parcelas_total,
+                DATE(vencimento)             AS vencimento,
+                COALESCE({col_evento}, 0.0)  AS valor_evento
+                {sel_pago},
+                UPPER(TRIM(COALESCE(tipo_obrigacao,''))) AS u_tipo
+            FROM contas_a_pagar_mov
+            WHERE UPPER(COALESCE(status, 'EM ABERTO')) IN ('EM ABERTO', 'PARCIAL')
+            ORDER BY DATE(vencimento) ASC, credor ASC, parcela_num ASC
+            """,
+            conn,
+        )
+
+    if df is None or df.empty:
+        return []
+
+    # aceita BOLETO ou variações
+    df = df[(df["u_tipo"] == "BOLETO") | (df["u_tipo"].str.startswith("BOLETO"))]
+    if df.empty:
+        return []
+
+    # em_aberto = max(valor_evento - valor_pago_acum, 0)
+    df["em_aberto"] = (df["valor_evento"] - df["valor_pago_acum"]).clip(lower=0.0)
+    df = df[df["em_aberto"] > 0.0]
+
+    def _fmt_row(r):
+        credor = (r["credor"] or "").strip() or "(sem credor)"
+        par    = int(r["parcela_num"] or 1)
+        tot    = int(r["parcelas_total"] or par)
+        venc   = str(r["vencimento"] or "")
+        try:
+            venc_pt = pd.to_datetime(venc).strftime("%d/%m/%Y") if venc else "—"
+        except Exception:
+            venc_pt = "—"
+        em_aberto = float(r["em_aberto"] or 0.0)
+        rotulo = f"{credor} • Parc {par}/{tot} • Venc {venc_pt} • R$ {em_aberto:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return {
+            "label": rotulo,
+            "obrigacao_id": int(r["obrigacao_id"] or 0),
+            "parcela_id": int(r["parcela_id"]),
+            "credor": credor,
+            "vencimento": venc,
+            "valor_evento": float(r["valor_evento"] or 0.0),
+            "pago_acumulado": float(r["valor_pago_acum"] or 0.0),
+            "em_aberto": em_aberto,
+            "parcela_num": par,
+            "parcelas_total": tot,
+        }
+
+    return [_fmt_row(r) for _, r in df.iterrows()]

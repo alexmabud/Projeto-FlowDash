@@ -22,6 +22,7 @@ Detalhes técnicos
 from __future__ import annotations
 
 from typing import Optional, Any
+import inspect
 from repository.contas_a_pagar_mov_repository.types import TipoObrigacao
 
 
@@ -50,6 +51,13 @@ class EventsMixin(object):
         # BaseRepo deve fornecer _get_conn()
         return self._get_conn()  # type: ignore[attr-defined]
 
+    def _supports_param(self, fn: Any, name: str) -> bool:
+        """Verifica se `fn` aceita um parâmetro chamado `name`."""
+        try:
+            return name in inspect.signature(fn).parameters
+        except Exception:
+            return False
+
     # ---------------------------------------------------------------------
     # Eventos
     # ---------------------------------------------------------------------
@@ -68,6 +76,10 @@ class EventsMixin(object):
         parcela_num: Optional[int],
         parcelas_total: Optional[int],
         usuario: str,
+        # >>> Correção: aceitar documento (opcional)
+        documento: Optional[str] = None,
+        # >>> Tolerância a extras para não quebrar chamadas antigas/variantes
+        **_extra: Any,
     ) -> int:
         """Registra um evento de **LANCAMENTO** (valor positivo)."""
         valor_total = float(valor_total)
@@ -86,8 +98,8 @@ class EventsMixin(object):
         )
 
         with self._conn_ctx(conn) as c:
-            return self._inserir_evento(  # BaseRepo
-                c,
+            # Monta kwargs básicos
+            kwargs = dict(
                 obrigacao_id=obrigacao_id,
                 tipo_obrigacao=tipo_obrigacao,
                 categoria_evento="LANCAMENTO",
@@ -104,6 +116,12 @@ class EventsMixin(object):
                 ledger_id=None,
                 usuario=usuario,
             )
+            # Passa documento somente se _inserir_evento suportar
+            if documento is not None and self._supports_param(self._inserir_evento, "documento"):
+                kwargs["documento"] = documento
+
+            # Chamada final
+            return self._inserir_evento(c, **kwargs)  # BaseRepo
 
     def registrar_pagamento(
         self,
@@ -117,6 +135,7 @@ class EventsMixin(object):
         origem: str,
         ledger_id: int,
         usuario: str,
+        **_extra: Any,
     ) -> int:
         """Registra um evento de **PAGAMENTO** (valor negativo)."""
         valor_pago = float(valor_pago)
@@ -163,6 +182,7 @@ class EventsMixin(object):
         descricao: Optional[str],
         credor: Optional[str],
         usuario: str,
+        **_extra: Any,
     ) -> int:
         """
         Registra um evento de **AJUSTE** (legado).

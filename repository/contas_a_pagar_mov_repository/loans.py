@@ -215,15 +215,15 @@ class LoansMixin(object):
 
                 if p <= ja_pagas:
                     # quitada: aplica pagamento “dentro” do próprio lançamento (status vira Quitado)
-                    self.aplicar_pagamento_parcela(
-                        c,
-                        parcela_id=int(lancamento_id),
-                        valor_parcela=float(vparc),
-                        valor_pago_total=float(vparc),
-                        juros=0.0,
-                        multa=0.0,
-                        desconto=0.0,
-                    )
+                    payload = {
+                        "parcela_id": int(lancamento_id),
+                        "valor_pago": float(vparc),   # TOTAL pago = valor da parcela
+                        "juros": 0.0,
+                        "multa": 0.0,
+                        "desconto": 0.0,
+                        "data_pagamento": venc_str,   # marca no dia do vencimento da parcela
+                    }
+                    self.aplicar_pagamento_parcela(c, payload)
                     marcadas_quitadas += 1
                 else:
                     # força status 'Em aberto'

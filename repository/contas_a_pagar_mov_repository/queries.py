@@ -177,6 +177,45 @@ class QueriesMixin(object):
             else:
                 return pd.read_sql(sql, c)
 
+    def listar_faturas_cartao_abertas(self, conn=None):
+        """
+        Retorna LANCAMENTOS de FATURA_CARTAO com saldo > 0,
+        já trazendo o saldo_restante (principal pendente).
+        """
+        with self._conn_ctx(conn) as c:
+            cur = c.cursor()
+            rows = cur.execute(
+                """
+                SELECT
+                    id                                     AS parcela_id,
+                    obrigacao_id,
+                    COALESCE(descricao, '')                AS descricao,
+                    COALESCE(data_evento, '')              AS data_evento,
+                    COALESCE(valor_evento, 0.0)            AS valor_total,
+                    COALESCE(valor_pago_acumulado, 0.0)    AS valor_pago,
+                    ROUND(
+                        CASE
+                            WHEN (COALESCE(valor_evento,0) - COALESCE(valor_pago_acumulado,0)) < 0
+                                THEN 0
+                            ELSE (COALESCE(valor_evento,0) - COALESCE(valor_pago_acumulado,0))
+                        END, 2
+                    ) AS saldo_restante,
+                    COALESCE(status, 'Em aberto')          AS status
+                FROM contas_a_pagar_mov
+                WHERE categoria_evento = 'LANCAMENTO'
+                AND (tipo_obrigacao = 'FATURA_CARTAO' OR tipo_origem = 'FATURA_CARTAO')
+                AND (COALESCE(valor_evento,0) - COALESCE(valor_pago_acumulado,0)) > 0.005
+                ORDER BY date(COALESCE(data_evento, '1970-01-01')) DESC, id DESC
+                """
+            ).fetchall()
+
+            # Converte para dict caso o row_factory não seja dict
+            try:
+                return [dict(r) for r in rows]
+            except Exception:
+                cols = [d[0] for d in cur.description]
+                return [{cols[i]: row[i] for i in range(len(cols))} for row in rows]
+
 
 # API pública explícita
 __all__ = ["QueriesMixin"]
