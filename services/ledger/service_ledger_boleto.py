@@ -11,8 +11,8 @@ Responsabilidades:
 - Atualizar saldos (caixas ou bancos) e logs em `movimentacoes_bancarias`.
 - Integrar com CAP:
     - Lançamento: `registrar_lancamento`
-    - Pagamento (QUITACAO TOTAL, sem resíduo): `aplicar_pagamento_parcela_quitacao_total`
-      (se valor informado for menor que o saldo, cai para parcial via `aplicar_pagamento_parcela`)
+    - Pagamento (PARCIAL ou TOTAL) via `aplicar_pagamento_parcela` (não força quitação; status e restante
+      são resolvidos pelo mixin de pagamentos).
 
 Dependências:
 - shared.db.get_conn (controle transacional feito pelo chamador deste mixin).
@@ -232,9 +232,9 @@ class BoletoMixin:
         self,
         *,
         data: str,
-        valor: float,
-        forma_pagamento: str,   # "DINHEIRO" | "PIX" | "DÉBITO"
-        origem: str,            # "Caixa"/"Caixa 2" ou nome do banco
+        valor: float,                 # valor BASE (principal) a aplicar na parcela
+        forma_pagamento: str,         # "DINHEIRO" | "PIX" | "DÉBITO"
+        origem: str,                  # "Caixa"/"Caixa 2" ou nome do banco
         obrigacao_id: int,
         usuario: str,
         categoria: Optional[str] = "Boletos",
@@ -246,12 +246,12 @@ class BoletoMixin:
         desconto: float = 0.0,
     ) -> Tuple[int, int, int]:
         """
-        Paga uma parcela de boleto ligada a `obrigacao_id`.
+        Paga uma parcela de boleto ligada a `obrigacao_id`, aplicando **valor BASE** no principal
+        (juros/multa/desconto são tratados como ajustes do desembolso).
 
-        - Se o valor informado for suficiente p/ quitar o principal, usa
-          `aplicar_pagamento_parcela_quitacao_total` (sem resíduo).
-        - Caso contrário, aplica pagamento **parcial** com `aplicar_pagamento_parcela`
-          (principal-only + acumuladores).
+        - Não forçamos quitação: usamos sempre `aplicar_pagamento_parcela` (como na fatura).
+          O mixin de pagamentos calcula `status`/`restante` automaticamente.
+        - O que **sai** do caixa/banco = principal_aplicado + juros + multa − desconto (nunca negativo).
 
         Retorna: (id_saida, id_mov_bancaria, id_evento_cap). Quando idempotente, retorna (-1, -1, -1).
         """
@@ -301,39 +301,35 @@ class BoletoMixin:
             pago_acum     = float(row[2])
             status_atual  = (row[3] or "").upper()
 
+            # Já quitada?
             if status_atual == "QUITADA" or (valor_parcela - pago_acum) <= eps:
                 logger.info("pagar_parcela_boleto: parcela já quitada (obrigacao_id=%s).", obrigacao_id)
                 return (-1, -1, -1)
 
-            # 2) Saldo atual do principal
-            saldo_principal = max(valor_parcela - pago_acum, 0.0)
+            # 2) RESTANTE e clamp do principal BASE
+            restante_antes     = max(0.0, valor_parcela - pago_acum)
+            principal_a_pagar  = min(v_pg, restante_antes)  # aplica no acumulado até o restante
 
-            # 3) Definir cenário: quitação total x parcial
-            principal_cliente = max(v_pg - v_desc, 0.0)  # o que o cliente trouxe para principal
-            quitacao_total = principal_cliente + eps >= saldo_principal
-
-            principal_efetivo = saldo_principal if quitacao_total else min(principal_cliente, saldo_principal)
-
-            # 4) Valor que sai do caixa/banco
-            total_saida = round(principal_efetivo + v_juros + v_multa - v_desc, 2)
+            # 3) LÍQUIDO que sai do caixa/banco (nunca negativo)
+            total_saida  = round(principal_a_pagar + v_juros + v_multa - v_desc, 2)
             if total_saida < 0:
                 total_saida = 0.0
 
-            id_saida = -1
-            id_mov   = -1
+            # IDs padrão
+            id_saida  = -1
+            id_mov    = -1
 
-            # 5) Observação padronizada (usa o valor final que saiu)
-            #    Obs.: por padrão não exibimos banco quando forma = PIX no cabeçalho.
+            # 4) Observação padronizada para log (usa o valor efetivamente desembolsado)
             obs = _fmt_obs_saida(
-                forma=forma_pagamento,
-                valor=float(total_saida),
+                forma=(forma_pagamento if total_saida > eps else "AJUSTE"),
+                valor=float(total_saida if total_saida > eps else 0.0),
                 categoria=cat,
                 subcategoria=sub,
                 descricao=desc,
-                banco=(org if forma_pagamento == "DÉBITO" else None),
+                banco=(org if (total_saida > eps and forma_pagamento == "DÉBITO") else None),
             )
 
-            # 6) Efeito financeiro (saida/saldos) e log — SOMENTE se houver desembolso
+            # 5) Efeito financeiro (saida/saldos) e log — SOMENTE se houver desembolso
             if total_saida > eps:
                 data_iso = str(pd.to_datetime(data).date())
                 if forma_pagamento == "DINHEIRO":
@@ -413,23 +409,24 @@ class BoletoMixin:
                         data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     )
 
-                # Observação extra no log se o valor informado diferir do ajustado pelo saldo
-                if abs(principal_cliente - principal_efetivo) > eps and id_mov != -1:
+                # Observação extra no log se o valor BASE informado foi ajustado ao restante
+                if abs(v_pg - principal_a_pagar) > eps and id_mov != -1:
                     cur.execute(
                         """
                         UPDATE movimentacoes_bancarias
-                           SET observacao = COALESCE(observacao,'') || ' [valor ajustado ao saldo: R$ ' || printf('%.2f', ?) || ']'
+                           SET observacao = COALESCE(observacao,'') || ' [valor base ajustado ao restante: R$ ' || printf('%.2f', ?) || ']'
                          WHERE id = ?
                         """,
-                        (float(total_saida), id_mov),
+                        (float(principal_a_pagar), id_mov),
                     )
 
-            # 7) Aplicar no CAP
-            if quitacao_total:
-                # QUITAÇÃO TOTAL — sem resíduo (status -> QUITADA)
-                res = self.cap_repo.aplicar_pagamento_parcela_quitacao_total(
+            # 6) Aplicar no CAP — sempre via PARCIAL (o mixin resolve status/restante)
+            evento_id = -1
+            if hasattr(self.cap_repo, "aplicar_pagamento_parcela"):
+                res = self.cap_repo.aplicar_pagamento_parcela(
                     conn,
                     parcela_id=int(parcela_id),
+                    valor_base=float(principal_a_pagar),
                     juros=float(v_juros),
                     multa=float(v_multa),
                     desconto=float(v_desc),
@@ -444,68 +441,50 @@ class BoletoMixin:
                 except Exception:
                     evento_id = -1
             else:
-                # PARCIAL — principal-only + acumuladores; status pode continuar EM ABERTO
-                if hasattr(self.cap_repo, "aplicar_pagamento_parcela"):
-                    res = self.cap_repo.aplicar_pagamento_parcela(
-                        conn,
-                        parcela_id=int(parcela_id),
-                        principal=float(principal_efetivo),
-                        juros=float(v_juros),
-                        multa=float(v_multa),
-                        desconto=float(v_desc),
-                        data_evento=str(pd.to_datetime(data).date()),
-                        usuario=usu,
-                    )
-                    try:
-                        evento_id = int(res.get("id_evento_cap", -1)) if isinstance(res, dict) else int(res or -1)
-                    except Exception:
-                        evento_id = -1
-                else:
-                    # Fallback SQL (compatibilidade) — principal-only + acumuladores
-                    cur2 = conn.cursor()
-                    cur2.execute("PRAGMA table_info('contas_a_pagar_mov')")
-                    cols = [r[1] for r in cur2.fetchall()]
-                    multa_col = "multa_paga" if "multa_paga" in cols else ("multa_pago" if "multa_pago" in cols else None)
-                    desc_col  = "desconto_aplicado" if "desconto_aplicado" in cols else ("desconto" if "desconto" in cols else None)
+                # Fallback SQL (compatibilidade) — aplica principal e acumuladores
+                cur2 = conn.cursor()
+                cur2.execute("PRAGMA table_info('contas_a_pagar_mov')")
+                cols = [r[1] for r in cur2.fetchall()]
+                multa_col = "multa_paga" if "multa_paga" in cols else ("multa_pago" if "multa_pago" in cols else None)
+                desc_col  = "desconto_aplicado" if "desconto_aplicado" in cols else ("desconto" if "desconto" in cols else None)
 
-                    sets = [
-                        "valor_pago_acumulado = COALESCE(valor_pago_acumulado,0) + :principal",
-                        "juros_pago = COALESCE(juros_pago,0) + :juros",
-                        "data_pagamento = DATE(:data_evento)",
-                        "status = CASE WHEN COALESCE(valor_evento,0) <= COALESCE(valor_pago_acumulado,0) + :principal THEN 'QUITADA' ELSE 'EM ABERTO' END",
-                    ]
-                    params = {
-                        "principal": float(principal_efetivo),
-                        "juros": float(v_juros),
-                        "data_evento": str(pd.to_datetime(data).date()),
-                        "parcela_id": int(parcela_id),
-                    }
-                    if multa_col:
-                        sets.append(f"{multa_col} = COALESCE({multa_col},0) + :multa")
-                        params["multa"] = float(v_multa)
-                    if desc_col:
-                        sets.append(f"{desc_col} = COALESCE({desc_col},0) + :desconto")
-                        params["desconto"] = float(v_desc)
+                sets = [
+                    "valor_pago_acumulado = COALESCE(valor_pago_acumulado,0) + :principal",
+                    "juros_pago = COALESCE(juros_pago,0) + :juros",
+                    "data_pagamento = DATE(:data_evento)",
+                    "status = CASE WHEN COALESCE(valor_evento,0) <= COALESCE(valor_pago_acumulado,0) + :principal THEN 'QUITADA' ELSE 'EM ABERTO' END",
+                ]
+                params = {
+                    "principal": float(principal_a_pagar),
+                    "juros": float(v_juros),
+                    "data_evento": str(pd.to_datetime(data).date()),
+                    "parcela_id": int(parcela_id),
+                }
+                if multa_col:
+                    sets.append(f"{multa_col} = COALESCE({multa_col},0) + :multa")
+                    params["multa"] = float(v_multa)
+                if desc_col:
+                    sets.append(f"{desc_col} = COALESCE({desc_col},0) + :desconto")
+                    params["desconto"] = float(v_desc)
 
-                    cur2.execute(
-                        f"UPDATE contas_a_pagar_mov SET {', '.join(sets)} WHERE id = :parcela_id",
-                        params,
-                    )
-                    evento_id = -1
+                cur2.execute(
+                    f"UPDATE contas_a_pagar_mov SET {', '.join(sets)} WHERE id = :parcela_id",
+                    params,
+                )
+                evento_id = -1
 
             conn.commit()
 
         logger.debug(
-            "pagar_parcela_boleto: obrig=%s total_saida=%.2f principal_efetivo=%.2f forma=%s origem=%s saida=%s mov=%s evento=%s quitacao_total=%s",
+            "pagar_parcela_boleto: obrig=%s total_saida=%.2f principal=%.2f forma=%s origem=%s saida=%s mov=%s evento=%s",
             obrigacao_id,
             total_saida,
-            principal_efetivo,
+            principal_a_pagar,
             forma_pagamento,
             org,
             id_saida,
             id_mov,
             evento_id,
-            quitacao_total,
         )
         return (id_saida, id_mov, evento_id)
 

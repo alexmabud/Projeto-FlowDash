@@ -1,27 +1,25 @@
+# services/ledger/service_ledger_emprestimo.py
 """
-Empréstimos (programação e pagamento).
+Empréstimos (programação e pagamento de parcelas).
 
-Regras para programar parcelas de empréstimos em CAP e efetuar pagamento de
-parcelas (dinheiro ou banco), aplicando multa/juros/desconto e atualizando
-saldos/registros financeiros.
+Este módulo padroniza o pagamento de **parcela de empréstimo/financiamento**
+para o mesmo modelo adotado em Fatura e Boleto:
 
-Responsabilidades:
-- Programar N parcelas (`tipo_obrigacao='EMPRESTIMO'`) com competência/vencimento.
-- Pagar parcela de empréstimo e registrar efeitos em `saida`/`movimentacoes_bancarias`.
-- Atualizar status dos LANCAMENTOS e aplicar detalhamento do pagamento em CAP:
-    - QUITAÇÃO TOTAL sem resíduo via `aplicar_pagamento_parcela_quitacao_total(...)`.
+- O parâmetro `valor` é o **valor BASE (principal)** que será aplicado no saldo da parcela.
+- A saída financeira (caixa/banco) é calculada como:
+    total_saida = principal_aplicado + juros + multa - desconto  (mínimo 0)
+- O lançamento contábil e o ajuste de saldos só ocorrem quando `total_saida > 0`.
+- A aplicação no CAP é feita **sempre via `aplicar_pagamento_parcela`** (parcial),
+  passando `valor_base`, `juros`, `multa`, `desconto` e metadados (`forma_pagamento`,
+  `origem`, `ledger_id`, `usuario`). O mixin de pagamentos decide `status/restante`.
 
-Dependências:
-- shared.db.get_conn
-- shared.ids.sanitize
-- self.cap_repo (proximo_obrigacao_id, registrar_lancamento,
-                 aplicar_pagamento_parcela_quitacao_total, obter_saldo_obrigacao)
-- self._garantir_linha_saldos_caixas, self._garantir_linha_saldos_bancos,
-  self._ajustar_banco_dynamic (validação/ajuste de colunas de bancos)
+Também expõe utilitários para **programar** um empréstimo em N parcelas.
 
-Notas de segurança:
-- SQL apenas com parâmetros (?).
-- Atualização de saldos de caixa com coluna whitelist (sem interpolar entrada do usuário).
+Dependências (expostas pela service/fachada que mistura este mixin):
+- self.db_path
+- self.cap_repo (proximo_obrigacao_id, registrar_lancamento, aplicar_pagamento_parcela, registrar_pagamento, obter_saldo_obrigacao)
+- self.mov_repo (ja_existe_transacao) [opcional]
+- self._garantir_linha_saldos_caixas, self._garantir_linha_saldos_bancos, self._ajustar_banco_dynamic
 """
 
 from __future__ import annotations
@@ -35,16 +33,14 @@ import sys
 from datetime import datetime
 from typing import List, Optional, Tuple
 
-# Garante que a raiz do projeto (<raiz>/services/ledger/..) esteja no sys.path
+# Garante que a raiz do projeto esteja no sys.path (../.. a partir deste arquivo)
 _CURRENT_DIR = os.path.dirname(__file__)
 _PROJECT_ROOT = os.path.abspath(os.path.join(_CURRENT_DIR, "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-# Terceiros
 import pandas as pd  # noqa: E402
 
-# Internos
 from shared.db import get_conn  # noqa: E402
 from shared.ids import sanitize  # noqa: E402
 from services.ledger.service_ledger_infra import (  # noqa: E402
@@ -54,22 +50,20 @@ from services.ledger.service_ledger_infra import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["_EmprestimoLedgerMixin"]
 
-
-class _EmprestimoLedgerMixin:
-    """Mixin com regras para empréstimos (pagar parcela e programar)."""
+class EmprestimoLedgerMixin:
+    """Mixin com regras para Empréstimos (pagar parcela e programar)."""
 
     # ------------------------------------------------------------------
-    # Pagamento de parcela de empréstimo (QUITACAO TOTAL — sem resíduo)
+    # Pagamento de parcela de empréstimo (PARCIAL/TOTAL via aplicar_pagamento_parcela)
     # ------------------------------------------------------------------
     def pagar_parcela_emprestimo(
         self,
         *,
         data: str,
-        valor: float,
-        forma_pagamento: str,   # "DINHEIRO" | "PIX" | "DÉBITO"
-        origem: str,            # "Caixa"/"Caixa 2" ou nome do banco
+        valor: float,                 # valor BASE (principal) a aplicar na parcela
+        forma_pagamento: str,         # "DINHEIRO" | "PIX" | "DÉBITO"
+        origem: str,                  # "Caixa"/"Caixa 2" ou nome do banco
         obrigacao_id: int,
         usuario: str,
         categoria: Optional[str] = "Empréstimos e Financiamentos",
@@ -81,16 +75,13 @@ class _EmprestimoLedgerMixin:
         desconto: float = 0.0,
     ) -> Tuple[int, int, int]:
         """
-        Mesmo padrão de Boleto/Fatura:
-        - Calcula saída líquida: principal limitado ao saldo + juros + multa − desconto (mín. 0).
-        - Se houver desembolso, gera saída (caixa/banco), log e ajusta saldos.
-        - Em seguida, chama `aplicar_pagamento_parcela_quitacao_total(...)` para:
-            * distribuir juros/multa/desconto,
-            * definir valor_pago_acumulado = base + juros + multa,
-            * status = 'QUITADO',
-            * registrar evento CAP negativo com o valor efetivamente pago (se > 0).
-        - Se a saída líquida for 0 (ex.: desconto cobre tudo), não mexe em caixa/banco;
-          ainda assim a parcela fica QUITADA sem gerar “resto”.
+        Aplica pagamento de parcela de **empréstimo/financiamento** no mesmo padrão de Fatura/Boleto.
+
+        - `valor` é aplicado no **principal** até o limite do restante.
+        - Saída financeira (quando > 0): `principal_aplicado + juros + multa - desconto`.
+        - Aplica no CAP com `aplicar_pagamento_parcela` (parcial). O mixin define `status/restante`.
+
+        Retorna `(id_saida, id_mov_bancaria, id_evento_cap)`. Em caso de idempotência, retorna `(-1, -1, -1)`.
         """
         v_pg    = max(0.0, float(valor))
         v_multa = max(0.0, float(multa or 0.0))
@@ -103,15 +94,26 @@ class _EmprestimoLedgerMixin:
         usu  = sanitize(usuario)
         org  = sanitize(origem)
 
-        eps = 0.005  # tolerância p/ ponto flutuante
+        eps = 0.005  # tolerância de ponto flutuante
+
+        # Idempotência por trans_uid (se fornecido)
+        try:
+            if trans_uid and hasattr(self, "mov_repo") and self.mov_repo.ja_existe_transacao(trans_uid):
+                logger.info("pagar_parcela_emprestimo: trans_uid já existe (%s) — ignorando", trans_uid)
+                return (-1, -1, -1)
+        except Exception:
+            pass
 
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
-            # 1) Parcela base (LANCAMENTO)
+            # 1) Ler a parcela-base (LANCAMENTO) p/ obter 'valor_evento' e 'valor_pago_acumulado'
             row = cur.execute(
                 """
-                SELECT id, COALESCE(valor_evento,0) AS valor_parcela
+                SELECT id,
+                       COALESCE(valor_evento,0)           AS valor_parcela,
+                       COALESCE(valor_pago_acumulado,0)   AS pago_acum,
+                       UPPER(COALESCE(status,''))         AS status_atual
                   FROM contas_a_pagar_mov
                  WHERE obrigacao_id = ?
                    AND categoria_evento = 'LANCAMENTO'
@@ -124,10 +126,19 @@ class _EmprestimoLedgerMixin:
 
             parcela_id    = int(row[0])
             valor_parcela = float(row[1])
+            pago_acum     = float(row[2])
+            status_atual  = (row[3] or "").upper()
 
-            # 2) Saldo atual e cálculo da saída
-            saldo_atual = float(self.cap_repo.obter_saldo_obrigacao(conn, int(obrigacao_id)) or 0.0)
-            principal_a_pagar = min(v_pg, max(saldo_atual, 0.0))
+            # Se já quitada, não repete
+            if status_atual == "QUITADA" or (valor_parcela - pago_acum) <= eps:
+                logger.info("pagar_parcela_emprestimo: parcela já quitada (obrigacao_id=%s).", obrigacao_id)
+                return (-1, -1, -1)
+
+            # 2) RESTANTE e clamp do principal BASE
+            restante_antes     = max(0.0, valor_parcela - pago_acum)
+            principal_a_pagar  = min(v_pg, restante_antes)
+
+            # 3) LÍQUIDO que sai do caixa/banco
             total_saida = round(principal_a_pagar + v_juros + v_multa - v_desc, 2)
             if total_saida < 0:
                 total_saida = 0.0
@@ -135,25 +146,27 @@ class _EmprestimoLedgerMixin:
             id_saida = -1
             id_mov   = -1
 
-            # 3) Se houver desembolso, saída + saldos + log
-            if total_saida > eps:
-                obs = _fmt_obs_saida(
-                    forma=forma_pagamento,
-                    valor=float(total_saida),
-                    categoria=cat,
-                    subcategoria=sub,
-                    descricao=desc,
-                    banco=(org if forma_pagamento == "DÉBITO" else None),
-                )
+            # 4) Observação padronizada (usa o valor efetivo desembolsado)
+            obs = _fmt_obs_saida(
+                forma=(forma_pagamento if total_saida > eps else "AJUSTE"),
+                valor=float(total_saida if total_saida > eps else 0.0),
+                categoria=cat,
+                subcategoria=sub,
+                descricao=desc,
+                banco=(org if (total_saida > eps and forma_pagamento == "DÉBITO") else None),
+            )
 
+            # 5) Efeito financeiro (saida/saldos) e log — somente se houver desembolso
+            if total_saida > eps:
+                data_iso = str(pd.to_datetime(data).date())
                 if forma_pagamento == "DINHEIRO":
-                    self._garantir_linha_saldos_caixas(conn, data)
+                    self._garantir_linha_saldos_caixas(conn, data_iso)
                     col_map = {"Caixa": "caixa", "Caixa 2": "caixa_2"}  # whitelist
                     col = col_map.get(org)
                     if not col:
                         raise ValueError(f"Origem de dinheiro inválida para DINHEIRO: {org}")
 
-                    # (1) Saída (LÍQUIDO)
+                    # Saída (DINHEIRO)
                     cur.execute(
                         """
                         INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
@@ -161,23 +174,23 @@ class _EmprestimoLedgerMixin:
                                            Origem_Dinheiro, Banco_Saida)
                         VALUES (?, ?, ?, ?, 'DINHEIRO', 1, ?, ?, ?, '')
                         """,
-                        (data, cat, sub, desc, float(total_saida), usu, org),
+                        (data_iso, cat, sub, desc, float(total_saida), usu, org),
                     )
                     id_saida = int(cur.lastrowid)
 
-                    # (2) Atualiza saldo do caixa
+                    # Atualiza saldo do caixa
                     cur.execute(
                         f"UPDATE saldos_caixas SET {col} = COALESCE({col},0) - ? WHERE data = ?",
-                        (float(total_saida), data),
+                        (float(total_saida), data_iso),
                     )
 
-                    # (3) Log
+                    # Log financeiro
                     id_mov = log_mov_bancaria(
                         conn,
-                        data=data,
-                        banco=org,  # "Caixa"/"Caixa 2"
+                        data=data_iso,
+                        banco=org,  # "Caixa" / "Caixa 2"
                         tipo="saida",
-                        valor=float(total_saida),    # LÍQUIDO
+                        valor=float(total_saida),    # TOTAL (principal + ajustes)
                         origem="saidas_emprestimo_pagamento",
                         observacao=obs,
                         usuario=usu,
@@ -187,14 +200,15 @@ class _EmprestimoLedgerMixin:
                         data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     )
                 else:
-                    # Bancos
+                    # Bancos (PIX/DÉBITO)
                     try:
-                        self._garantir_linha_saldos_bancos(conn, data)
+                        self._garantir_linha_saldos_bancos(conn, data_iso)
                     except Exception:
                         pass
 
-                    self._ajustar_banco_dynamic(conn, banco_col=org, delta=-float(total_saida), data=data)
+                    self._ajustar_banco_dynamic(conn, banco_col=org, delta=-float(total_saida), data=data_iso)
 
+                    # Saída (Banco)
                     cur.execute(
                         """
                         INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
@@ -202,16 +216,17 @@ class _EmprestimoLedgerMixin:
                                            Origem_Dinheiro, Banco_Saida)
                         VALUES (?, ?, ?, ?, ?, 1, ?, ?, '', ?)
                         """,
-                        (data, cat, sub, desc, forma_pagamento, float(total_saida), usu, org),
+                        (data_iso, cat, sub, desc, forma_pagamento, float(total_saida), usu, org),
                     )
                     id_saida = int(cur.lastrowid)
 
+                    # Log financeiro
                     id_mov = log_mov_bancaria(
                         conn,
-                        data=data,
+                        data=data_iso,
                         banco=org,                      # nome do banco
                         tipo="saida",
-                        valor=float(total_saida),       # LÍQUIDO
+                        valor=float(total_saida),       # TOTAL (principal + ajustes)
                         origem="saidas_emprestimo_pagamento",
                         observacao=obs,
                         usuario=usu,
@@ -221,39 +236,77 @@ class _EmprestimoLedgerMixin:
                         data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     )
 
-                # Observação extra se informou base acima do saldo e foi ajustado
-                if v_pg > saldo_atual + eps:
+                # Observação extra no log se o valor BASE informado foi ajustado ao restante
+                if abs(v_pg - principal_a_pagar) > eps and id_mov != -1:
                     cur.execute(
                         """
                         UPDATE movimentacoes_bancarias
-                           SET observacao = COALESCE(observacao,'') || ' [valor ajustado ao saldo: R$ ' || printf('%.2f', ?) || ']'
+                           SET observacao = COALESCE(observacao,'') || ' [valor base ajustado ao restante: R$ ' || printf('%.2f', ?) || ']'
                          WHERE id = ?
                         """,
-                        (float(total_saida), id_mov),
+                        (float(principal_a_pagar), id_mov),
                     )
 
-            # 4) QUITAÇÃO TOTAL — sempre (com ou sem desembolso)
-            res = self.cap_repo.aplicar_pagamento_parcela_quitacao_total(
-                conn,
-                parcela_id=int(parcela_id),
-                juros=float(v_juros),
-                multa=float(v_multa),
-                desconto=float(v_desc),
-                data_evento=data,
-                forma_pagamento=forma_pagamento,
-                origem=org,
-                ledger_id=(id_saida if id_saida != -1 else 0),
-                usuario=usu,
-            )
-            evento_id = int(res.get("id_evento_cap", -1))
+            # 6) Aplicar no CAP — sempre via PARCIAL
+            evento_id = -1
+            if hasattr(self.cap_repo, "aplicar_pagamento_parcela"):
+                res = self.cap_repo.aplicar_pagamento_parcela(
+                    conn,
+                    parcela_id=int(parcela_id),
+                    valor_base=float(principal_a_pagar),
+                    juros=float(v_juros),
+                    multa=float(v_multa),
+                    desconto=float(v_desc),
+                    data_evento=str(pd.to_datetime(data).date()),
+                    forma_pagamento=forma_pagamento,
+                    origem=org,
+                    ledger_id=(id_saida if id_saida != -1 else 0),
+                    usuario=usu,
+                )
+                try:
+                    evento_id = int(res.get("id_evento_cap", -1)) if isinstance(res, dict) else int(res or -1)
+                except Exception:
+                    evento_id = -1
+            else:
+                # Fallback SQL (compatibilidade) — aplica principal e acumuladores
+                cur2 = conn.cursor()
+                cur2.execute("PRAGMA table_info('contas_a_pagar_mov')")
+                cols = [r[1] for r in cur2.fetchall()]
+                multa_col = "multa_paga" if "multa_paga" in cols else ("multa_pago" if "multa_pago" in cols else None)
+                desc_col  = "desconto_aplicado" if "desconto_aplicado" in cols else ("desconto" if "desconto" in cols else None)
+
+                sets = [
+                    "valor_pago_acumulado = COALESCE(valor_pago_acumulado,0) + :principal",
+                    "juros_pago = COALESCE(juros_pago,0) + :juros",
+                    "data_pagamento = DATE(:data_evento)",
+                    "status = CASE WHEN COALESCE(valor_evento,0) <= COALESCE(valor_pago_acumulado,0) + :principal THEN 'QUITADA' ELSE 'EM ABERTO' END",
+                ]
+                params = {
+                    "principal": float(principal_a_pagar),
+                    "juros": float(v_juros),
+                    "data_evento": str(pd.to_datetime(data).date()),
+                    "parcela_id": int(parcela_id),
+                }
+                if multa_col:
+                    sets.append(f"{multa_col} = COALESCE({multa_col},0) + :multa")
+                    params["multa"] = float(v_multa)
+                if desc_col:
+                    sets.append(f"{desc_col} = COALESCE({desc_col},0) + :desconto")
+                    params["desconto"] = float(v_desc)
+
+                cur2.execute(
+                    f"UPDATE contas_a_pagar_mov SET {', '.join(sets)} WHERE id = :parcela_id",
+                    params,
+                )
+                evento_id = -1
 
             conn.commit()
 
         logger.debug(
-            "pagar_parcela_emprestimo: obrig=%s total=%.2f base=%.2f forma=%s origem=%s saida=%s mov=%s evento=%s",
+            "pagar_parcela_emprestimo: obrig=%s total_saida=%.2f principal=%.2f forma=%s origem=%s saida=%s mov=%s evento=%s",
             obrigacao_id,
             total_saida,
-            valor_parcela,
+            principal_a_pagar,
             forma_pagamento,
             org,
             id_saida,
@@ -263,7 +316,7 @@ class _EmprestimoLedgerMixin:
         return (id_saida, id_mov, evento_id)
 
     # ------------------------------------------------------------------
-    # Programação de empréstimo (N parcelas)
+    # Programar empréstimo (N parcelas de mesmo valor)
     # ------------------------------------------------------------------
     def programar_emprestimo(
         self,
@@ -317,116 +370,63 @@ class _EmprestimoLedgerMixin:
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
-            base_obrig_id = self.cap_repo.proximo_obrigacao_id(conn)
+            # Base para obrigacao_id
+            if hasattr(self.cap_repo, "proximo_obrigacao_id"):
+                base_obrig_id = int(self.cap_repo.proximo_obrigacao_id(conn))
+            else:
+                row_max = cur.execute("SELECT COALESCE(MAX(obrigacao_id), 0) FROM contas_a_pagar_mov").fetchone()
+                base_obrig_id = int((row_max[0] or 0) + 1)
 
-            for i in range(1, int(parcelas_total) + 1):
-                vcto = (base_dt + pd.DateOffset(months=i - 1)).date()
-                competencia = f"{vcto.year:04d}-{vcto.month:02d}"
-                obrigacao_id = base_obrig_id + (i - 1)
+            # 1) Gerar LANCAMENTOS
+            for i in range(parcelas_total):
+                obrig_id = base_obrig_id + i
+                vcto = (base_dt + pd.DateOffset(months=i)).date()
+                descricao_cap = (desc or f"{credor} {i+1}/{parcelas_total} - Empréstimo")
 
                 lanc_id = self.cap_repo.registrar_lancamento(
                     conn,
-                    obrigacao_id=obrigacao_id,
+                    obrigacao_id=int(obrig_id),
                     tipo_obrigacao="EMPRESTIMO",
                     valor_total=float(valor_parcela),
-                    data_evento=str(base_dt.date()),
+                    data_evento=str(vcto),       # registra na competência
                     vencimento=str(vcto),
-                    descricao=desc or f"{credor} {i}/{parcelas_total}",
+                    descricao=descricao_cap,
                     credor=credor,
-                    competencia=competencia,
-                    parcela_num=i,
-                    parcelas_total=int(parcelas_total),
+                    competencia=str(vcto)[:7],   # YYYY-MM
+                    parcela_num=i+1,
+                    parcelas_total=parcelas_total,
                     usuario=usuario,
                 )
                 ids_lanc.append(int(lanc_id))
 
-            # Marca origem/status e liga ao cadastro do empréstimo (se houver)
-            if emprestimo_id is not None:
-                try:
-                    emprestimo_id = int(emprestimo_id)
-                except Exception:
-                    emprestimo_id = None
+            # Marcar origem e status padrão
+            cur.execute(
+                """
+                UPDATE contas_a_pagar_mov
+                   SET tipo_origem='EMPRESTIMO',
+                       cartao_id=NULL,
+                       status = CASE WHEN COALESCE(NULLIF(status,''), '') = '' THEN 'EM ABERTO' ELSE UPPER(status) END
+                 WHERE obrigacao_id BETWEEN ? AND ?
+                """,
+                (base_obrig_id, base_obrig_id + int(parcelas_total) - 1),
+            )
 
-            if emprestimo_id is not None:
-                cur.execute(
-                    """
-                    UPDATE contas_a_pagar_mov
-                       SET tipo_origem='EMPRESTIMO',
-                           emprestimo_id=?,
-                           cartao_id=NULL,
-                           status = COALESCE(NULLIF(status,''), 'Em aberto')
-                     WHERE obrigacao_id BETWEEN ? AND ?
-                    """,
-                    (int(emprestimo_id), base_obrig_id, base_obrig_id + int(parcelas_total) - 1),
-                )
-            else:
-                cur.execute(
-                    """
-                    UPDATE contas_a_pagar_mov
-                       SET tipo_origem='EMPRESTIMO',
-                           cartao_id=NULL,
-                           status = COALESCE(NULLIF(status,''), 'Em aberto')
-                     WHERE obrigacao_id BETWEEN ? AND ?
-                    """,
-                    (base_obrig_id, base_obrig_id + int(parcelas_total) - 1),
-                )
-
-            # Registra parcelas já pagas (opcional)
+            # 2) Opcional: marcar K primeiras parcelas como já pagas (origem)
             k = max(0, min(int(parcelas_ja_pagas or 0), int(parcelas_total)))
             if k > 0:
-                for i in range(0, k):
+                for i in range(k):
                     obrig_id = base_obrig_id + i
-                    row = cur.execute(
-                        """
-                        SELECT COALESCE(vencimento, data_evento) AS vcto
-                          FROM contas_a_pagar_mov
-                         WHERE obrigacao_id = ?
-                           AND categoria_evento='LANCAMENTO'
-                         LIMIT 1
-                        """,
-                        (obrig_id,),
-                    ).fetchone()
-                    vcto = row[0] if row and row[0] else str((base_dt + pd.DateOffset(months=i)).date())
-
-                    # Para registros “já pagos” na origem, inserimos um evento CAP simples
+                    vcto = (base_dt + pd.DateOffset(months=i)).date()
                     ev_id = self.cap_repo.registrar_pagamento(
                         conn,
                         obrigacao_id=int(obrig_id),
                         tipo_obrigacao="EMPRESTIMO",
-                        valor_pago=float(valor_parcela),
+                        valor_total=float(valor_parcela),
                         data_evento=str(vcto),
-                        forma_pagamento="AJUSTE",
-                        origem="programacao",
-                        ledger_id=None,
+                        descricao="Pagamento já realizado na contratação",
                         usuario=usuario,
                     )
                     ids_pay.append(int(ev_id))
-
-                cur.execute(
-                    """
-                    UPDATE contas_a_pagar_mov
-                       SET status='Quitado'
-                     WHERE obrigacao_id BETWEEN ? AND ? AND categoria_evento='LANCAMENTO'
-                    """,
-                    (base_obrig_id, base_obrig_id + k - 1),
-                )
-
-            # Log informativo de programação
-            log_mov_bancaria(
-                conn,
-                data=str(base_dt.date()),
-                banco=credor,
-                tipo="info",
-                valor=0.0,
-                origem="emprestimo_programado",
-                observacao=(
-                    f"Empréstimo programado {parcelas_total}x de R$ {valor_parcela:.2f} - "
-                    f"{credor} (pagas na origem: {k})"
-                ),
-                usuario=usuario,
-                referencia_tabela="contas_a_pagar_mov",
-                referencia_id=(ids_lanc[0] if ids_lanc else None),
-            )
 
             conn.commit()
 
@@ -441,7 +441,7 @@ class _EmprestimoLedgerMixin:
         return (ids_lanc, ids_pay)
 
     # ------------------------------------------------------------------
-    # Programar a partir do cadastro de empréstimos
+    # Programar a partir de um cadastro (dict) de empréstimos
     # ------------------------------------------------------------------
     def programar_emprestimo_por_cadastro(
         self,
@@ -449,7 +449,7 @@ class _EmprestimoLedgerMixin:
         cadastro: dict,
         usuario: str,
     ) -> Tuple[List[int], List[int]]:
-        """Cria programação de empréstimo a partir de um dict (cadastro) existente."""
+        """Cria programação de empréstimo a partir de um dict `cadastro` existente."""
         credor = sanitize(
             cadastro.get("banco")
             or cadastro.get("descricao")
@@ -459,7 +459,7 @@ class _EmprestimoLedgerMixin:
 
         data_primeira = str(cadastro.get("data_primeira_parcela") or "").strip()
         if not data_primeira:
-            raise ValueError("data_primeira_parcela ausente no cadastro.")
+            raise ValueError("data_primeira_parcela não informada no cadastro.")
 
         try:
             pd.to_datetime(data_primeira)
@@ -477,15 +477,14 @@ class _EmprestimoLedgerMixin:
             vp = 0.0
 
         try:
+            emp_id = int(cadastro.get("id") or cadastro.get("emprestimo_id") or 0)
+        except Exception:
+            emp_id = 0
+
+        try:
             pp = int(cadastro.get("parcelas_ja_pagas") or 0)
         except Exception:
             pp = 0
-
-        emp_id = cadastro.get("id")
-        try:
-            emp_id = int(emp_id) if emp_id is not None else None
-        except Exception:
-            emp_id = None
 
         if pt < 1:
             raise ValueError(f"parcelas_total inválido: {cadastro.get('parcelas_total')!r}")
@@ -502,3 +501,8 @@ class _EmprestimoLedgerMixin:
             emprestimo_id=emp_id,
             parcelas_ja_pagas=pp,
         )
+
+
+# --- Alias de compatibilidade (alguns módulos importam _EmprestimoLedgerMixin) ---
+_EmprestimoLedgerMixin = EmprestimoLedgerMixin
+__all__ = ["EmprestimoLedgerMixin", "_EmprestimoLedgerMixin"]
