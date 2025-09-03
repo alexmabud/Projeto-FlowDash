@@ -35,13 +35,22 @@ else:
 """
 
 from __future__ import annotations
+
 from typing import Any, Dict, Optional, Tuple
 from datetime import datetime
 
+__all__ = [
+    "len_safe",
+    "is_blank",
+    "coerce_saida_form",
+    "processar_salvar_saida",
+]
+
 # -------------------- len seguro e checagens --------------------
 
+
 def len_safe(x: Any) -> int:
-    """len robusto (para int/float/None vira len(str(x)) ou 0)."""
+    """Retorna um 'len' robusto (para int/float/None vira len(str(x)) ou 0)."""
     if x is None:
         return 0
     try:
@@ -52,31 +61,71 @@ def len_safe(x: Any) -> int:
         except Exception:
             return 0
 
+
 def is_blank(x: Any) -> bool:
-    """Vazio para UI: None -> True; ints/floats nunca são 'em branco'."""
+    """Define 'vazio' para UI: None -> True; ints/floats nunca são 'em branco'."""
     if x is None:
         return True
     if isinstance(x, (int, float)):
         return False
     return str(x).strip() == ""
 
+
 # -------------------- parses básicos --------------------
 
+
 def _parse_money(v: Any) -> float:
-    """Aceita '400,00', '1.234,56', 400 (int/float)."""
+    """Converte valores monetários em float de forma robusta.
+
+    Aceita:
+        - "1.234,56" (pt-BR) → 1234.56
+        - "1,234.56" (en-US) → 1234.56
+        - "1234,56"         → 1234.56
+        - "1234.56"         → 1234.56
+        - 1234 / 1234.56    → 1234.0 / 1234.56
+
+    Regras:
+        - Quando há ',' e '.': assume que o separador decimal é o que aparece
+          mais à direita; o outro é separador de milhar e é removido.
+        - Quando há só ',': trata como separador decimal.
+        - Quando há só '.': trata como separador decimal.
+    """
     if v is None:
         return 0.0
     if isinstance(v, (int, float)):
         return float(v)
-    s = str(v).strip()
-    s = s.replace(".", "").replace(",", ".")
+
+    s = str(v).strip().replace(" ", "")
+    if not s:
+        return 0.0
+
+    has_dot = "." in s
+    has_comma = "," in s
+
     try:
+        if has_dot and has_comma:
+            # separador decimal = o símbolo mais à direita
+            last_dot = s.rfind(".")
+            last_comma = s.rfind(",")
+            if last_comma > last_dot:
+                # decimal = ',', milhares = '.'
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                # decimal = '.', milhares = ','
+                s = s.replace(",", "")
+        elif has_comma:
+            # apenas vírgula -> decimal
+            s = s.replace(",", ".")
+        else:
+            # apenas ponto (ou nenhum) -> já está OK
+            pass
         return float(s)
     except Exception:
         return 0.0
 
+
 def _parse_date_any(s: Any) -> str:
-    """Normaliza 'YYYY-MM-DD'; aceita 'DD/MM/YYYY', 'YYYY/MM/DD', etc."""
+    """Normaliza datas para 'YYYY-MM-DD'; aceita 'DD/MM/YYYY', 'YYYY/MM/DD', etc."""
     if not s:
         return datetime.now().strftime("%Y-%m-%d")
     s = str(s).strip()
@@ -90,28 +139,44 @@ def _parse_date_any(s: Any) -> str:
     except Exception:
         return datetime.now().strftime("%Y-%m-%d")
 
+
 def _int_ge1(p: Any) -> int:
-    """Parcelas como inteiro >=1."""
+    """Coerção de parcelas para inteiro >= 1."""
     try:
         return max(1, int(p or 1))
     except Exception:
         return 1
 
+
 def _norm_str(x: Any) -> Optional[str]:
-    """String normalizada (None se vazio)."""
+    """Normaliza strings (trim); retorna None quando vazio/whitespace."""
     if x is None:
         return None
     s = str(x).strip()
     return s or None
 
+
 # -------------------- normalizador principal do form --------------------
 
+
 def coerce_saida_form(d: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normaliza um dict do formulário "Lançar Saída" e deriva campos úteis:
-    - valor (float), parcelas (int>=1), data_norm (YYYY-MM-DD)
-    - forma_norm em {'DINHEIRO','PIX','DÉBITO'} com heurísticas
-    - strings seguras em texto
+    """Normaliza um dict do formulário "Lançar Saída" e deriva campos úteis.
+
+    Gera:
+        - valor (float), parcelas (int>=1), data_norm (YYYY-MM-DD)
+        - forma_norm em {'DINHEIRO','PIX','DÉBITO'} com heurísticas
+        - strings seguras para texto
+
+    Heurística para `forma_norm`:
+        - se forma ∈ {'DINHEIRO','PIX','DÉBITO'}: usa direto (normalizando 'DEBITO' -> 'DÉBITO')
+        - se forma == 'BOLETO':
+            • origem ∈ {'caixa','caixa 2','caixa2'} → 'DINHEIRO'
+            • senão, se houver banco → 'PIX'
+            • senão → 'DINHEIRO'
+        - se forma vazia:
+            • origem ∈ {'caixa','caixa 2','caixa2'} → 'DINHEIRO'
+            • senão, se houver banco → 'PIX'
+            • senão → 'DINHEIRO'
     """
     out: Dict[str, Any] = dict(d)
 
@@ -124,20 +189,12 @@ def coerce_saida_form(d: Dict[str, Any]) -> Dict[str, Any]:
         out[k] = _norm_str(d.get(k))
 
     # Forma normalizada (considera aliases)
-    raw_forma = (
-        d.get("forma")
-        or d.get("forma_pagamento")
-        or d.get("metodo")
-        or d.get("meio_pagamento")
-    )
+    raw_forma = d.get("forma") or d.get("forma_pagamento") or d.get("metodo") or d.get("meio_pagamento")
     forma_up = (str(raw_forma).strip().upper()) if raw_forma is not None else ""
 
     if forma_up == "DEBITO":
         forma_up = "DÉBITO"
 
-    # Heurística:
-    # - "BOLETO" do UI vira DINHEIRO se origem for Caixa/Caixa 2; senão tenta PIX
-    # - se forma vazia: Caixa/Caixa 2 => DINHEIRO; banco informado => PIX; fallback DINHEIRO
     origem_low = (out.get("origem") or "").lower()
     if forma_up in {"DINHEIRO", "PIX", "DÉBITO"}:
         forma_norm = forma_up
@@ -152,26 +209,27 @@ def coerce_saida_form(d: Dict[str, Any]) -> Dict[str, Any]:
             forma_norm = "DINHEIRO"
 
     out["forma_norm"] = forma_norm
-
     return out
+
 
 # -------------------- integração direta com o Ledger --------------------
 
+
 def processar_salvar_saida(payload: Dict[str, Any], db_path: str) -> Tuple[bool, Any]:
-    """
-    Normaliza o payload do formulário e grava a saída:
+    """Normaliza o payload do formulário e grava a saída via Ledger.
+
     - Faz parse seguro (datas, valores, parcelas) e resolve forma de pagamento (BOLETO -> DINHEIRO/PIX conforme origem/banco).
     - Evita qualquer uso de len(...) em int/float (usa len_safe se precisar).
     - Chama LedgerService.registrar_lancamento para saída avulsa (sem obrigacao_id).
 
     Retorna:
-        (True, resultado)  em caso de sucesso
-        (False, mensagem)  em caso de erro amigável
+        (True, resultado) em caso de sucesso
+        (False, mensagem) em caso de erro amigável
     """
     try:
         d = coerce_saida_form(payload)
 
-        # Validações mínimas (sem usar len() direto):
+        # Validações mínimas
         if d["valor"] <= 0:
             return (False, "Valor deve ser maior que zero.")
 
@@ -203,11 +261,12 @@ def processar_salvar_saida(payload: Dict[str, Any], db_path: str) -> Tuple[bool,
         # Mensagem compacta para UI; para depuração, logue stack no console do servidor
         return (False, f"Falha ao salvar saída: {e}")
 
+
 # -------------------- teste rápido local --------------------
 if __name__ == "__main__":
     sample = {
         "data_evento": "02/09/2025",
-        "valor": "400,00",
+        "valor": "1,234.56",
         "forma": "BOLETO",
         "categoria": "Outros",
         "subcategoria": "Outros",

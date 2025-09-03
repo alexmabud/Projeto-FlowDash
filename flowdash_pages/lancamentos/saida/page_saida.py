@@ -1,12 +1,12 @@
 # ===================== Page: Saída =====================
 """
-Página principal da Saída – monta layout e chama forms/actions.
+Página principal da Saída — monta layout e aciona forms/actions.
 
-Mantém o comportamento do arquivo original:
-- Toggle do formulário
-- Campos e fluxos idênticos (incluindo Pagamentos: Fatura/Boletos/Empréstimos)
+Comportamentos mantidos do original:
+- Toggle do formulário (botão "🔴 Saída")
+- Campos e fluxos idênticos (inclui Pagamentos: Fatura/Boletos/Empréstimos)
 - Validações e mensagens
-- st.rerun() após sucesso
+- `st.rerun()` após sucesso
 
 Compatibilidade:
 - Funciona com versões NOVAS (carregar_listas_para_form retorna 8 itens
@@ -16,7 +16,7 @@ Compatibilidade:
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 import datetime as _dt
 import streamlit as st
 
@@ -31,10 +31,13 @@ from .actions_saida import (
 
 __all__ = ["render_saida"]
 
+# Providers de listagem opcionais (para compat entre versões)
+ListProvider = Callable[[], list]
+
 
 # ----------------- helpers -----------------
 def _norm_date(d: Any) -> _dt.date:
-    """Normaliza data para datetime.date."""
+    """Converte entrada diversa de data em `datetime.date` usando `coerce_data`."""
     return coerce_data(d)
 
 
@@ -43,7 +46,20 @@ def _coalesce_state(
     caminho_banco: Optional[str],
     data_lanc: Optional[Any],
 ) -> Tuple[str, _dt.date]:
-    """Extrai (db_path, data_lanc: date) de state com fallback para args diretos."""
+    """Extrai `(db_path, data_lanc)` a partir do `state` ou dos argumentos diretos.
+
+    Args:
+        state: Objeto de estado com possíveis atributos `db_path/caminho_banco`
+               e `data_lanc/data_lancamento/data`.
+        caminho_banco: Caminho do banco (fallback quando `state` não tiver).
+        data_lanc: Data do lançamento (fallback quando `state` não tiver).
+
+    Returns:
+        Tuple[str, date]: `(db_path, data_lanc_normalizada)`.
+
+    Raises:
+        ValueError: Quando nenhum caminho de banco foi informado.
+    """
     db = None
     dt = None
     if state is not None:
@@ -66,9 +82,13 @@ def render_saida(
     caminho_banco: Optional[str] = None,
     data_lanc: Optional[Any] = None,
 ) -> None:
-    """
-    Preferencial: render_saida(state)
-    Compatível:   render_saida(None, caminho_banco='...', data_lanc=date|'YYYY-MM-DD')
+    """Renderiza a página de Saída.
+
+    Preferencial:
+        render_saida(state)
+
+    Compatível:
+        render_saida(None, caminho_banco='...', data_lanc=date|'YYYY-MM-DD')
     """
     # Resolver entradas
     try:
@@ -85,8 +105,8 @@ def render_saida(
         return
 
     # Contexto do usuário
-    usuario = st.session_state.get("usuario_logado", {"nome": "Sistema"})
-    usuario_nome = usuario.get("nome", "Sistema")
+    usuario: Dict[str, Any] = st.session_state.get("usuario_logado", {"nome": "Sistema"})
+    usuario_nome: str = usuario.get("nome", "Sistema")
 
     # Carrega listas/repos necessárias para o formulário (compatível 6 OU 8 retornos)
     try:
@@ -113,15 +133,15 @@ def render_saida(
                 listar_destinos_fatura_em_aberto_fn,
                 carregar_opcoes_pagamentos_fn,
             ) = carregado[:6]
-            listar_boletos_em_aberto_fn = lambda: []
-            listar_empfin_em_aberto_fn = lambda: []
+            listar_boletos_em_aberto_fn: ListProvider = lambda: []
+            listar_empfin_em_aberto_fn: ListProvider = lambda: []
     except Exception as e:
         st.error(f"❌ Falha ao preparar formulário: {e}")
         return
 
     # Render UI (retorna payload). Tentar com providers novos; se a função não aceitar, cair para chamada antiga.
     try:
-        payload = render_form_saida(
+        payload: Dict[str, Any] = render_form_saida(
             data_lanc=_data_lanc,  # datetime.date
             invalidate_cb=invalidate_confirm,
             nomes_bancos=nomes_bancos,
@@ -133,7 +153,7 @@ def render_saida(
             listar_boletos_em_aberto_fn=listar_boletos_em_aberto_fn,   # pode não existir em versão antiga
             listar_empfin_em_aberto_fn=listar_empfin_em_aberto_fn,     # pode não existir em versão antiga
         )
-    except TypeError as te:
+    except TypeError:
         # Fallback para assinatura antiga (sem os dois kwargs finais)
         payload = render_form_saida(
             data_lanc=_data_lanc,
@@ -156,8 +176,10 @@ def render_saida(
         st.warning("⚠️ Confirme os dados antes de salvar.")
         return
 
-    # Execução
-    try:
+    # Execução (com rastreio de erro detalhado)
+    from shared.debug_trace import debug_wrap_ctx
+
+    with debug_wrap_ctx("Salvar Saída"):
         res = registrar_saida(
             caminho_banco=_db_path,
             data_lanc=_data_lanc,
@@ -178,8 +200,3 @@ def render_saida(
         st.session_state.form_saida = False
         st.success(res["msg"])
         st.rerun()
-
-    except ValueError as ve:
-        st.warning(f"⚠️ {ve}")
-    except Exception as e:
-        st.error(f"❌ Erro ao salvar saída: {e}")

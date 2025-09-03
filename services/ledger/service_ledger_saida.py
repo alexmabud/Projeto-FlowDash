@@ -1,43 +1,28 @@
+# services/ledger/service_ledger_saida.py
 """
 Saídas (dinheiro e bancária).
 
-Regras para registrar saídas de dinheiro (Caixa/Caixa 2) e saídas bancárias
-(PIX/DÉBITO), com logs em `movimentacoes_bancarias` e integrações com CAP:
+Registra saídas em dinheiro (Caixa/Caixa 2) e bancárias (PIX/DÉBITO),
+logando em `movimentacoes_bancarias` e integrando com CAP quando aplicável.
 
-- Vínculo direto a um título (obrigacao_id/tipo_obrigacao).
-- Auto-classificação por destino (cartão/boletos/empréstimos).
-- Auto-baixa de pagamentos.
-- Atalho de pagamento direto de fatura por `obrigacao_id_fatura`.
-
-Dependências:
-- shared.db.get_conn
-- shared.ids.sanitize, uid_saida_dinheiro, uid_saida_bancaria
-- self.mov_repo.ja_existe_transacao
-- self.cap_repo (registrar_pagamento, obter_saldo_obrigacao)
-- Mixins auxiliares:
-  - _garantir_linha_saldos_caixas/_bancos
-  - _ajustar_banco_dynamic
-  - _classificar_conta_a_pagar_por_destino
-  - _auto_baixar_pagamentos
-  - _pagar_fatura_por_obrigacao
-
-Notas de segurança:
-- SQL apenas com parâmetros (?).
-- Atualização do saldo de caixas com coluna **whitelist** (evita injeção).
+Compat e robustez:
+- Aceita valores como '400,00', '1.234,56' ou '1234.56' (parser monetário BR/US-aware).
+- Aceita datas em 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD/MM/YYYY' ou 'DD-MM-YYYY'.
+- Aceita aliases de forma: forma/forma_pagamento/metodo/meio_pagamento.
+- Garante strings seguras para sanitização e idempotência (evita len(int) nos UIDs).
 """
 
 from __future__ import annotations
 
-# -----------------------------------------------------------------------------
-# Imports
-# -----------------------------------------------------------------------------
 import logging
 import os
 import sys
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-# Garante que a raiz do projeto (<raiz>/services/ledger/..) esteja no sys.path
+# ---------------------------------------------------------------------
+# sys.path bootstrap (execução via Streamlit/CLI)
+# ---------------------------------------------------------------------
 _CURRENT_DIR = os.path.dirname(__file__)
 _PROJECT_ROOT = os.path.abspath(os.path.join(_CURRENT_DIR, "..", ".."))
 if _PROJECT_ROOT not in sys.path:
@@ -55,9 +40,209 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["_SaidasLedgerMixin"]
 
+_EPS = 0.005  # tolerância para consideração de “sobras” não aplicadas
+
 
 class _SaidasLedgerMixin:
-    """Regras de saída (dinheiro e bancária)."""
+    """Regras de saída (dinheiro e bancária). Fornece o dispatcher e os dois fluxos."""
+
+    # ------------------------ Helpers de normalização ------------------------
+
+    def _sane(self, v: Any) -> Optional[str]:
+        """Converte para string sanitizada (ou None) antes de gerar UIDs/SQL.
+
+        Evita erros como len(int) quando geradores de UID assumem strings.
+        """
+        if v is None:
+            return None
+        try:
+            s = str(v)
+        except Exception:
+            return None
+        return sanitize(s)
+
+    def _parse_money(self, v: Any) -> float:
+        """Converte valores monetários aceitando padrões BR e US.
+
+        Exemplos aceitos:
+            '1.234,56' → 1234.56
+            '1234,56'  → 1234.56
+            '1,234.56' → 1234.56
+            '1234.56'  → 1234.56
+            1234.56    → 1234.56
+        """
+        if v is None:
+            return 0.0
+        if isinstance(v, (int, float)):
+            return float(v)
+
+        s = str(v).strip()
+        if not s:
+            return 0.0
+
+        # Decide qual é o separador decimal pela última ocorrência de '.' ou ','
+        dot = s.rfind(".")
+        comma = s.rfind(",")
+
+        try:
+            if dot == -1 and comma == -1:
+                # Só dígitos
+                return float(s)
+            if dot > comma:
+                # Provável estilo US: '.' decimal, ',' milhar
+                s = s.replace(",", "")
+                return float(s)
+            else:
+                # Provável estilo BR: ',' decimal, '.' milhar
+                s = s.replace(".", "").replace(",", ".")
+                return float(s)
+        except Exception:
+            # Fallback conservador
+            try:
+                return float(s.replace(",", "."))
+            except Exception:
+                return 0.0
+
+    def _parse_date(self, s: Optional[str]) -> str:
+        """Normaliza para 'YYYY-MM-DD' aceitando formatos comuns."""
+        if not s:
+            return datetime.now().strftime("%Y-%m-%d")
+        s = s.strip()
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        # Fallback: ISO-like
+        try:
+            return datetime.fromisoformat(s).date().strftime("%Y-%m-%d")
+        except Exception:
+            return datetime.now().strftime("%Y-%m-%d")
+
+    def _infer_forma(self, *, forma: Optional[str], banco: Optional[str], origem: Optional[str]) -> str:
+        """Normaliza a forma para uma das: 'DINHEIRO', 'PIX', 'DÉBITO'.
+
+        Regras:
+          - usa forma/metodo/meio_pagamento já normalizados se válidos;
+          - se origem for 'Caixa'/'Caixa 2' => 'DINHEIRO';
+          - se houver banco => 'PIX';
+          - caso contrário => 'DINHEIRO'.
+        """
+        if forma:
+            f = self._sane(forma)
+            f = (f or "").upper()
+            if f == "DEBITO":
+                f = "DÉBITO"
+            if f in {"DINHEIRO", "PIX", "DÉBITO"}:
+                return f
+        origem_norm = (origem or "").strip().lower()
+        if origem_norm in {"caixa", "caixa 2", "caixa2"}:
+            return "DINHEIRO"
+        if banco:
+            return "PIX"
+        return "DINHEIRO"
+
+    def _registrar_sobra_obs(self, cur, mov_id: int, sobra: float) -> None:
+        """Anota em `movimentacoes_bancarias.observacao` a sobra não aplicada (se houver)."""
+        if sobra > _EPS:
+            cur.execute(
+                """
+                UPDATE movimentacoes_bancarias
+                   SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
+                 WHERE id = ?
+                """,
+                (float(sobra), mov_id),
+            )
+
+    # ------------------------- API de compatibilidade -------------------------
+
+    def registrar_lancamento(
+        self,
+        *,
+        tipo_evento: str,                       # 'SAIDA' ou 'ENTRADA'
+        categoria_evento: Optional[str] = None,
+        subcategoria_evento: Optional[str] = None,
+        valor_evento: float | str = 0.0,
+        forma: Optional[str] = None,
+        forma_pagamento: Optional[str] = None,  # alias compat
+        metodo: Optional[str] = None,           # alias compat
+        meio_pagamento: Optional[str] = None,   # alias compat
+        origem: Optional[str] = None,
+        banco: Optional[str] = None,
+        descricao: Optional[str] = None,
+        usuario: Optional[str] = None,
+        trans_uid: Optional[str] = None,
+        data_evento: Optional[str] = None,
+        **_ignored: Any,                        # engole kwargs extras do UI/legado
+    ) -> Tuple[int, int]:
+        """Registrador genérico usado pelo LedgerService para **saídas avulsas**.
+
+        Comportamento:
+            - Para tipo_evento='SAIDA':
+                • se forma inferida == 'DINHEIRO' → chama `registrar_saida_dinheiro(...)`
+                • se forma inferida in {'PIX','DÉBITO'} → chama `registrar_saida_bancaria(...)`
+            - Para 'ENTRADA': não suportado neste mixin.
+        Retorno:
+            (id_saida, id_mov_bancaria) ou (-1, -1) se a transação idempotente já existir.
+
+        Raises:
+            NotImplementedError: para eventos do tipo 'ENTRADA'.
+            ValueError: se o valor da saída for inválido (<= 0).
+        """
+        tipo = (self._sane(tipo_evento) or "SAIDA").upper()
+        if tipo != "SAIDA":
+            raise NotImplementedError(
+                "registrar_lancamento: apenas SAIDA é suportado neste mixin. "
+                "Use o fluxo de entradas específico para ENTRADA."
+            )
+
+        valor = self._parse_money(valor_evento)
+        if valor <= 0:
+            raise ValueError("Valor da saída deve ser maior que zero.")
+
+        # Normaliza data e campos textuais
+        data = self._parse_date(data_evento)
+        categoria = self._sane(categoria_evento)
+        subcategoria = self._sane(subcategoria_evento)
+        desc = self._sane(descricao)
+        usuario_s = self._sane(usuario) or "-"
+
+        # Escolhe forma efetiva (considera aliases)
+        forma_eff = self._infer_forma(
+            forma=(forma or forma_pagamento or metodo or meio_pagamento),
+            banco=banco,
+            origem=origem,
+        )
+
+        if forma_eff == "DINHEIRO":
+            # origem_dinheiro precisa ser 'Caixa' ou 'Caixa 2'
+            origem_din = origem if origem in ("Caixa", "Caixa 2") else "Caixa"
+            return self.registrar_saida_dinheiro(
+                data=data,
+                valor=valor,
+                origem_dinheiro=origem_din,
+                categoria=categoria,
+                sub_categoria=subcategoria,
+                descricao=desc,
+                usuario=usuario_s,
+                trans_uid=trans_uid,  # pode ser None; será normalizado dentro
+            )
+
+        # PIX ou DÉBITO
+        banco_nome = self._sane(banco) or (self._sane(origem) or "Banco 1")
+        return self.registrar_saida_bancaria(
+            data=data,
+            valor=valor,
+            banco_nome=banco_nome,
+            forma=forma_eff,  # 'PIX' ou 'DÉBITO'
+            categoria=categoria,
+            sub_categoria=subcategoria,
+            descricao=desc,
+            usuario=usuario_s,
+            trans_uid=trans_uid,  # pode ser None; será normalizado dentro
+        )
+
+    # -------------------------- Fluxos específicos --------------------------
 
     def registrar_saida_dinheiro(
         self,
@@ -70,62 +255,45 @@ class _SaidasLedgerMixin:
         descricao: Optional[str],
         usuario: str,
         trans_uid: Optional[str] = None,
-        vinculo_pagamento: Optional[Dict] = None,
+        vinculo_pagamento: Optional[Dict[str, Any]] = None,
         pagamento_tipo: Optional[str] = None,
         pagamento_destino: Optional[str] = None,
         competencia_pagamento: Optional[str] = None,
         obrigacao_id_fatura: Optional[int] = None,
     ) -> Tuple[int, int]:
-        """Registra uma saída em dinheiro (Caixa/Caixa 2) e integra com CAP (opcional).
+        """Registra uma saída **em dinheiro** (Caixa/Caixa 2) e integra com CAP (opcional).
 
-        Valida o valor, ajusta o saldo do caixa correspondente, grava log em
-        `movimentacoes_bancarias` e, quando aplicável, executa:
-        - pagamento direto de fatura via `obrigacao_id_fatura`;
-        - vínculo direto com um título via `vinculo_pagamento`;
-        - classificação e auto-baixa por destino (fatura/boletos/empréstimos).
-
-        Args:
-            data (str): Data do lançamento em 'YYYY-MM-DD'.
-            valor (float): Valor da saída (> 0).
-            origem_dinheiro (str): "Caixa" ou "Caixa 2".
-            categoria (Optional[str]): Categoria da saída.
-            sub_categoria (Optional[str]): Subcategoria da saída.
-            descricao (Optional[str]): Descrição livre do lançamento.
-            usuario (str): Nome do usuário logado que executa o lançamento.
-            trans_uid (Optional[str]): UID idempotente da transação (auto-gerado se None).
-            vinculo_pagamento (Optional[Dict]): Vínculo direto com título (obrigacao_id/tipo_obrigacao/valor).
-            pagamento_tipo (Optional[str]): Tipo de pagamento para classificação (ex.: "FATURA_CARTAO").
-            pagamento_destino (Optional[str]): Destino para classificação (ex.: nome do cartão).
-            competencia_pagamento (Optional[str]): Competência contábil do pagamento (ex.: "2025-08").
-            obrigacao_id_fatura (Optional[int]): Id de obrigação para pagar fatura diretamente.
+        Regras:
+            - Atualiza `saldos_caixas` na coluna validada ('caixa' ou 'caixa_2').
+            - Loga a movimentação em `movimentacoes_bancarias` (origem='saidas').
+            - Se `obrigacao_id_fatura` for informado, tenta pagar fatura por obrigação
+              com prioridade; anota eventual sobra não aplicada no log da mov.
 
         Returns:
-            Tuple[int, int]: `(id_saida, id_mov_bancaria)`; retorna `(-1, -1)` se já existir `trans_uid`.
-
-        Raises:
-            ValueError: Se `valor <= 0` ou `origem_dinheiro` inválida.
+            (id_saida, id_mov_bancaria) ou (-1, -1) se trans_uid já existir.
         """
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
         if origem_dinheiro not in ("Caixa", "Caixa 2"):
             raise ValueError("Origem do dinheiro inválida (use 'Caixa' ou 'Caixa 2').")
 
-        categoria = sanitize(categoria)
-        sub_categoria = sanitize(sub_categoria)
-        descricao = sanitize(descricao)
-        usuario = sanitize(usuario)
+        categoria = self._sane(categoria)
+        sub_categoria = self._sane(sub_categoria)
+        descricao = self._sane(descricao)
+        usuario = self._sane(usuario) or "-"
 
-        trans_uid = trans_uid or uid_saida_dinheiro(
-            data, valor, origem_dinheiro, categoria, sub_categoria, descricao, usuario
+        # **IMPORTANTE**: valor como string para o gerador de UID (evita len(int))
+        valor_str = f"{float(valor):.2f}"
+
+        tuid = trans_uid or uid_saida_dinheiro(
+            data, valor_str, origem_dinheiro, categoria, sub_categoria, descricao, usuario
         )
-        if self.mov_repo.ja_existe_transacao(trans_uid):
-            logger.info(
-                "registrar_saida_dinheiro: trans_uid já existe (%s) — ignorando",
-                trans_uid,
-            )
-            return (-1, -1)
+        trans_uid_str = str(tuid)
 
-        eps = 0.005
+        if getattr(self, "mov_repo", None) and hasattr(self.mov_repo, "ja_existe_transacao"):
+            if self.mov_repo.ja_existe_transacao(trans_uid_str):
+                logger.info("registrar_saida_dinheiro: trans_uid já existe (%s) — ignorando", trans_uid_str)
+                return (-1, -1)
 
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
@@ -173,7 +341,7 @@ class _SaidasLedgerMixin:
                     float(valor),
                     obs,
                     id_saida,
-                    trans_uid,
+                    trans_uid_str,
                     usuario,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
@@ -192,15 +360,7 @@ class _SaidasLedgerMixin:
                     ledger_id=id_saida,
                     usuario=usuario,
                 )
-                if sobra > eps:
-                    cur.execute(
-                        """
-                        UPDATE movimentacoes_bancarias
-                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
-                         WHERE id = ?
-                        """,
-                        (float(sobra), id_mov),
-                    )
+                self._registrar_sobra_obs(cur, id_mov, sobra)
                 conn.commit()
                 logger.debug(
                     "registrar_saida_dinheiro: id_saida=%s id_mov=%s sobra=%.2f",
@@ -214,12 +374,7 @@ class _SaidasLedgerMixin:
             if vinculo_pagamento:
                 obrig_id = int(vinculo_pagamento["obrigacao_id"])
                 tipo_obrig = str(vinculo_pagamento["tipo_obrigacao"])
-                val = float(
-                    vinculo_pagamento.get(
-                        "valor_pagar",
-                        vinculo_pagamento.get("valor_pago", valor),
-                    )
-                )
+                val = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor)))
 
                 self.cap_repo.registrar_pagamento(
                     conn,
@@ -236,9 +391,7 @@ class _SaidasLedgerMixin:
 
             # (5) Classificação + Auto-baixa por destino/tipo
             if pagamento_tipo and pagamento_destino:
-                self._classificar_conta_a_pagar_por_destino(
-                    conn, pagamento_tipo, pagamento_destino
-                )
+                self._classificar_conta_a_pagar_por_destino(conn, pagamento_tipo, pagamento_destino)
                 restante = self._auto_baixar_pagamentos(
                     conn,
                     pagamento_tipo=pagamento_tipo,
@@ -251,15 +404,7 @@ class _SaidasLedgerMixin:
                     usuario=usuario,
                     competencia_pagamento=competencia_pagamento,
                 )
-                if restante > eps:
-                    cur.execute(
-                        """
-                        UPDATE movimentacoes_bancarias
-                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
-                         WHERE id = ?
-                        """,
-                        (float(restante), id_mov),
-                    )
+                self._registrar_sobra_obs(cur, id_mov, restante)
 
             conn.commit()
             logger.debug("registrar_saida_dinheiro: id_saida=%s id_mov=%s", id_saida, id_mov)
@@ -277,43 +422,24 @@ class _SaidasLedgerMixin:
         descricao: Optional[str],
         usuario: str,
         trans_uid: Optional[str] = None,
-        vinculo_pagamento: Optional[Dict] = None,
+        vinculo_pagamento: Optional[Dict[str, Any]] = None,
         pagamento_tipo: Optional[str] = None,
         pagamento_destino: Optional[str] = None,
         competencia_pagamento: Optional[str] = None,
         obrigacao_id_fatura: Optional[int] = None,
     ) -> Tuple[int, int]:
-        """Registra uma saída bancária (PIX/DÉBITO) e integra com CAP (opcional).
+        """Registra uma saída **bancária** (PIX/DÉBITO) e integra com CAP (opcional).
 
-        Valida o valor, ajusta o saldo do banco correspondente, grava log em
-        `movimentacoes_bancarias` e, quando aplicável, executa:
-        - pagamento direto de fatura via `obrigacao_id_fatura`;
-        - vínculo direto com um título via `vinculo_pagamento`;
-        - classificação e auto-baixa por destino (fatura/boletos/empréstimos).
-
-        Args:
-            data (str): Data do lançamento em 'YYYY-MM-DD'.
-            valor (float): Valor da saída (> 0).
-            banco_nome (str): Nome da coluna de banco a ser ajustada.
-            forma (str): "PIX" ou "DÉBITO".
-            categoria (Optional[str]): Categoria da saída.
-            sub_categoria (Optional[str]): Subcategoria da saída.
-            descricao (Optional[str]): Descrição livre do lançamento.
-            usuario (str): Nome do usuário logado que executa o lançamento.
-            trans_uid (Optional[str]): UID idempotente da transação (auto-gerado se None).
-            vinculo_pagamento (Optional[Dict]): Vínculo direto com título (obrigacao_id/tipo_obrigacao/valor).
-            pagamento_tipo (Optional[str]): Tipo de pagamento para classificação (ex.: "FATURA_CARTAO").
-            pagamento_destino (Optional[str]): Destino para classificação (ex.: nome do cartão).
-            competencia_pagamento (Optional[str]): Competência contábil do pagamento (ex.: "2025-08").
-            obrigacao_id_fatura (Optional[int]): Id de obrigação para pagar fatura diretamente.
+        Regras:
+            - Atualiza `saldos_bancos` pela coluna dinâmica (via `_ajustar_banco_dynamic`).
+            - Loga a movimentação em `movimentacoes_bancarias` (origem='saidas').
+            - Se `obrigacao_id_fatura` for informado, tenta pagar fatura por obrigação
+              com prioridade; anota eventual sobra não aplicada no log da mov.
 
         Returns:
-            Tuple[int, int]: `(id_saida, id_mov_bancaria)`; retorna `(-1, -1)` se já existir `trans_uid`.
-
-        Raises:
-            ValueError: Se `valor <= 0` ou `forma` inválida.
+            (id_saida, id_mov_bancaria) ou (-1, -1) se trans_uid já existir.
         """
-        forma_u = sanitize(forma).upper()
+        forma_u = (self._sane(forma) or "").upper()
         if forma_u == "DEBITO":
             forma_u = "DÉBITO"
         if forma_u not in ("PIX", "DÉBITO"):
@@ -321,23 +447,24 @@ class _SaidasLedgerMixin:
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
 
-        banco_nome = sanitize(banco_nome)
-        categoria = sanitize(categoria)
-        sub_categoria = sanitize(sub_categoria)
-        descricao = sanitize(descricao)
-        usuario = sanitize(usuario)
+        banco_nome = self._sane(banco_nome) or "Banco 1"
+        categoria = self._sane(categoria)
+        sub_categoria = self._sane(sub_categoria)
+        descricao = self._sane(descricao)
+        usuario = self._sane(usuario) or "-"
 
-        trans_uid = trans_uid or uid_saida_bancaria(
-            data, valor, banco_nome, forma_u, categoria, sub_categoria, descricao, usuario
+        # **IMPORTANTE**: valor como string para o gerador de UID (evita len(int))
+        valor_str = f"{float(valor):.2f}"
+
+        tuid = trans_uid or uid_saida_bancaria(
+            data, valor_str, banco_nome, forma_u, categoria, sub_categoria, descricao, usuario
         )
-        if self.mov_repo.ja_existe_transacao(trans_uid):
-            logger.info(
-                "registrar_saida_bancaria: trans_uid já existe (%s) — ignorando",
-                trans_uid,
-            )
-            return (-1, -1)
+        trans_uid_str = str(tuid)
 
-        eps = 0.005
+        if getattr(self, "mov_repo", None) and hasattr(self.mov_repo, "ja_existe_transacao"):
+            if self.mov_repo.ja_existe_transacao(trans_uid_str):
+                logger.info("registrar_saida_bancaria: trans_uid já existe (%s) — ignorando", trans_uid_str)
+                return (-1, -1)
 
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
@@ -381,7 +508,7 @@ class _SaidasLedgerMixin:
                     float(valor),
                     obs,
                     id_saida,
-                    trans_uid,
+                    trans_uid_str,
                     usuario,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
@@ -400,15 +527,7 @@ class _SaidasLedgerMixin:
                     ledger_id=id_saida,
                     usuario=usuario,
                 )
-                if sobra > eps:
-                    cur.execute(
-                        """
-                        UPDATE movimentacoes_bancarias
-                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
-                         WHERE id = ?
-                        """,
-                        (float(sobra), id_mov),
-                    )
+                self._registrar_sobra_obs(cur, id_mov, sobra)
                 conn.commit()
                 logger.debug(
                     "registrar_saida_bancaria: id_saida=%s id_mov=%s sobra=%.2f",
@@ -422,12 +541,7 @@ class _SaidasLedgerMixin:
             if vinculo_pagamento:
                 obrig_id = int(vinculo_pagamento["obrigacao_id"])
                 tipo_obrig = str(vinculo_pagamento["tipo_obrigacao"])
-                val = float(
-                    vinculo_pagamento.get(
-                        "valor_pagar",
-                        vinculo_pagamento.get("valor_pago", valor),
-                    )
-                )
+                val = float(vinculo_pagamento.get("valor_pagar", vinculo_pagamento.get("valor_pago", valor)))
 
                 self.cap_repo.registrar_pagamento(
                     conn,
@@ -444,9 +558,7 @@ class _SaidasLedgerMixin:
 
             # (5) Classificação + Auto-baixa por destino/tipo
             if pagamento_tipo and pagamento_destino:
-                self._classificar_conta_a_pagar_por_destino(
-                    conn, pagamento_tipo, pagamento_destino
-                )
+                self._classificar_conta_a_pagar_por_destino(conn, pagamento_tipo, pagamento_destino)
                 restante = self._auto_baixar_pagamentos(
                     conn,
                     pagamento_tipo=pagamento_tipo,
@@ -459,15 +571,7 @@ class _SaidasLedgerMixin:
                     usuario=usuario,
                     competencia_pagamento=competencia_pagamento,
                 )
-                if restante > eps:
-                    cur.execute(
-                        """
-                        UPDATE movimentacoes_bancarias
-                           SET observacao = COALESCE(observacao,'') || ' [Sobra não aplicada: R$ ' || printf('%.2f', ?) || ']'
-                         WHERE id = ?
-                        """,
-                        (float(restante), id_mov),
-                    )
+                self._registrar_sobra_obs(cur, id_mov, restante)
 
             conn.commit()
             logger.debug("registrar_saida_bancaria: id_saida=%s id_mov=%s", id_saida, id_mov)
