@@ -7,15 +7,15 @@ Regras principais:
 - Ordem de aplicação: FIFO por vencimento das parcelas em aberto da obrigação.
 - Rateio do pagamento:
     • principal → vai para `valor_pago_acumulado` das parcelas (CASCADE entre parcelas).
-    • juros     → vai para `juros_pago` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-    • multa     → vai para `multa_paga` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-    • desconto  → vai para `desconto_aplicado` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-- Saída de caixa/banco: calculada pelo Repository como
-  (principal + juros + multa − desconto) para cada aplicação.
-- trans_uid: gerado por operação e retornado ao chamador.
-- Este serviço NÃO cria eventos novos no CAP; apenas aplica/acumula nos lançamentos
-  já programados (parcelas). A criação de Saída/Mov. bancária pode ser feita por
-  outro serviço financeiro reutilizando o `saida_total` agregado.
+    • juros     → vai para `juros_*` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • multa     → vai para `multa_*` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • desconto  → vai para `desconto_*` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+- Saída de caixa/banco: (principal + juros + multa − desconto) agregado.
+- trans_uid: gerado por operação (idempotência).
+- Este serviço atualiza CAP; a criação de movimentação:
+  • se o pagamento vier do fluxo de SAÍDA (registrar_saida_*), a mov. já é registrada lá;
+  • se o pagamento for direto por aqui, este serviço registra 1 linha em `movimentacoes_bancarias`
+    usando `forma_pagamento` e `origem` passados.
 
 Dependências (Repository):
 - listar_parcelas_em_aberto_fifo(conn, obrigacao_id)
@@ -32,25 +32,15 @@ from uuid import uuid4
 import sqlite3
 
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+# Utilitários de infra para padronizar logs de movimentação
+from services.ledger.service_ledger_infra import _ensure_mov_cols, _fmt_obs_saida
 
 _EPS = 1e-9  # Tolerância numérica para comparações de ponto flutuante
 
 
 @dataclass
 class ResultadoParcela:
-    """Snapshot resumido do efeito do pagamento em uma parcela de fatura.
-
-    Attributes:
-        parcela_id: ID da parcela afetada.
-        aplicado_principal: Valor de principal aplicado nesta parcela (amortização).
-        aplicado_juros: Valor de juros aplicado nesta parcela (somente 1ª aberta).
-        aplicado_multa: Valor de multa aplicado nesta parcela (somente 1ª aberta).
-        aplicado_desconto: Valor de desconto aplicado nesta parcela (somente 1ª aberta).
-        saida_total: Impacto total de caixa/banco nesta parcela
-            (principal + juros + multa − desconto), calculado no Repository.
-        status: Novo status da parcela após a aplicação (e.g., "PARCIAL", "QUITADO").
-        restante_principal: Principal ainda em aberto após a aplicação nesta parcela.
-    """
+    """Snapshot resumido do efeito do pagamento em uma parcela de fatura."""
     parcela_id: int
     aplicado_principal: float
     aplicado_juros: float
@@ -65,16 +55,116 @@ class ServiceLedgerFatura:
     """Serviço de pagamento de FATURA_CARTAO com rateio FIFO e encargos na 1ª parcela aberta."""
 
     def __init__(self, db_path: str) -> None:
-        """Inicializa o serviço.
-
-        Args:
-            db_path: Caminho do arquivo SQLite.
-        """
         self.db_path = db_path
         self.cap_repo = ContasAPagarMovRepository(db_path)
 
     # ------------------------------------------------------------------
-    # API principal
+    # API compatível com o helper legado (_pagar_fatura_por_obrigacao)
+    # ------------------------------------------------------------------
+    def pagar_fatura_cartao(self, *args, **kwargs) -> Dict[str, Any]:
+        """
+        Wrapper compatível:
+        - Aceita `conn` como 1º argumento posicional (opcional).
+        - Aceita `valor_base` **ou** `valor` (alias para principal) ou `principal`.
+        - Aceita `juros/multa/desconto`, `data_evento`, `usuario`.
+        - Usa (quando fornecidos) `forma_pagamento` e `origem` para registrar
+          uma linha em `movimentacoes_bancarias` quando o pagamento é feito
+          diretamente por este serviço (sem passar por registrar_saida_*).
+        - Retorna dict com `ok`, `sobra`, `obrigacao_id`, `ids`, `trans_uid`,
+          `saida_total`, `resultados`, e opcional `mensagem`.
+        """
+        conn: Optional[sqlite3.Connection] = None
+        if args and isinstance(args[0], sqlite3.Connection):
+            conn = args[0]
+
+        obrigacao_id = int(kwargs.get("obrigacao_id"))
+
+        # Mapear principal (alias)
+        if "valor_base" in kwargs:
+            principal = float(kwargs.get("valor_base") or 0.0)
+        elif "valor" in kwargs:
+            principal = float(kwargs.get("valor") or 0.0)
+        else:
+            principal = float(kwargs.get("principal") or 0.0)
+
+        juros = float(kwargs.get("juros") or 0.0)
+        multa = float(kwargs.get("multa") or 0.0)
+        desconto = float(kwargs.get("desconto") or 0.0)
+        data_evento = kwargs.get("data_evento")
+        usuario = kwargs.get("usuario") or "-"
+
+        # Infos para possível log de movimentação direta
+        forma_pagamento = (kwargs.get("forma_pagamento") or kwargs.get("forma") or "DINHEIRO").upper()
+        if forma_pagamento == "DEBITO":
+            forma_pagamento = "DÉBITO"
+        origem = kwargs.get("origem") or ("Caixa" if forma_pagamento == "DINHEIRO" else "Banco 1")
+
+        ledger_id = kwargs.get("ledger_id")  # quando pagamento veio do fluxo de SAÍDA
+        trans_uid_ext = kwargs.get("trans_uid")  # se vier de fora, preservamos
+
+        core = self._pagar_core(
+            obrigacao_id=obrigacao_id,
+            principal=principal,
+            juros=juros,
+            multa=multa,
+            desconto=desconto,
+            data_evento=data_evento,
+            usuario=usuario,
+            conn=conn,
+            trans_uid_override=trans_uid_ext,
+        )
+
+        # Se NÃO veio do fluxo de SAÍDA (sem ledger_id), registramos a movimentação aqui.
+        # Evita duplicidade usando o mesmo trans_uid.
+        if ledger_id is None and core["saida_total"] > 0:
+            with self._conn_ctx(conn) as c:
+                if not self._mov_ja_existe(c, core["trans_uid"]):
+                    _ensure_mov_cols(c.cursor())
+                    obs = _fmt_obs_saida(
+                        forma=forma_pagamento,
+                        valor=float(core["saida_total"]),
+                        categoria="FATURA_CARTAO",
+                        subcategoria=None,
+                        descricao=f"Pagamento fatura (obrigação {obrigacao_id})",
+                        banco=(origem if forma_pagamento == "DÉBITO" else None),
+                    )
+                    c.execute(
+                        """
+                        INSERT INTO movimentacoes_bancarias
+                            (data, banco, tipo, valor, origem, observacao,
+                             referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
+                        VALUES (?, ?, 'saida', ?, 'saidas', ?, 'fatura_cartao', ?, ?, ?, ?)
+                        """,
+                        (
+                            (data_evento or datetime.now().strftime("%Y-%m-%d")),
+                            origem,
+                            float(core["saida_total"]),
+                            obs,
+                            int(obrigacao_id),
+                            core["trans_uid"],
+                            usuario,
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        ),
+                    )
+                    # Commit é feito pelo _conn_ctx quando abrimos a conexão internamente
+
+        # Monta resposta padronizada (esperada pelo helper compat)
+        resp = {
+            "ok": True,
+            "obrigacao_id": obrigacao_id,
+            "sobra": float(core["sobra"]),
+            "trans_uid": core["trans_uid"],
+            "saida_total": float(core["saida_total"]),
+            "resultados": core["resultados"],
+            "ids": {"ledger_id": ledger_id if ledger_id is not None else None, "cap_evento_id": None, "mov_id": None},
+        }
+        if core.get("mensagem"):
+            resp["ok"] = False
+            resp["mensagem"] = core["mensagem"]
+        return resp
+
+    # ------------------------------------------------------------------
+    # API principal (mantida) — agora também retorna `sobra`
     # ------------------------------------------------------------------
     def pagar_fatura(
         self,
@@ -88,36 +178,48 @@ class ServiceLedgerFatura:
         usuario: str = "-",
         conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, Any]:
-        """Aplica o pagamento de fatura de cartão conforme regras FIFO e de encargos.
+        """Aplica o pagamento de fatura de cartão conforme regras FIFO e de encargos."""
+        core = self._pagar_core(
+            obrigacao_id=obrigacao_id,
+            principal=principal,
+            juros=juros,
+            multa=multa,
+            desconto=desconto,
+            data_evento=data_evento,
+            usuario=usuario,
+            conn=conn,
+        )
+        return {
+            "trans_uid": core["trans_uid"],
+            "saida_total": float(core["saida_total"]),
+            "resultados": core["resultados"],
+            "sobra": float(core["sobra"]),
+            **({"mensagem": core["mensagem"]} if core.get("mensagem") else {}),
+        }
 
-        Regras:
-            - O `principal` é aplicado em cascata sobre as parcelas em aberto (FIFO).
-            - `juros`, `multa` e `desconto` são aplicados apenas na PRIMEIRA parcela
-              ainda em aberto no momento da operação (não cascateiam).
-
-        Args:
-            obrigacao_id: Identificador do grupo (fatura) a ser pago.
-            principal: Valor destinado à amortização do principal (>= 0).
-            juros: Encargo de juros a aplicar na 1ª parcela aberta (>= 0).
-            multa: Encargo de multa a aplicar na 1ª parcela aberta (>= 0).
-            desconto: Desconto a aplicar na 1ª parcela aberta (>= 0).
-            data_evento: Data do evento no formato 'YYYY-MM-DD'. Padrão: data de hoje.
-            usuario: Identificação do operador.
-            conn: Conexão SQLite opcional. Se omitida, o serviço gerencia a transação.
-
-        Returns:
-            Dict com:
-                - trans_uid (str): identificador único desta operação.
-                - saida_total (float): soma do impacto de caixa/banco em todas as parcelas.
-                - resultados (list[dict]): lista de snapshots por parcela aplicada.
-                - (opcional) mensagem (str): quando não há parcelas em aberto.
-
-        Notes:
-            - O cálculo da saída (principal + juros + multa − desconto) é feito no Repository.
-            - Este serviço não cria linhas em CAP; apenas aplica/acumula na programação existente.
-        """
+    # ------------------------------------------------------------------
+    # Núcleo compartilhado
+    # ------------------------------------------------------------------
+    def _pagar_core(
+        self,
+        *,
+        obrigacao_id: int,
+        principal: float,
+        juros: float,
+        multa: float,
+        desconto: float,
+        data_evento: Optional[str],
+        usuario: str,
+        conn: Optional[sqlite3.Connection],
+        trans_uid_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Núcleo de aplicação do pagamento com retorno padronizado para wrappers."""
         data_evt = data_evento or datetime.now().strftime("%Y-%m-%d")
-        trans_uid = f"FATURA-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        trans_uid = (
+            trans_uid_override
+            if trans_uid_override
+            else f"FATURA-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        )
 
         # Sanitização (não permitir negativos)
         restante_principal = max(0.0, float(principal or 0.0))
@@ -129,22 +231,20 @@ class ServiceLedgerFatura:
         saida_total_agregado = 0.0
 
         with self._conn_ctx(conn) as c:
-            # 1) Obter parcelas em aberto (FIFO) desta fatura (obrigacao_id)
             fifo = self.cap_repo.listar_parcelas_em_aberto_fifo(c, obrigacao_id=obrigacao_id)
             if not fifo:
                 return {
                     "trans_uid": trans_uid,
                     "saida_total": 0.0,
                     "resultados": [],
+                    "sobra": float(restante_principal),
                     "mensagem": "Nenhuma parcela em aberto para esta fatura.",
                 }
 
-            # 2) Encargos são aplicados apenas na 1ª parcela aberta
             encargos_pend = {"juros": juros, "multa": multa, "desconto": desconto}
             primeira = True
 
             for p in fifo:
-                # Se já não há principal a aplicar e já passamos da 1ª parcela (encargos aplicados), encerramos
                 if restante_principal <= _EPS and not primeira:
                     break
 
@@ -152,14 +252,12 @@ class ServiceLedgerFatura:
                 faltante_parcela = float(p["principal_faltante"] or 0.0)
 
                 aplicar_principal = min(restante_principal, max(0.0, faltante_parcela))
-                # Atualiza o restante do principal (2 casas para manter consistência monetária)
                 restante_principal = round(restante_principal - aplicar_principal, 2)
 
                 if primeira:
                     aplicar_juros = encargos_pend["juros"]
                     aplicar_multa = encargos_pend["multa"]
                     aplicar_desconto = encargos_pend["desconto"]
-                    # Zera pendências de encargos para as próximas parcelas
                     encargos_pend = {"juros": 0.0, "multa": 0.0, "desconto": 0.0}
                     primeira = False
                 else:
@@ -193,7 +291,6 @@ class ServiceLedgerFatura:
                     )
                 )
 
-                # Se não há mais principal a aplicar e nada foi aplicado nesta iteração, encerramos
                 if restante_principal <= _EPS and aplicar_principal <= _EPS:
                     break
 
@@ -201,24 +298,22 @@ class ServiceLedgerFatura:
             "trans_uid": trans_uid,
             "saida_total": float(saida_total_agregado),
             "resultados": [r.__dict__ for r in resultados],
+            "sobra": float(restante_principal),
         }
+
+    # ------------------------------------------------------------------
+    # Movimentação direta (quando não veio do fluxo de SAÍDA)
+    # ------------------------------------------------------------------
+    def _mov_ja_existe(self, conn: sqlite3.Connection, trans_uid: str) -> bool:
+        cur = conn.execute("SELECT 1 FROM movimentacoes_bancarias WHERE trans_uid = ? LIMIT 1", (trans_uid,))
+        return cur.fetchone() is not None
 
     # ------------------------------------------------------------------
     # Utilitário interno: contexto de conexão/commit
     # ------------------------------------------------------------------
     @contextmanager
     def _conn_ctx(self, conn: Optional[sqlite3.Connection]) -> Iterator[sqlite3.Connection]:
-        """Gerencia a conexão SQLite.
-
-        Se `conn` for fornecida, a função apenas a reutiliza (sem fechar/commit).
-        Caso contrário, abre uma conexão nova, faz commit e fecha ao final.
-
-        Args:
-            conn: Conexão SQLite existente (opcional).
-
-        Yields:
-            Conexão SQLite utilizável dentro do bloco `with`.
-        """
+        """Gerencia a conexão SQLite (reusa a existente ou cria/commita/fecha)."""
         if conn is not None:
             yield conn
         else:

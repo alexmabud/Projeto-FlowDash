@@ -13,7 +13,7 @@ Compatibilidade e decisões:
     • Caso contrário, faz fallback criando a saída (dinheiro/bancária) com `obrigacao_id_fatura`,
       o que aplica o pagamento e retorna IDs de saída/log.
 - Boletos/Empréstimos:
-    • Aceita retorno legado (tupla com IDs) **ou** retorno novo (dict). Calcula restante/status
+    • Aceita retorno legado (tupla com IDs) **ou** retorno novo (dict). Calcule restante/status
       diretamente no banco quando precisar.
 - Valor em aberto/Status:
     • Preferimos `principal_pago_acumulado` (padrão novo). Se não existir, caímos para
@@ -119,6 +119,24 @@ def _opcoes_pagamentos(caminho_banco: str, tipo: str) -> list[str]:
             return df["rotulo"].sort_values().tolist()
 
     return []
+
+
+# ---------- Contador seguro (lista/tupla/set → len; int/float truthy → 1; None/falsy → 0)
+def _safe_count(x: Any) -> int:
+    if x is None:
+        return 0
+    if isinstance(x, (list, tuple, set)):
+        return len(x)
+    # alguns serviços antigos retornam 1 id inteiro (ou 0/None)
+    try:
+        # int/float/bool
+        return 1 if int(x) != 0 else 0
+    except Exception:
+        # último recurso: tenta len genérico
+        try:
+            return len(x)  # type: ignore[arg-type]
+        except Exception:
+            return 0
 
 
 # ---------------- Helpers de coluna de valor/saldo (para mostrar "valor em aberto")
@@ -705,12 +723,13 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             fechamento=int(fechamento),
             vencimento=int(vencimento),
         )
+        parcelas_criadas = _safe_count(ids_fatura)
         return {
             "ok": True,
             "msg": (
                 "ℹ️ Transação já registrada (idempotência)."
-                if not ids_fatura
-                else f"✅ Despesa em CRÉDITO programada! Valor: {valor_saida:.2f} | Parcelas criadas: {len(ids_fatura)} | Log: {id_mov}"
+                if parcelas_criadas == 0
+                else f"✅ Despesa em CRÉDITO programada! Valor: {valor_saida:.2f} | Parcelas criadas: {parcelas_criadas} | Log: {id_mov}"
             ),
         }
 
@@ -816,12 +835,13 @@ def registrar_saida(caminho_banco: str, data_lanc: date, usuario_nome: str, payl
             id_mov = int(cur.lastrowid)
             conn.commit()
 
+        parcelas_criadas = _safe_count(ids_cap)
         return {
             "ok": True,
             "msg": (
                 "ℹ️ Transação já registrada (idempotência)."
-                if not ids_cap
-                else f"✅ Boleto programado! Valor: {float(valor_saida):.2f} | Parcelas criadas: {len(ids_cap)} | Obrigação: {obrigacao_id} | Log: {id_mov}"
+                if parcelas_criadas == 0
+                else f"✅ Boleto programado! Valor: {float(valor_saida):.2f} | Parcelas criadas: {parcelas_criadas} | Obrigação: {obrigacao_id} | Log: {id_mov}"
             ),
         }
 
