@@ -33,19 +33,7 @@ if _PROJECT_ROOT not in sys.path:
 # Utils: resolução dinâmica de símbolos (classes) com fallbacks
 # =====================================================================
 def _resolve_symbol(mod_names: list[str], attr_candidates: list[str]) -> Optional[Type[Any]]:
-    """Tenta obter uma classe pesquisando, na ordem, módulos e nomes de atributos.
-
-    Percorre a lista de módulos `mod_names` e tenta importá-los. Para cada módulo
-    importado com sucesso, retorna o primeiro atributo cujo nome esteja em
-    `attr_candidates` e seja uma classe (``type``).
-
-    Args:
-        mod_names: Lista de nomes de módulos para tentar importar (em ordem de preferência).
-        attr_candidates: Lista de nomes de atributos (classes) a buscar nos módulos.
-
-    Returns:
-        A classe encontrada ou ``None`` caso nenhuma combinação (módulo, atributo) seja válida.
-    """
+    """Tenta obter uma classe pesquisando, na ordem, módulos e nomes de atributos."""
     for mod in mod_names:
         try:
             m = importlib.import_module(mod)
@@ -63,16 +51,7 @@ def _resolve_mixin(
     primary_attrs: list[str],
     fallback: Optional[Type[Any]] = None,
 ) -> Type[Any]:
-    """Resolve um mixin por nome de módulo/atributo com fallback opcional.
-
-    Args:
-        primary_mods: Módulos onde o mixin pode estar definido.
-        primary_attrs: Nomes de classe candidatos para o mixin.
-        fallback: Classe de fallback quando nada é encontrado.
-
-    Returns:
-        Uma classe (mixin) válida para compor a MRO.
-    """
+    """Resolve um mixin por nome de módulo/atributo com fallback opcional."""
     cls = _resolve_symbol(primary_mods, primary_attrs)
     return cls or (fallback or type("EmptyMixin", (), {}))
 
@@ -80,7 +59,6 @@ def _resolve_mixin(
 # =====================================================================
 # Repositórios (dinâmicos; sem import estático rígido)
 # =====================================================================
-# Movimentações: preferir o nome novo; aceitar legado
 MovimentacoesRepoType: Optional[Type[Any]] = _resolve_symbol(
     mod_names=[
         "repository.movimentacoes_repository",
@@ -92,7 +70,6 @@ MovimentacoesRepoType: Optional[Type[Any]] = _resolve_symbol(
     ],
 )
 
-# Cartões: preferir o nome novo; aceitar legado
 CartoesRepoType: Optional[Type[Any]] = _resolve_symbol(
     mod_names=[
         "repository.cartoes_repository",
@@ -166,6 +143,7 @@ if _FaturaMixin is None:
         class _FaturaMixin:  # type: ignore
             """Wrapper fino quando só existe ServiceLedgerFatura (sem mixin direto)."""
 
+            # -------- núcleo privado: assinatura canônica esperada pelo ServiceLedgerFatura
             def _pagar_fatura_impl(
                 self,
                 *,
@@ -177,7 +155,6 @@ if _FaturaMixin is None:
                 data_evento: str | None = None,
                 usuario: str = "-",
             ) -> dict[str, Any]:
-                """Encaminha a chamada para ServiceLedgerFatura.pagar_fatura()."""
                 svc = _ServiceFatura(self.db_path)  # type: ignore[attr-defined]
                 return svc.pagar_fatura(
                     obrigacao_id=obrigacao_id,
@@ -190,13 +167,46 @@ if _FaturaMixin is None:
                     conn=None,
                 )
 
+            # -------- wrappers públicos com normalização de aliases (compat UI)
+            @staticmethod
+            def _normalize_fatura_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+                """Normaliza nomes usados na UI para a assinatura canônica do serviço."""
+                obrig = (
+                    kwargs.get("obrigacao_id")
+                    or kwargs.get("obrigacao_id_fatura")
+                    or kwargs.get("fatura_id")
+                )
+                principal = (
+                    kwargs.get("principal")
+                    if kwargs.get("principal") is not None
+                    else (
+                        kwargs.get("valor_principal")
+                        if kwargs.get("valor_principal") is not None
+                        else (
+                            kwargs.get("valor_base")
+                            if kwargs.get("valor_base") is not None
+                            else kwargs.get("valor", 0.0)
+                        )
+                    )
+                )
+                data_evt = kwargs.get("data_evento") or kwargs.get("data")
+                return {
+                    "obrigacao_id": int(obrig or 0),
+                    "principal": float(principal or 0.0),
+                    "juros": float(kwargs.get("juros") or 0.0),
+                    "multa": float(kwargs.get("multa") or 0.0),
+                    "desconto": float(kwargs.get("desconto") or 0.0),
+                    "data_evento": data_evt,
+                    "usuario": (kwargs.get("usuario") or "-"),
+                }
+
             def pagar_fatura(self, **kwargs: Any) -> dict[str, Any]:
-                """Alias compatível para pagar fatura."""
-                return self._pagar_fatura_impl(**kwargs)
+                norm = self._normalize_fatura_kwargs(kwargs)
+                return self._pagar_fatura_impl(**norm)
 
             def pagar_fatura_cartao(self, **kwargs: Any) -> dict[str, Any]:
-                """Alias compatível alternativo para pagar fatura."""
-                return self._pagar_fatura_impl(**kwargs)
+                norm = self._normalize_fatura_kwargs(kwargs)
+                return self._pagar_fatura_impl(**norm)
 
     else:
 
@@ -233,11 +243,6 @@ class LedgerService(
     """
 
     def __init__(self, db_path: str) -> None:
-        """Inicializa a fachada do Ledger.
-
-        Args:
-            db_path: Caminho do arquivo SQLite (banco de dados).
-        """
         self.db_path = db_path
 
         # Repositórios aguardados pelos mixins
@@ -248,7 +253,6 @@ class LedgerService(
         # Serviço específico de BOLETO (instanciado sob demanda — evita dependências circulares)
         self._boleto_svc: Optional[ServiceLedgerBoleto] = None
 
-        # Cooperativo, caso algum mixin possua __init__
         try:
             super().__init__()  # type: ignore[misc]
         except TypeError:
@@ -261,11 +265,6 @@ class LedgerService(
 
     # ------------------ Ponte/Delegação para BOLETO ------------------
     def _get_boleto(self) -> ServiceLedgerBoleto:
-        """Instancia lazy o serviço de boleto para evitar dependências circulares.
-
-        Returns:
-            Instância de :class:`ServiceLedgerBoleto`.
-        """
         if self._boleto_svc is None:
             self._boleto_svc = ServiceLedgerBoleto(self.db_path)
         return self._boleto_svc
@@ -289,44 +288,11 @@ class LedgerService(
         data_compra: str | None = None,     # compat
         metodo: str | None = None,          # compat (alguns fluxos)
         meio_pagamento: str | None = None,  # compat (alguns fluxos)
-        **_ignored: Any,                    # engole kwargs extras (ex.: documento, parcelas)
+        **_ignored: Any,                    # engole kwargs extras
     ) -> dict[str, Any]:
-        """Registra saída de BOLETO (avulsa) ou paga parcela via serviço (FIFO).
-
-        Comportamento:
-            - Com `obrigacao_id`: delega pagamento de parcela (FIFO) ao :class:`ServiceLedgerBoleto`.
-            - Sem `obrigacao_id`: registra SAÍDA avulsa com categoria 'BOLETO' via `registrar_lancamento`.
-            - Aceita `data_compra`, `metodo`, `meio_pagamento` e ignora kwargs desconhecidos.
-            - Se `forma` não vier, infere: origem 'Caixa/Caixa 2' → "DINHEIRO"; senão, se há `banco` → "PIX";
-              caso contrário → "DINHEIRO".
-
-        Args:
-            valor: Valor do evento (principal quando pago via obrigação).
-            forma: Forma de pagamento (opcional; pode ser inferida).
-            origem: Origem do recurso ("Caixa", "Caixa 2", ou nome do banco/conta).
-            banco: Nome do banco quando aplicável.
-            descricao: Descrição legada da saída.
-            usuario: Usuário operador.
-            trans_uid: Token idempotente legada (não obrigatório aqui).
-            obrigacao_id: Identificador da obrigação (grupo de parcelas). Se informado, aciona pagamento FIFO.
-            parcela_id: Ignorado no fluxo FIFO (apenas compat).
-            juros: Juros a aplicar na primeira parcela aberta (pagamento via obrigação).
-            multa: Multa a aplicar na primeira parcela aberta (pagamento via obrigação).
-            desconto: Desconto a aplicar na primeira parcela aberta (pagamento via obrigação).
-            data_evento: Data do evento (YYYY-MM-DD).
-            data_compra: Alias de compatibilidade para data do evento.
-            metodo: Alias de compatibilidade para forma de pagamento.
-            meio_pagamento: Alias de compatibilidade para forma de pagamento.
-            **_ignored: Parâmetros legados ignorados.
-
-        Returns:
-            Dicionário com o resultado da operação. No caso de pagamento de parcela,
-            retorna a estrutura do serviço de boleto (`trans_uid`, `saida_total`, `resultados`).
-        """
-        # Normaliza data
+        """Registra saída de BOLETO (avulsa) ou paga parcela via serviço (FIFO)."""
         _data_evt = data_evento or data_compra
 
-        # Normaliza/infere forma
         _forma = (forma or metodo or meio_pagamento)
         if not _forma:
             origem_norm = (origem or "").strip().lower()
@@ -338,7 +304,6 @@ class LedgerService(
                 _forma = "DINHEIRO"
 
         if obrigacao_id is not None:
-            # Pagamento de parcela (delegado ao serviço de boleto). 'forma' não é usada na lógica de CAP.
             boleto = self._get_boleto()
             return boleto.registrar_saida_boleto(
                 valor=valor,
@@ -356,7 +321,6 @@ class LedgerService(
                 data_evento=_data_evt,
             )
 
-        # Saída AVULSA (sem CAP) — usa o registrador genérico do Ledger
         return self.registrar_lancamento(
             tipo_evento="SAIDA",
             categoria_evento="BOLETO",
@@ -372,25 +336,10 @@ class LedgerService(
 
     # ------------------ Dispatcher seguro para 'registrar_lancamento' ------------------
     def registrar_lancamento(self, **kwargs: Any) -> dict[str, Any]:
-        """Despacha para a primeira implementação real de `registrar_lancamento` na MRO.
-
-        Vasculha a MRO (exceto a própria classe) procurando uma implementação concreta
-        de `registrar_lancamento`. Ao encontrar, delega a chamada e retorna o resultado.
-
-        Args:
-            **kwargs: Parâmetros a serem repassados para a implementação encontrada.
-
-        Returns:
-            Dicionário com o resultado da operação (conforme implementação do mixin de saídas).
-
-        Raises:
-            RuntimeError: Caso nenhum mixin com `registrar_lancamento` esteja presente.
-        """
         for base in self.__class__.mro()[1:]:
             impl = base.__dict__.get("registrar_lancamento")
             if impl is not None:
                 return impl(self, **kwargs)  # type: ignore[misc]
-
         raise RuntimeError(
             "registrar_lancamento() não está disponível no LedgerService.\n"
             "- Verifique se o mixin de saídas está presente (services.ledger.service_ledger_saida)\n"
@@ -398,45 +347,88 @@ class LedgerService(
             "- Alternativa: informe 'obrigacao_id' para usar o fluxo de pagamento de parcela de BOLETO."
         )
 
+    # ------------------ Wrappers compat: BOLETO & EMPRESTIMO ------------------
     def pagar_parcela_boleto(
         self,
         *,
-        obrigacao_id: int,
-        parcela_id: int | None = None,  # compat; ignorado (pagamento é FIFO)
-        valor_base: float,
+        obrigacao_id: int | None = None,
+        obrigacao_id_boleto: int | None = None,  # alias aceito
+        parcela_id: int | None = None,           # compat; ignorado (FIFO)
+        valor_base: float | None = None,
+        valor_principal: float | None = None,    # alias aceito
+        valor: float | None = None,              # alias legado
         juros: float = 0.0,
         multa: float = 0.0,
         desconto: float = 0.0,
         usuario: str | None = None,
         data_evento: str | None = None,
+        data: str | None = None,                 # alias aceito
         **_kwargs: Any,
     ) -> dict[str, Any]:
-        """Alias compatível — delega ao serviço de boleto (FIFO dentro da obrigação).
+        """Compat: delega ao serviço de BOLETO (FIFO). Aceita aliases de IDs/valor/data."""
+        _obrig = obrigacao_id if obrigacao_id is not None else (obrigacao_id_boleto or 0)
+        _principal = (
+            valor_base
+            if valor_base is not None
+            else (valor_principal if valor_principal is not None else (valor or 0.0))
+        )
+        _data_evt = data_evento or data
 
-        Args:
-            obrigacao_id: Identificador da obrigação (grupo de parcelas).
-            parcela_id: Ignorado — mantido apenas para compatibilidade.
-            valor_base: Valor de principal a aplicar.
-            juros: Juros a aplicar (1ª parcela aberta).
-            multa: Multa a aplicar (1ª parcela aberta).
-            desconto: Desconto a aplicar (1ª parcela aberta).
-            usuario: Usuário operador.
-            data_evento: Data do evento (YYYY-MM-DD).
-            **_kwargs: Parâmetros legados ignorados.
-
-        Returns:
-            Estrutura retornada por :meth:`ServiceLedgerBoleto.pagar_parcela_boleto`.
-        """
         boleto = self._get_boleto()
         return boleto.pagar_parcela_boleto(
-            obrigacao_id=obrigacao_id,
+            obrigacao_id=int(_obrig),
             parcela_id=parcela_id,
-            valor_base=valor_base,
-            juros=juros,
-            multa=multa,
-            desconto=desconto,
+            valor_base=float(_principal or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
             usuario=usuario or "-",
-            data_evento=data_evento,
+            data_evento=_data_evt,
+        )
+
+    def pagar_parcela_emprestimo(
+        self,
+        *,
+        obrigacao_id_emprestimo: int | None = None,
+        obrigacao_id: int | None = None,        # alias aceito
+        valor_principal: float | None = None,
+        valor_base: float | None = None,        # alias aceito
+        valor: float | None = None,             # alias legado
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+        usuario: str | None = None,
+        data_evento: str | None = None,
+        data: str | None = None,                # alias aceito
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        """Wrapper compatível para EMPRESTIMO (delegação ao ServiceLedgerEmprestimo)."""
+        _obrig = (
+            obrigacao_id_emprestimo if obrigacao_id_emprestimo is not None else (obrigacao_id or 0)
+        )
+        _principal = (
+            valor_base
+            if valor_base is not None
+            else (valor_principal if valor_principal is not None else (valor or 0.0))
+        )
+        _data_evt = data_evento or data
+
+        try:
+            mod = importlib.import_module("services.ledger.service_ledger_emprestimo")
+            ServiceLedgerEmprestimo = getattr(mod, "ServiceLedgerEmprestimo")
+        except Exception as e:
+            raise RuntimeError("ServiceLedgerEmprestimo não encontrado ou inválido.") from e
+
+        svc = ServiceLedgerEmprestimo(self.db_path)
+        return svc.pagar_emprestimo(
+            obrigacao_id=int(_obrig),
+            principal=float(_principal or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
+            data_evento=_data_evt,
+            usuario=usuario or "-",
+            conn=None,
         )
 
 

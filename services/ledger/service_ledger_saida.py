@@ -35,10 +35,11 @@ if _PROJECT_ROOT not in sys.path:
 
 # Internos
 from shared.db import get_conn  # noqa: E402
-from shared.ids import sanitize, uid_saida_bancaria, uid_saida_dinheiro  # noqa: E402
+from shared.ids import sanitize  # noqa: E402
 from services.ledger.service_ledger_infra import (  # noqa: E402
-    _ensure_mov_cols,
     _fmt_obs_saida,
+    log_mov_bancaria,
+    gerar_trans_uid,
 )
 from services.ledger.service_ledger_boleto import ServiceLedgerBoleto  # noqa: E402
 from services.ledger.service_ledger_fatura import ServiceLedgerFatura  # noqa: E402
@@ -330,12 +331,10 @@ class _SaidasLedgerMixin:
         mv = self._parse_money(multa)
         dv = self._parse_money(desconto)
 
-        # trans_uid idempotente baseado no valor DIGITADO (principal informado na tela)
+        # trans_uid idempotente baseado nos campos (determinístico quando não fornecido)
         valor_str = f"{float(valor):.2f}"
-        tuid = trans_uid or uid_saida_dinheiro(
-            data, valor_str, origem_dinheiro, categoria, sub_categoria, descricao, usuario
-        )
-        trans_uid_str = str(tuid)
+        seed = f"SAIDA_DIN|{data}|{valor_str}|{origem_dinheiro}|{categoria}|{sub_categoria}|{descricao}|{usuario}"
+        trans_uid_str = str(trans_uid or gerar_trans_uid("mb", seed=seed))
 
         if getattr(self, "mov_repo", None) and hasattr(self.mov_repo, "ja_existe_transacao"):
             if self.mov_repo.ja_existe_transacao(trans_uid_str):
@@ -397,6 +396,7 @@ class _SaidasLedgerMixin:
                         desconto=dv,
                         data_evento=data,
                         usuario=usuario,
+                        ledger_id=id_saida,  # evita duplicidade de movimentação no service de boleto
                         conn=conn,
                     )
                     saida_total = float(res.get("saida_total", valor))
@@ -421,8 +421,7 @@ class _SaidasLedgerMixin:
                 (saida_total, data),
             )
 
-            # (4) Log movimentação bancária (mesmo para DINHEIRO registramos em mov. para auditoria)
-            _ensure_mov_cols(cur)
+            # (4) Log movimentação bancária central (idempotente por trans_uid)
             obs = _fmt_obs_saida(
                 forma="DINHEIRO",
                 valor=saida_total,
@@ -430,25 +429,20 @@ class _SaidasLedgerMixin:
                 subcategoria=sub_categoria,
                 descricao=mov_desc,
             )
-            cur.execute(
-                """
-                INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao,
-                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
-                VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?, ?, ?)
-                """,
-                (
-                    data,
-                    origem_dinheiro,
-                    saida_total,
-                    obs,
-                    id_saida,
-                    trans_uid_str,
-                    usuario,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                ),
+            id_mov = log_mov_bancaria(
+                conn,
+                data=data,
+                banco=origem_dinheiro,
+                tipo="saida",
+                valor=saida_total,
+                origem="saidas",
+                observacao=obs,
+                usuario=usuario,
+                referencia_id=id_saida,
+                referencia_tabela="saida",
+                trans_uid=trans_uid_str,
+                data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
-            id_mov = int(cur.lastrowid)
 
             # (5) Anota sobra de principal (se houver)
             self._registrar_sobra_obs(cur, id_mov, sobra_reg)
@@ -504,10 +498,8 @@ class _SaidasLedgerMixin:
         dv = self._parse_money(desconto)
 
         valor_str = f"{float(valor):.2f}"
-        tuid = trans_uid or uid_saida_bancaria(
-            data, valor_str, banco_nome, forma_u, categoria, sub_categoria, descricao, usuario
-        )
-        trans_uid_str = str(tuid)
+        seed = f"SAIDA_BAN|{data}|{valor_str}|{banco_nome}|{forma_u}|{categoria}|{sub_categoria}|{descricao}|{usuario}"
+        trans_uid_str = str(trans_uid or gerar_trans_uid("mb", seed=seed))
 
         if getattr(self, "mov_repo", None) and hasattr(self.mov_repo, "ja_existe_transacao"):
             if self.mov_repo.ja_existe_transacao(trans_uid_str):
@@ -567,6 +559,7 @@ class _SaidasLedgerMixin:
                         desconto=dv,
                         data_evento=data,
                         usuario=usuario,
+                        ledger_id=id_saida,  # evita duplicidade de movimentação no service de boleto
                         conn=conn,
                     )
                     saida_total = float(res.get("saida_total", valor))
@@ -586,8 +579,7 @@ class _SaidasLedgerMixin:
             self._garantir_linha_saldos_bancos(conn, data)
             self._ajustar_banco_dynamic(conn, banco_col=banco_nome, delta=-saida_total, data=data)
 
-            # (3) Log movimentação bancária
-            _ensure_mov_cols(cur)
+            # (3) Log movimentação bancária central (idempotente por trans_uid)
             obs = _fmt_obs_saida(
                 forma=forma_u,
                 valor=saida_total,
@@ -596,25 +588,20 @@ class _SaidasLedgerMixin:
                 descricao=mov_desc,
                 banco=(banco_nome if forma_u == "DÉBITO" else None),
             )
-            cur.execute(
-                """
-                INSERT INTO movimentacoes_bancarias
-                    (data, banco, tipo, valor, origem, observacao,
-                     referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
-                VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?, ?, ?)
-                """,
-                (
-                    data,
-                    banco_nome,
-                    saida_total,
-                    obs,
-                    id_saida,
-                    trans_uid_str,
-                    usuario,
-                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                ),
+            id_mov = log_mov_bancaria(
+                conn,
+                data=data,
+                banco=banco_nome,
+                tipo="saida",
+                valor=saida_total,
+                origem="saidas",
+                observacao=obs,
+                usuario=usuario,
+                referencia_id=id_saida,
+                referencia_tabela="saida",
+                trans_uid=trans_uid_str,
+                data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             )
-            id_mov = int(cur.lastrowid)
 
             # (4) Sobra (se houver)
             self._registrar_sobra_obs(cur, id_mov, sobra_reg)

@@ -9,12 +9,12 @@ Regras principais:
     • juros     → vai para `juros_pago` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
     • multa     → vai para `multa_paga` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
     • desconto  → vai para `desconto_aplicado` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-- Saída de caixa/banco: calculada pelo Repository como
-  (principal + juros + multa − desconto) para cada aplicação.
-- trans_uid: gerado por operação e retornado ao chamador.
+- Saída de caixa/banco: **principal + juros + multa** (desconto **não** sai do caixa), agregado pelo Repository.
+- trans_uid: gerado por operação e retornado ao chamador (aceita override para idempotência entre camadas).
 - Este serviço NÃO cria eventos novos no CAP durante o pagamento; apenas aplica/acumula
-  nos lançamentos já programados (parcelas). A criação de Saída/Mov. bancária pode ser
-  feita por outro serviço financeiro reutilizando o `saida_total` agregado.
+  nos lançamentos já programados (parcelas). A movimentação bancária:
+    • é registrada pelo fluxo de SAÍDA quando o pagamento vem de lá (preferível);
+    • ou pode ser registrada aqui quando chamado diretamente (sem `ledger_id`), usando log central idempotente.
 
 Programação de empréstimo:
 - Cria N lançamentos no CAP (um por parcela), com `tipo_obrigacao='EMPRESTIMO'` e status inicial 'EM ABERTO'.
@@ -38,6 +38,7 @@ import sqlite3
 import pandas as pd  # usado apenas para DateOffset no agendamento
 
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+from services.ledger.service_ledger_infra import _fmt_obs_saida, log_mov_bancaria
 
 _EPS = 1e-9  # Tolerância numérica para comparações de ponto flutuante
 
@@ -53,7 +54,7 @@ class ResultadoParcela:
         aplicado_multa: Valor de multa aplicado nesta parcela (somente 1ª aberta).
         aplicado_desconto: Valor de desconto aplicado nesta parcela (somente 1ª aberta).
         saida_total: Impacto total de caixa/banco nesta parcela
-            (principal + juros + multa − desconto), calculado no Repository.
+            (**principal + juros + multa**; desconto **não** sai do caixa), calculado no Repository.
         status: Novo status da parcela após a aplicação (e.g., "PARCIAL", "QUITADO").
         restante_principal: Principal ainda em aberto após a aplicação nesta parcela.
     """
@@ -86,12 +87,25 @@ class ServiceLedgerEmprestimo:
         self,
         *,
         obrigacao_id: int,
-        principal: float,
+        # Aliases aceitos para o principal:
+        principal: Optional[float] = None,
+        valor_principal: Optional[float] = None,
+        valor_base: Optional[float] = None,
+        valor: Optional[float] = None,
         juros: float = 0.0,
         multa: float = 0.0,
         desconto: float = 0.0,
+        # Aliases de data
         data_evento: Optional[str] = None,
+        data: Optional[str] = None,
         usuario: str = "-",
+        # Log bancário direto (opcional)
+        forma_pagamento: Optional[str] = None,
+        origem: Optional[str] = None,
+        ledger_id: Optional[int] = None,
+        # Idempotência entre camadas (ex.: quando veio de Saída)
+        trans_uid: Optional[str] = None,
+        # Conexão opcional
         conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, Any]:
         """Aplica o pagamento de EMPRESTIMO conforme regras FIFO e de encargos.
@@ -103,23 +117,116 @@ class ServiceLedgerEmprestimo:
 
         Args:
             obrigacao_id: Identificador do grupo/parcelas a pagar (FIFO por vencimento).
-            principal: Valor destinado à amortização do principal (>= 0).
-            juros: Encargo de juros a aplicar na 1ª parcela aberta (>= 0).
-            multa: Encargo de multa a aplicar na 1ª parcela aberta (>= 0).
-            desconto: Desconto a aplicar na 1ª parcela aberta (>= 0).
-            data_evento: Data do evento no formato 'YYYY-MM-DD'. Padrão: data de hoje.
+            principal/valor_principal/valor_base/valor: Aliases para o valor de principal (>= 0).
+            juros, multa, desconto: Encargos/abatimentos aplicados apenas na 1ª parcela aberta.
+            data_evento/data: Data do evento no formato 'YYYY-MM-DD'. Padrão: hoje.
             usuario: Identificação do operador.
+            forma_pagamento, origem, ledger_id: Para registrar a movimentação bancária quando chamado
+                diretamente (ledger_id=None). Se veio do fluxo de SAÍDA, **não** registramos MB aqui.
+            trans_uid: UID idempotente externo (preservado quando fornecido).
             conn: Conexão SQLite opcional. Se omitida, o serviço gerencia a transação.
 
         Returns:
             Dict com:
-                - trans_uid (str): identificador único desta operação.
-                - saida_total (float): soma do impacto de caixa/banco em todas as parcelas.
-                - resultados (list[dict]): lista de snapshots por parcela aplicada.
-                - (opcional) mensagem (str): quando não há parcelas em aberto.
+                ok (bool), trans_uid (str), saida_total (float), resultados (list[dict]),
+                sobra (float), ids{ledger_id, cap_evento_id, mov_id}, e (opcional) mensagem.
         """
+        # Normalizações de entrada
+        _principal = (
+            principal if principal is not None
+            else (valor_principal if valor_principal is not None
+                  else (valor_base if valor_base is not None else (valor or 0.0)))
+        )
+        data_evt = data_evento or data or datetime.now().strftime("%Y-%m-%d")
+        _usuario = usuario or "-"
+
+        # Padrões para possível log direto
+        forma = (forma_pagamento or "DINHEIRO").upper()
+        if forma == "DEBITO":
+            forma = "DÉBITO"
+        _origem = origem or ("Caixa" if forma == "DINHEIRO" else "Banco 1")
+
+        # Core de pagamento
+        core = self._pagar_core(
+            obrigacao_id=int(obrigacao_id),
+            principal=float(_principal or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
+            data_evento=data_evt,
+            usuario=_usuario,
+            conn=conn,
+            trans_uid_override=trans_uid,
+        )
+
+        mov_id: Optional[int] = None
+        # Se NÃO veio do fluxo de SAÍDA (sem ledger_id), registramos a movimentação aqui.
+        # Usa log central com idempotência por trans_uid (não duplica caso já exista).
+        if ledger_id is None and core["saida_total"] > 0:
+            with self._conn_ctx(conn) as c:
+                obs = _fmt_obs_saida(
+                    forma=forma,
+                    valor=float(core["saida_total"]),
+                    categoria="EMPRESTIMO",
+                    subcategoria=None,
+                    descricao=f"Pagamento empréstimo (obrigação {obrigacao_id})",
+                    banco=(_origem if forma == "DÉBITO" else None),
+                )
+                mov_id = log_mov_bancaria(
+                    c,
+                    data=data_evt,
+                    banco=str(_origem or ""),
+                    tipo="saida",
+                    valor=float(core["saida_total"]),
+                    origem="saidas",
+                    observacao=obs,
+                    usuario=_usuario,
+                    referencia_id=int(obrigacao_id),
+                    referencia_tabela="emprestimo",
+                    trans_uid=str(core["trans_uid"]),
+                    data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+
+        resp: Dict[str, Any] = {
+            "ok": True,
+            "obrigacao_id": int(obrigacao_id),
+            "sobra": float(core["sobra"]),
+            "trans_uid": core["trans_uid"],
+            "saida_total": float(core["saida_total"]),
+            "resultados": core["resultados"],
+            "ids": {
+                "ledger_id": ledger_id if ledger_id is not None else None,
+                "cap_evento_id": None,
+                "mov_id": mov_id if (ledger_id is None and core["saida_total"] > 0) else None,
+            },
+        }
+        if core.get("mensagem"):
+            resp["ok"] = False
+            resp["mensagem"] = core["mensagem"]
+        return resp
+
+    # ------------------------------------------------------------------
+    # Núcleo compartilhado
+    # ------------------------------------------------------------------
+    def _pagar_core(
+        self,
+        *,
+        obrigacao_id: int,
+        principal: float,
+        juros: float,
+        multa: float,
+        desconto: float,
+        data_evento: Optional[str],
+        usuario: str,
+        conn: Optional[sqlite3.Connection],
+        trans_uid_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
         data_evt = data_evento or datetime.now().strftime("%Y-%m-%d")
-        trans_uid = f"EMPRESTIMO-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        trans_uid = (
+            trans_uid_override
+            if trans_uid_override
+            else f"EMPRESTIMO-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        )
 
         # Sanitização (não permitir negativos)
         restante_principal = max(0.0, float(principal or 0.0))
@@ -138,6 +245,7 @@ class ServiceLedgerEmprestimo:
                     "trans_uid": trans_uid,
                     "saida_total": 0.0,
                     "resultados": [],
+                    "sobra": float(restante_principal),
                     "mensagem": "Nenhuma parcela em aberto para esta obrigação.",
                 }
 
@@ -203,6 +311,7 @@ class ServiceLedgerEmprestimo:
             "trans_uid": trans_uid,
             "saida_total": float(saida_total_agregado),
             "resultados": [r.__dict__ for r in resultados],
+            "sobra": float(restante_principal),
         }
 
     # ------------------------------------------------------------------
@@ -327,4 +436,4 @@ class ServiceLedgerEmprestimo:
 
 # Compatibilidade com código legado que importava um "mixin"
 _EmprestimoLedgerMixin = ServiceLedgerEmprestimo
-__all__ = ["ServiceLedgerEmprestimo", "_EmprestimoLedgerMixin"]
+__all__ = ["ServiceLedgerEmprestimo", "_EmprestimoLedgerMixin", "ResultadoParcela"]

@@ -140,7 +140,16 @@ class ContasAPagarMovRepository:
             valor_evento = float(row["valor_evento"] or 0.0)
             principal_acum = float(row["principal_pago_acumulado"] or 0.0)
             restante = round(max(valor_evento - principal_acum, 0.0), 2)
-            status = STATUS_PARCIAL if restante > _EPS else STATUS_QUITADO
+
+            # Status depende SOMENTE do principal acumulado vs valor_evento
+            if principal_acum + 1e-9 >= valor_evento:
+                status = STATUS_QUITADO
+            elif principal_acum > _EPS:
+                status = STATUS_PARCIAL
+            else:
+                # principal zero (ou ~zero): se há valor_evento, está EM ABERTO
+                status = STATUS_ABERTO if valor_evento > _EPS else STATUS_QUITADO
+
             return restante, status
 
     def aplicar_pagamento_por_obrigacao(
@@ -362,8 +371,9 @@ class ContasAPagarMovRepository:
             )
 
             if novo_principal + 1e-9 >= valor_evento:
+                novo_principal = valor_evento  # clamp para evitar exceder por arredondamento
                 novo_status = STATUS_QUITADO
-            elif novo_principal > 0:
+            elif novo_principal > _EPS:
                 novo_status = STATUS_PARCIAL
             else:
                 novo_status = STATUS_ABERTO
@@ -749,7 +759,7 @@ class ContasAPagarMovRepository:
         limite: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Lista parcelas de uma obrigação com faltante de PRINCIPAL > 0 (FIFO)."""
-        sql = """
+        sql = f"""
             SELECT
                 id AS parcela_id,
                 DATE(vencimento) AS vencimento,
@@ -758,7 +768,8 @@ class ContasAPagarMovRepository:
                 (COALESCE(valor_evento,0) - COALESCE(principal_pago_acumulado,0)) AS principal_faltante
             FROM contas_a_pagar_mov
             WHERE obrigacao_id = ?
-              AND (COALESCE(valor_evento,0) - COALESCE(principal_pago_acumulado,0)) > 0
+              AND categoria_evento = 'LANCAMENTO'
+              AND (COALESCE(valor_evento,0) - COALESCE(principal_pago_acumulado,0)) > {_EPS}
             ORDER BY DATE(vencimento), id
         """
         params: List[Any] = [obrigacao_id]

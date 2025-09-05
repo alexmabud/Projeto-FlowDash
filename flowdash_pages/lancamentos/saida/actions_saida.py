@@ -1,240 +1,478 @@
 # flowdash_pages/lancamentos/saida/actions_saida.py
-# ===================== Actions: Saída =====================
 """
-Actions da página de Saída (sem Streamlit aqui).
+Actions: Saídas (Dinheiro e Bancária)
 
-Refatoração (2025-09-04)
-------------------------
+- Normaliza inputs e delega para `LedgerService.registrar_lancamento`.
+- Integra CAP (BOLETO/FATURA_CARTAO/EMPRESTIMO).
+- Mantém compatibilidade com funções/assinaturas antigas via aliases.
 
-- Delegação total de listagens e regras de CAP ao Repository.
-- Pagamentos específicos (fatura/boletos/emprestimos) ficam em
-  `flowdash_pages.lancamentos.saida.actions_pagamentos`.
-- Aqui ficamos com:
-    • Registrar saídas genéricas (dinheiro/bancária) sem CAP.
-    • Programar BOLETO (criar LANCAMENTO no CAP).
-    • Pequenos wrappers de listagem (delegando ao Repository) para
-      manter compatibilidade com a UI.
-
-Regras
-------
-- Saída genérica:
-    ledger.registrar_saida_dinheiro(...)    # quando forma="DINHEIRO"
-    ledger.registrar_saida_bancaria(...)    # quando forma ≠ "DINHEIRO"
-- Programação de boleto:
-    repository.registrar_lancamento(..., tipo_obrigacao="BOLETO", categoria_evento="LANCAMENTO")
+Retorno padrão das ações:
+- dict: { ok: bool, id_saida: int|None, id_mov: int|None, mensagem: str|None }
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Dict, Any, Tuple, List, Iterable
 from datetime import datetime
+import contextlib
 
-# Ledger e Repository
 from services.ledger.service_ledger import LedgerService
-from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
 
-# Reuso de helper (evita duplicação)
-from flowdash_pages.lancamentos.saida.actions_pagamentos import (  # type: ignore
-    _canonicalizar_banco_safe,  # reuso intencional
-)
+# =============================================================================
+# Constantes de UI / defaults
+# =============================================================================
+DEFAULT_FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
+DEFAULT_ORIGENS = ["Caixa", "Caixa 2"]
+DEFAULT_BANDEIRAS = ["VISA", "MASTERCARD", "ELO", "HIPERCARD", "AMEX"]
+DEFAULT_BANCOS = ["Banco 1", "Banco 2", "Banco 3", "Banco 4"]
+
+
+# =============================================================================
+# Helpers de normalização
+# =============================================================================
+def _norm_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _money(v: Any) -> float:
+    """Converte string BR/US em float. Heurística: último separador define decimal."""
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if not s:
+        return 0.0
+    dot, comma = s.rfind("."), s.rfind(",")
+    try:
+        if dot == -1 and comma == -1:
+            return float(s)
+        if dot > comma:
+            return float(s.replace(",", ""))
+        return float(s.replace(".", "").replace(",", "."))
+    except Exception:
+        with contextlib.suppress(Exception):
+            return float(s.replace(",", "."))
+        return 0.0
+
+
+def _norm_date(s: Optional[str]) -> str:
+    """YYYY-MM-DD. Aceita formatos comuns/ISO; se vazio/erro, usa hoje."""
+    if not s:
+        return datetime.now().strftime("%Y-%m-%d")
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
+        with contextlib.suppress(Exception):
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+    with contextlib.suppress(Exception):
+        return datetime.fromisoformat(s).date().strftime("%Y-%m-%d")
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _norm_forma(forma: Optional[str]) -> str:
+    f = (forma or "").strip().upper()
+    if f == "DEBITO":
+        return "DÉBITO"
+    return f or "DINHEIRO"
+
+
+def _resolve_obrigacao(
+    *,
+    tipo_obrigacao: Optional[str],
+    obrigacao_id: Optional[int],
+    obrigacao_id_fatura: Optional[int],
+    obrigacao_id_boleto: Optional[int],
+    obrigacao_id_emprestimo: Optional[int],
+) -> Tuple[Optional[str], Optional[int]]:
+    """Resolve (tipo_obrigacao, obrigacao_id) com suporte a campos legados."""
+    t = _norm_str(tipo_obrigacao)
+
+    oid: Optional[int] = None
+    if isinstance(obrigacao_id, int):
+        oid = obrigacao_id
+    elif isinstance(obrigacao_id, str) and obrigacao_id.strip().isdigit():
+        oid = int(obrigacao_id.strip())
+
+    if t and oid:
+        return t.upper(), oid
+    if obrigacao_id_fatura is not None:
+        return "FATURA_CARTAO", int(obrigacao_id_fatura)
+    if obrigacao_id_boleto is not None:
+        return "BOLETO", int(obrigacao_id_boleto)
+    if obrigacao_id_emprestimo is not None:
+        return "EMPRESTIMO", int(obrigacao_id_emprestimo)
+    if t:
+        return t.upper(), oid
+    return None, None
+
+
+# =============================================================================
+# Ações principais
+# =============================================================================
+def registrar_saida_action(
+    *,
+    caminho_banco: str,
+    valor: Any,
+    forma: Optional[str] = None,                 # "DINHEIRO" | "PIX" | "DÉBITO"
+    origem: Optional[str] = None,                # "Caixa"/"Caixa 2" (para DINHEIRO) ou nome da conta
+    banco: Optional[str] = None,                 # nome do banco/conta quando bancária
+    categoria: Optional[str] = None,
+    subcategoria: Optional[str] = None,
+    descricao: Optional[str] = None,
+    usuario: Optional[str] = None,
+    data: Optional[str] = None,
+    juros: Any = 0.0,
+    multa: Any = 0.0,
+    desconto: Any = 0.0,
+    trans_uid: Optional[str] = None,
+    # Integração CAP (genérico + compat)
+    tipo_obrigacao: Optional[str] = None,
+    obrigacao_id: Optional[int] = None,
+    obrigacao_id_fatura: Optional[int] = None,
+    obrigacao_id_boleto: Optional[int] = None,
+    obrigacao_id_emprestimo: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Normaliza os dados e delega ao `LedgerService.registrar_lancamento`."""
+    valor_f = _money(valor)
+    if valor_f <= 0:
+        return {"ok": False, "mensagem": "Valor da saída deve ser maior que zero."}
+
+    data_norm = _norm_date(data)
+    forma_norm = _norm_forma(forma)
+    tipo_obr, obr_id = _resolve_obrigacao(
+        tipo_obrigacao=tipo_obrigacao,
+        obrigacao_id=obrigacao_id,
+        obrigacao_id_fatura=obrigacao_id_fatura,
+        obrigacao_id_boleto=obrigacao_id_boleto,
+        obrigacao_id_emprestimo=obrigacao_id_emprestimo,
+    )
+
+    try:
+        ledger = LedgerService(caminho_banco)
+        id_saida, id_mov = ledger.registrar_lancamento(
+            tipo_evento="SAIDA",
+            categoria_evento=_norm_str(categoria),
+            subcategoria_evento=_norm_str(subcategoria),
+            valor_evento=valor_f,
+            forma=forma_norm,
+            origem=_norm_str(origem),
+            banco=_norm_str(banco),
+            juros=_money(juros),
+            multa=_money(multa),
+            desconto=_money(desconto),
+            descricao=_norm_str(descricao),
+            usuario=_norm_str(usuario) or "-",
+            trans_uid=_norm_str(trans_uid),
+            data_evento=data_norm,
+            tipo_obrigacao=tipo_obr,
+            obrigacao_id=obr_id,
+        )
+        return {"ok": True, "id_saida": id_saida, "id_mov": id_mov, "mensagem": None}
+    except Exception as e:
+        return {"ok": False, "mensagem": f"Falha ao registrar saída: {e}"}
+
+
+def registrar_saida_dinheiro_action(
+    *,
+    caminho_banco: str,
+    valor: Any,
+    origem_dinheiro: Optional[str] = None,      # "Caixa" | "Caixa 2"
+    categoria: Optional[str] = None,
+    subcategoria: Optional[str] = None,
+    descricao: Optional[str] = None,
+    usuario: Optional[str] = None,
+    data: Optional[str] = None,
+    juros: Any = 0.0,
+    multa: Any = 0.0,
+    desconto: Any = 0.0,
+    trans_uid: Optional[str] = None,
+    # CAP
+    tipo_obrigacao: Optional[str] = None,
+    obrigacao_id: Optional[int] = None,
+    obrigacao_id_fatura: Optional[int] = None,
+    obrigacao_id_boleto: Optional[int] = None,
+    obrigacao_id_emprestimo: Optional[int] = None,
+) -> Dict[str, Any]:
+    return registrar_saida_action(
+        caminho_banco=caminho_banco,
+        valor=valor,
+        forma="DINHEIRO",
+        origem=origem_dinheiro or "Caixa",
+        categoria=categoria,
+        subcategoria=subcategoria,
+        descricao=descricao,
+        usuario=usuario,
+        data=data,
+        juros=juros,
+        multa=multa,
+        desconto=desconto,
+        trans_uid=trans_uid,
+        tipo_obrigacao=tipo_obrigacao,
+        obrigacao_id=obrigacao_id,
+        obrigacao_id_fatura=obrigacao_id_fatura,
+        obrigacao_id_boleto=obrigacao_id_boleto,
+        obrigacao_id_emprestimo=obrigacao_id_emprestimo,
+    )
+
+
+def registrar_saida_bancaria_action(
+    *,
+    caminho_banco: str,
+    valor: Any,
+    forma: str,                                  # "PIX" | "DÉBITO" (aceita "DEBITO")
+    banco_nome: Optional[str] = None,
+    categoria: Optional[str] = None,
+    subcategoria: Optional[str] = None,
+    descricao: Optional[str] = None,
+    usuario: Optional[str] = None,
+    data: Optional[str] = None,
+    juros: Any = 0.0,
+    multa: Any = 0.0,
+    desconto: Any = 0.0,
+    trans_uid: Optional[str] = None,
+    # CAP
+    tipo_obrigacao: Optional[str] = None,
+    obrigacao_id: Optional[int] = None,
+    obrigacao_id_fatura: Optional[int] = None,
+    obrigacao_id_boleto: Optional[int] = None,
+    obrigacao_id_emprestimo: Optional[int] = None,
+) -> Dict[str, Any]:
+    return registrar_saida_action(
+        caminho_banco=caminho_banco,
+        valor=valor,
+        forma=forma,
+        banco=banco_nome,
+        categoria=categoria,
+        subcategoria=subcategoria,
+        descricao=descricao,
+        usuario=usuario,
+        data=data,
+        juros=juros,
+        multa=multa,
+        desconto=desconto,
+        trans_uid=trans_uid,
+        tipo_obrigacao=tipo_obrigacao,
+        obrigacao_id=obrigacao_id,
+        obrigacao_id_fatura=obrigacao_id_fatura,
+        obrigacao_id_boleto=obrigacao_id_boleto,
+        obrigacao_id_emprestimo=obrigacao_id_emprestimo,
+    )
+
+
+# =============================================================================
+# SQLite utilitários para a UI (listas)
+# =============================================================================
+try:
+    import sqlite3
+except Exception:  # pragma: no cover
+    sqlite3 = None  # permite rodar sem sqlite em ambientes de teste
+
+
+def _open_sqlite(db_path: str):
+    conn = sqlite3.connect(db_path, timeout=30)
+    with contextlib.suppress(Exception):
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def _fetch_names(conn, sql: str) -> List[str]:
+    """Executa SELECT de uma coluna e devolve lista de strings limpas."""
+    with contextlib.suppress(Exception):
+        cur = conn.execute(sql)
+        rows = cur.fetchall()
+        out: List[str] = []
+        for r in rows:
+            try:
+                out.append(str(r[0]).strip())
+            except Exception:
+                with contextlib.suppress(Exception):
+                    keys = list(r.keys())  # sqlite3.Row
+                    if keys:
+                        out.append(str(r[keys[0]]).strip())
+        return [x for x in out if x]
+    return []
+
+
+def _first_nonempty_from(conn, tables: Iterable[str], column: str = "nome") -> List[str]:
+    """Retorna a primeira lista não-vazia de nomes dentre possíveis tabelas."""
+    for t in tables:
+        lst = _fetch_names(
+            conn,
+            f"""
+            SELECT {column}
+              FROM {t}
+             WHERE COALESCE(TRIM({column}), '') <> ''
+             ORDER BY LOWER(TRIM({column}))
+            """,
+        )
+        if lst:
+            return lst
+    return []
+
+
+def _try_get_bancos(conn) -> List[str]:
+    # 1) Tabelas de cadastro
+    lst = _first_nonempty_from(conn, ["cadastro_bancos", "bancos"])
+    if lst:
+        return lst
+
+    # 2) Heurística via tabela de saldos: usa nomes das colunas como bancos
+    with contextlib.suppress(Exception):
+        cur = conn.execute("PRAGMA table_info('saldos_bancos')")
+        colunas = [c[1] for c in cur.fetchall()]  # (cid, name, type, notnull, dflt, pk)
+        ignorar = {"id", "data", "created_at", "updated_at"}
+        candidatos = [c for c in colunas if c not in ignorar]
+        if candidatos:
+            return sorted(candidatos, key=lambda s: s.lower().strip())
+
+    # 3) Fallback
+    return DEFAULT_BANCOS[:]
+
+
+def _try_get_cartoes(conn) -> List[str]:
+    return _first_nonempty_from(conn, ["cartoes_credito", "cartoes"])
+
+
+def _try_get_bandeiras(conn) -> List[str]:
+    return _first_nonempty_from(conn, ["bandeiras_cartao", "cartoes_bandeiras", "bandeiras"]) or DEFAULT_BANDEIRAS[:]
+
+
+def _try_get_categorias(conn) -> List[str]:
+    return _first_nonempty_from(conn, ["categorias_saida", "categorias", "cadastro_categorias_saida"])
+
+
+def _try_get_subcategorias(conn) -> List[str]:
+    return _first_nonempty_from(conn, ["subcategorias_saida", "subcategorias", "cadastro_subcategorias_saida"])
+
+
+def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str, List[str]]:
+    """
+    Carrega listas auxiliares para o formulário de Saída.
+
+    Retorna dict com chaves:
+      - bancos, formas, origens_dinheiro, categorias, subcategorias, cartoes, bandeiras
+    """
+    def _defaults():
+        return {
+            "bancos": DEFAULT_BANCOS[:],
+            "formas": DEFAULT_FORMAS[:],
+            "origens_dinheiro": DEFAULT_ORIGENS[:],
+            "categorias": [],
+            "subcategorias": [],
+            "cartoes": [],
+            "bandeiras": DEFAULT_BANDEIRAS[:],
+        }
+
+    # Validação forte do db_path (evita erros como slice(None,6,None))
+    valid_path = isinstance(db_path, (str, bytes, bytearray)) and str(db_path).strip() != ""
+
+    if not sqlite3 or not valid_path:
+        return _defaults()
+
+    try:
+        conn = _open_sqlite(str(db_path))
+        bancos = _try_get_bancos(conn)
+        cartoes = _try_get_cartoes(conn)
+        bandeiras = _try_get_bandeiras(conn)
+        categorias = _try_get_categorias(conn)
+        subcategorias = _try_get_subcategorias(conn)
+        return {
+            "bancos": bancos or DEFAULT_BANCOS[:],
+            "formas": DEFAULT_FORMAS[:],
+            "origens_dinheiro": DEFAULT_ORIGENS[:],
+            "categorias": categorias or [],
+            "subcategorias": subcategorias or [],
+            "cartoes": cartoes or [],
+            "bandeiras": bandeiras or DEFAULT_BANDEIRAS[:],
+        }
+    except Exception:
+        return _defaults()
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+# =============================================================================
+# Shims de compatibilidade (APIs antigas usadas pela page_lancamentos)
+# =============================================================================
+def _spread_args_to_kwargs(args: tuple, kwargs: dict, order: List[str]) -> dict:
+    """Mapeia args posicionais para kwargs seguindo 'order', sem sobrescrever chaves já existentes."""
+    out = dict(kwargs)
+    for i, v in enumerate(args):
+        if i < len(order) and order[i] not in out:
+            out[order[i]] = v
+    return out
+
+
+def registrar_saida(*args, **kwargs):
+    """
+    Alias compatível da API antiga.
+    Ordem posicional aceita:
+      caminho_banco, valor, forma, origem, banco, categoria, subcategoria, descricao,
+      usuario, data, juros, multa, desconto, trans_uid,
+      tipo_obrigacao, obrigacao_id, obrigacao_id_fatura, obrigacao_id_boleto, obrigacao_id_emprestimo
+    """
+    order = [
+        "caminho_banco", "valor", "forma", "origem", "banco",
+        "categoria", "subcategoria", "descricao", "usuario", "data",
+        "juros", "multa", "desconto", "trans_uid",
+        "tipo_obrigacao", "obrigacao_id",
+        "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
+    ]
+    kw = _spread_args_to_kwargs(args, kwargs, order)
+
+    # Sinônimos
+    if "origem" not in kw and "origem_dinheiro" in kw:
+        kw["origem"] = kw.get("origem_dinheiro")
+    if "banco" not in kw and "banco_nome" in kw:
+        kw["banco"] = kw.get("banco_nome")
+
+    return registrar_saida_action(**kw)
+
+
+def registrar_saida_dinheiro(*args, **kwargs):
+    """Alias compatível: força forma 'DINHEIRO' e usa 'origem_dinheiro' se fornecida."""
+    order = [
+        "caminho_banco", "valor", "origem_dinheiro",
+        "categoria", "subcategoria", "descricao", "usuario", "data",
+        "juros", "multa", "desconto", "trans_uid",
+        "tipo_obrigacao", "obrigacao_id",
+        "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
+    ]
+    kw = _spread_args_to_kwargs(args, kwargs, order)
+    kw.setdefault("forma", "DINHEIRO")
+    if "origem" not in kw and "origem_dinheiro" in kw:
+        kw["origem"] = kw.get("origem_dinheiro")
+    return registrar_saida_action(**kw)
+
+
+def registrar_saida_bancaria(*args, **kwargs):
+    """Alias compatível para saídas bancárias (PIX/DÉBITO)."""
+    order = [
+        "caminho_banco", "valor", "forma", "banco_nome",
+        "categoria", "subcategoria", "descricao", "usuario", "data",
+        "juros", "multa", "desconto", "trans_uid",
+        "tipo_obrigacao", "obrigacao_id",
+        "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
+    ]
+    kw = _spread_args_to_kwargs(args, kwargs, order)
+    if "banco" not in kw and "banco_nome" in kw:
+        kw["banco"] = kw.get("banco_nome")
+    return registrar_saida_action(**kw)
+
 
 __all__ = [
+    "registrar_saida_action",
+    "registrar_saida_dinheiro_action",
+    "registrar_saida_bancaria_action",
     "carregar_listas_para_form",
+    # aliases antigos:
     "registrar_saida",
-    "programar_boleto",
-    "listar_boletos_em_aberto",
-    "_listar_boletos_em_aberto",
+    "registrar_saida_dinheiro",
+    "registrar_saida_bancaria",
 ]
-
-# ---------- Constantes (somente UI)
-FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
-ORIGENS_DINHEIRO_PADRAO = ["Caixa", "Caixa 2"]
-
-
-# =============================================================================
-# Factory
-# =============================================================================
-def _get_services(caminho_banco: str) -> Tuple[LedgerService, ContasAPagarMovRepository]:
-    return LedgerService(caminho_banco), ContasAPagarMovRepository(caminho_banco)
-
-
-# =============================================================================
-# Listas para o formulário (somente UI)
-# =============================================================================
-def carregar_listas_para_form(caminho_banco: str):
-    """
-    Retorna tupla no formato legado (8 itens), preservando o mesmo comportamento do formulário:
-    (nomes_bancos, nomes_cartoes, df_categorias, listar_subcategorias,
-     listar_destinos_fatura_em_aberto, opcoes_pagamentos,
-     listar_boletos_em_aberto, listar_empfin_em_aberto)
-    """
-    # Imports locais para evitar mexer no topo do arquivo
-    import pandas as pd  # noqa: F401
-    from flowdash_pages.cadastros.cadastro_classes import BancoRepository
-    from repository.cartoes_repository import CartoesRepository
-    from repository.categorias_repository import CategoriasRepository
-    from flowdash_pages.lancamentos.saida.actions_pagamentos import (
-        listar_faturas_abertas,
-        listar_boletos_abertos,
-        listar_emprestimos_abertos,
-    )
-
-    # Repositórios originais (mantém UI idêntica)
-    bancos_repo = BancoRepository(caminho_banco)
-    cartoes_repo = CartoesRepository(caminho_banco)
-    cats_repo = CategoriasRepository(caminho_banco)
-
-    df_bancos = bancos_repo.carregar_bancos()
-    nomes_bancos = df_bancos["nome"].tolist() if (df_bancos is not None and not df_bancos.empty) else []
-    nomes_cartoes = cartoes_repo.listar_nomes()
-    df_categorias = cats_repo.listar_categorias()
-
-    # Callbacks esperados pelo formulário (mesma ordem/assinatura)
-    listar_subcategorias = cats_repo.listar_subcategorias
-    listar_destinos_fatura_em_aberto = lambda: listar_faturas_abertas(caminho_banco)
-    opcoes_pagamentos = lambda tipo: FORMAS  # usa a constante já definida no arquivo
-    listar_boletos = lambda: listar_boletos_abertos(caminho_banco)
-    listar_empfin = lambda: listar_emprestimos_abertos(caminho_banco)
-
-    return (
-        nomes_bancos,
-        nomes_cartoes,
-        df_categorias,
-        listar_subcategorias,
-        listar_destinos_fatura_em_aberto,
-        opcoes_pagamentos,
-        listar_boletos,
-        listar_empfin,
-    )
-
-# =============================================================================
-# Saída genérica (sem CAP)
-# =============================================================================
-def registrar_saida(
-    *,
-    caminho_banco: str,
-    data: str,
-    valor: float,
-    forma_pagamento: str,                  # "DINHEIRO", "PIX", "DÉBITO", "CRÉDITO"
-    categoria: str,
-    descricao: str,
-    usuario: str = "-",
-    sub_categoria: Optional[str] = None,
-    origem_dinheiro: Optional[str] = None,  # quando DINHEIRO
-    banco_nome: Optional[str] = None,       # quando não DINHEIRO
-) -> Dict[str, Any]:
-    """
-    Registra uma SAÍDA genérica (não vinculada a CAP).
-
-    - Quando forma = "DINHEIRO": usa `registrar_saida_dinheiro`.
-    - Caso contrário: usa `registrar_saida_bancaria`.
-    """
-    ledger, _ = _get_services(caminho_banco)
-    data_str = str(data or datetime.now().strftime("%Y-%m-%d"))
-    valor_f = float(valor or 0.0)
-
-    if (forma_pagamento or "").strip().upper() == "DINHEIRO":
-        origem = (origem_dinheiro or ORIGENS_DINHEIRO_PADRAO[0])
-        saida_id, mov_id = ledger.registrar_saida_dinheiro(
-            data=data_str,
-            valor=valor_f,
-            origem_dinheiro=origem,
-            categoria=categoria,
-            sub_categoria=sub_categoria,
-            descricao=descricao,
-            usuario=usuario,
-        )
-    else:
-        banco_norm = _canonicalizar_banco_safe(caminho_banco, banco_nome)
-        saida_id, mov_id = ledger.registrar_saida_bancaria(
-            data=data_str,
-            valor=valor_f,
-            banco_nome=banco_norm or "Banco Inter",
-            forma=forma_pagamento,
-            categoria=categoria,
-            sub_categoria=sub_categoria,
-            descricao=descricao,
-            usuario=usuario,
-        )
-
-    return {
-        "ok": True,
-        "id_saida": saida_id,
-        "id_mov": mov_id,
-        "data": data_str,
-        "valor": valor_f,
-        "forma": forma_pagamento,
-        "categoria": categoria,
-        "sub_categoria": sub_categoria,
-        "descricao": descricao,
-        "usuario": usuario,
-    }
-
-
-# =============================================================================
-# Programação de BOLETO (gera LANCAMENTO no CAP)
-# =============================================================================
-def programar_boleto(
-    *,
-    caminho_banco: str,
-    valor_total: float,
-    vencimento: str,
-    credor: Optional[str],
-    descricao: Optional[str],
-    usuario: str,
-    competencia: Optional[str] = None,
-    parcela_num: Optional[int] = None,
-    parcelas_total: Optional[int] = None,
-    obrigacao_id: Optional[int] = None,
-    data_evento: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Cria/insere um LANCAMENTO de BOLETO no CAP.
-    - Se não informar `obrigacao_id`, gera o próximo automaticamente.
-    - Acumuladores começam zerados e `status = EM ABERTO`.
-    """
-    _, repo = _get_services(caminho_banco)
-
-    _obrigacao_id = int(obrigacao_id or repo.proximo_obrigacao_id(None))
-    lanc_id = repo.registrar_lancamento(
-        None,
-        obrigacao_id=_obrigacao_id,
-        tipo_obrigacao="BOLETO",
-        valor_total=float(valor_total or 0.0),
-        data_evento=str(data_evento or datetime.now().strftime("%Y-%m-%d")),
-        vencimento=str(vencimento),
-        descricao=(descricao or None),
-        credor=(credor or None),
-        competencia=(competencia or None),
-        parcela_num=(int(parcela_num) if parcela_num else None),
-        parcelas_total=(int(parcelas_total) if parcelas_total else None),
-        usuario=str(usuario or "-"),
-        tipo_origem=None,
-        cartao_id=None,
-        emprestimo_id=None,
-    )
-
-    return {
-        "ok": True,
-        "lancamento_id": int(lanc_id),
-        "obrigacao_id": int(_obrigacao_id),
-        "tipo_obrigacao": "BOLETO",
-        "vencimento": str(vencimento),
-        "valor_total": float(valor_total or 0.0),
-        "credor": (credor or None),
-        "descricao": (descricao or None),
-        "usuario": str(usuario or "-"),
-    }
-
-
-# =============================================================================
-# Listagens — delegação ao Repository (mantém compat com UI)
-# =============================================================================
-def listar_boletos_em_aberto(caminho_banco: str) -> List[dict]:
-    _, repo = _get_services(caminho_banco)
-    return repo.listar_boletos_em_aberto()
-
-
-# Alias compat (nome legado)
-def _listar_boletos_em_aberto(caminho_banco: str) -> List[dict]:
-    return listar_boletos_em_aberto(caminho_banco)

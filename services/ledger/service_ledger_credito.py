@@ -1,3 +1,4 @@
+# services/ledger/service_ledger_credito.py
 """
 Compras a crédito (programação em fatura).
 
@@ -9,20 +10,21 @@ Regras para agregar compras a crédito na fatura do cartão:
 Responsabilidades:
 - Determinar a competência base da compra conforme regras do cartão.
 - Criar/atualizar LANCAMENTO da fatura (`tipo_obrigacao='FATURA_CARTAO'`).
-- Inserir itens detalhados em `fatura_cartao_itens`.
+- Inserir itens detalhados em `fatura_cartao_itens` (se existir a tabela).
 - Preservar idempotência via `trans_uid` (`mov_repo.ja_existe_transacao`).
 
 Dependências:
 - shared.db.get_conn
 - shared.ids.sanitize, uid_credito_programado
 - self.cap_repo (proximo_obrigacao_id, registrar_lancamento)
-- self.mov_repo (ja_existe_transacao)
-- self.cartoes_repo (obter_por_nome)
-- self._competencia_compra (helper na service/fachada)
+- self.mov_repo (ja_existe_transacao) [opcional]
+- self.cartoes_repo (obter_por_nome)  [opcional]
+- self._competencia_compra (helper no mixin de infra)
+- self._atualizar_status_por_id (helper no mixin de CAP)
 
 Notas:
-- NÃO atualizamos coluna legada `valor`.
-- Status: "EM ABERTO" / "PARCIAL" / "QUITADO" (definido pelo helper).
+- NÃO movimenta caixa nem banco (somente log de 'registro' para auditoria).
+- Status: "EM ABERTO" / "PARCIAL" / "QUITADO" (helper).
 """
 
 from __future__ import annotations
@@ -67,7 +69,8 @@ class _CreditoLedgerMixin:
 
     Este mixin agrega compras a crédito às respectivas faturas de cartão, criando
     (ou atualizando) um LANCAMENTO por competência e registrando itens
-    descritivos em `fatura_cartao_itens`. A auditoria fica em `movimentacoes_bancarias`.
+    descritivos em `fatura_cartao_itens` (quando existir). A auditoria fica em
+    `movimentacoes_bancarias` como 'registro' (valor 0.0).
     """
 
     # ------------------------------------------------------------------
@@ -87,30 +90,7 @@ class _CreditoLedgerMixin:
         parcela_num: Optional[int] = None,
         parcelas_total: Optional[int] = None,
     ) -> int:
-        """Soma `valor_add` ao LANCAMENTO da fatura (cartão+competência).
-
-        Se já houver LANCAMENTO para (cartão, competência), acumula em `valor_evento`.
-        Caso contrário, cria um novo LANCAMENTO.
-
-        Observação:
-            O UPDATE usa `descricao = COALESCE(descricao, ?)` para preservar uma
-            descrição já existente; só preenche se estiver NULL.
-
-        Args:
-            conn: Conexão SQLite aberta.
-            cartao_nome: Nome do cartão (credor no CAP).
-            competencia: Competência no formato `YYYY-MM`.
-            valor_add: Valor a somar ao principal da fatura.
-            data_evento: Data do evento (normalmente a data da compra).
-            vencimento: Data de vencimento calculada para a competência.
-            usuario: Operador responsável.
-            descricao: Descrição genérica para o LANCAMENTO (pode ser None).
-            parcela_num: Número da parcela (para sinalizar no CAP).
-            parcelas_total: Total de parcelas.
-
-        Returns:
-            int: ID do LANCAMENTO (contas_a_pagar_mov.id).
-        """
+        """Soma `valor_add` ao LANCAMENTO da fatura (cartão+competência)."""
         cur = conn.cursor()
         valor_add = round(float(valor_add or 0.0), 2)
 
@@ -128,8 +108,7 @@ class _CreditoLedgerMixin:
         ).fetchone()
 
         if row:
-            lanc_id = int(row["id"])
-            _ = int(row["obrigacao_id"])  # mantido para debug/log
+            lanc_id = int(row[0])
             cur.execute(
                 """
                 UPDATE contas_a_pagar_mov
@@ -140,7 +119,13 @@ class _CreditoLedgerMixin:
                 (valor_add, descricao, lanc_id),
             )
         else:
-            obrigacao_id = self.cap_repo.proximo_obrigacao_id(conn)  # type: ignore[attr-defined]
+            # Próximo obrigacao_id seguro
+            try:
+                obrigacao_id = int(self.cap_repo.proximo_obrigacao_id(conn))  # type: ignore[attr-defined]
+            except Exception:
+                r = cur.execute("SELECT COALESCE(MAX(obrigacao_id),0) FROM contas_a_pagar_mov").fetchone()
+                obrigacao_id = int((r[0] or 0) + 1)
+
             lanc_id = self.cap_repo.registrar_lancamento(  # type: ignore[attr-defined]
                 conn,
                 obrigacao_id=int(obrigacao_id),
@@ -165,11 +150,14 @@ class _CreditoLedgerMixin:
                        status = COALESCE(NULLIF(status,''), 'EM ABERTO')
                  WHERE id = ?
                 """,
-                (cartao_nome, lanc_id),
+                (cartao_nome, int(lanc_id)),
             )
 
-        # Recalcula STATUS de forma segura (helper busca os números no BD)
-        self._atualizar_status_por_id(conn, int(lanc_id))  # type: ignore[attr-defined]
+        # Recalcula STATUS (helper de CAP)
+        try:
+            self._atualizar_status_por_id(conn, int(lanc_id))  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         logger.debug(
             "_add_valor_fatura: cartao=%s comp=%s add=%.2f lanc_id=%s",
@@ -191,31 +179,14 @@ class _CreditoLedgerMixin:
         sub_categoria: Optional[str],
         descricao: Optional[str],
         usuario: str,
-        fechamento: int,  # (IGNORADO — usa dados do cartão no banco; mantido por compat)
-        vencimento: int,  # (IGNORADO — usa dados do cartão no banco; mantido por compat)
+        fechamento: int,  # fallback: dias_fechamento quando não houver cartoes_repo
+        vencimento: int,  # fallback: vencimento_dia   quando não houver cartoes_repo
         trans_uid: Optional[str] = None,
     ) -> Tuple[List[int], int]:
         """Rateia o valor em parcelas e agrega cada parcela à fatura adequada.
 
         Idempotência: se `trans_uid` já existe em `movimentacoes_bancarias`,
         a operação é ignorada.
-
-        Args:
-            data_compra: Data da compra (YYYY-MM-DD).
-            valor: Valor total da compra (> 0).
-            parcelas: Número de parcelas (>= 1).
-            cartao_nome: Nome do cartão.
-            categoria: Categoria principal (para item).
-            sub_categoria: Subcategoria (para item).
-            descricao: Descrição detalhada (para item).
-            usuario: Identificação do operador.
-            fechamento: (Ignorado) mantido para compatibilidade de chamadas antigas.
-            vencimento: (Ignorado) mantido para compatibilidade de chamadas antigas.
-            trans_uid: UID determinístico opcional.
-
-        Returns:
-            Tuple[List[int], int]: (IDs de LANCAMENTO afetados/criados, id do log em `movimentacoes_bancarias`)
-            ou ([], -1) se idempotente.
         """
         if float(valor) <= 0:
             raise ValueError("Valor deve ser maior que zero.")
@@ -231,7 +202,7 @@ class _CreditoLedgerMixin:
         # Descrição genérica para o LANCAMENTO (CAP)
         descricao_cap = "Descrição na Fatura"
 
-        # Idempotência
+        # Idempotência por UID
         trans_uid = trans_uid or uid_credito_programado(
             data_compra, valor, parcelas, cartao_nome, categoria, sub_categoria, descricao_item, usuario
         )
@@ -240,35 +211,38 @@ class _CreditoLedgerMixin:
                 logger.info("registrar_saida_credito: trans_uid já existe (%s) — ignorando", trans_uid)
                 return ([], -1)
         except Exception:
-            # Falha em checar idempotência não deve travar a programação
-            pass
+            pass  # falha em checar idempotência não deve travar a programação
 
         compra = pd.to_datetime(data_compra)
 
         with get_conn(self.db_path) as conn:  # type: ignore[attr-defined]
             cur = conn.cursor()
 
-            # Config do cartão (aceita tupla (vencimento_dia, dias_fechamento) ou dict equivalente)
-            card_cfg: Any = self.cartoes_repo.obter_por_nome(cartao_nome)  # type: ignore[attr-defined]
-            if not card_cfg:
-                raise ValueError(f"Cartão '{cartao_nome}' não encontrado.")
+            # Config do cartão
+            vencimento_dia: int
+            dias_fechamento: int
             try:
-                if isinstance(card_cfg, dict):
-                    vencimento_dia = int(card_cfg.get("vencimento_dia"))
-                    dias_fechamento = int(card_cfg.get("dias_fechamento"))
+                card_cfg: Any = getattr(self, "cartoes_repo", None) and self.cartoes_repo.obter_por_nome(cartao_nome)  # type: ignore[attr-defined]
+                if card_cfg:
+                    if isinstance(card_cfg, dict):
+                        vencimento_dia = int(card_cfg.get("vencimento_dia"))
+                        dias_fechamento = int(card_cfg.get("dias_fechamento"))
+                    else:
+                        v_dia, d_fech = card_cfg  # type: ignore[misc]
+                        vencimento_dia = int(v_dia)
+                        dias_fechamento = int(d_fech)
                 else:
-                    vencimento_dia, dias_fechamento = map(int, card_cfg)  # type: ignore[arg-type]
-            except Exception as e:
-                raise ValueError(
-                    f"cartoes_repo.obter_por_nome('{cartao_nome}') deve retornar "
-                    f"(vencimento_dia, dias_fechamento) ou dict compatível."
-                ) from e
+                    raise RuntimeError("cartoes_repo indisponível")
+            except Exception:
+                # Fallback para parâmetros recebidos
+                vencimento_dia = int(vencimento or 10)
+                dias_fechamento = int(fechamento or 7)
 
             # Competência base da compra (regra do cartão)
             comp_base_str = self._competencia_compra(  # type: ignore[attr-defined]
                 compra_dt=pd.to_datetime(compra).to_pydatetime(),
-                vencimento_dia=int(vencimento_dia),
-                dias_fechamento=int(dias_fechamento),
+                vencimento_dia=vencimento_dia,
+                dias_fechamento=dias_fechamento,
             )
             comp_base = pd.to_datetime(comp_base_str + "-01")
 
@@ -278,6 +252,21 @@ class _CreditoLedgerMixin:
 
             lanc_ids: List[int] = []
             total_programado = 0.0
+
+            # Confere existência de fatura_cartao_itens (itens são opcionais)
+            itens_table_exists = bool(
+                cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='fatura_cartao_itens'"
+                ).fetchone()
+            )
+            if itens_table_exists:
+                # Índice único idempotente por (purchase_uid, parcela_num)
+                try:
+                    cur.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS ux_fatura_itens_uid_parc ON fatura_cartao_itens (purchase_uid, parcela_num)"
+                    )
+                except Exception:
+                    pass
 
             for p in range(1, int(parcelas) + 1):
                 comp_dt = comp_base + pd.DateOffset(months=p - 1)
@@ -306,29 +295,35 @@ class _CreditoLedgerMixin:
                 lanc_ids.append(int(lanc_id))
                 total_programado = round(total_programado + float(vparc), 2)
 
-                # Item detalhado na fatura (usa descrição do formulário)
-                cur.execute(
-                    """
-                    INSERT INTO fatura_cartao_itens
-                        (purchase_uid, cartao, competencia, data_compra, descricao_compra, categoria,
-                         parcela_num, parcelas, valor_parcela, usuario)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        trans_uid,
-                        cartao_nome,
-                        competencia,
-                        str(compra.date()),
-                        descricao_item or "",
-                        (f"{categoria or ''}" + (f" / {sub_categoria}" if sub_categoria else "")).strip(" /"),
-                        int(p),
-                        int(parcelas),
-                        float(vparc),
-                        usuario,
-                    ),
-                )
+                # Item detalhado na fatura (se existir a tabela)
+                if itens_table_exists:
+                    try:
+                        cur.execute(
+                            """
+                            INSERT OR IGNORE INTO fatura_cartao_itens
+                                (purchase_uid, cartao, competencia, data_compra, descricao_compra, categoria,
+                                 parcela_num, parcelas, valor_parcela, usuario, lancamento_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                trans_uid,
+                                cartao_nome,
+                                competencia,
+                                str(compra.date()),
+                                descricao_item or "",
+                                (f"{categoria or ''}" + (f" / {sub_categoria}" if sub_categoria else "")).strip(" /"),
+                                int(p),
+                                int(parcelas),
+                                float(vparc),
+                                usuario,
+                                int(lanc_id),
+                            ),
+                        )
+                    except Exception:
+                        # Não quebra programação por falha de itens (apenas log)
+                        logger.warning("Falha ao inserir item de fatura (uid=%s, parc=%s/%s)", trans_uid, p, parcelas)
 
-            # Log — padronizado COM parcelas (• Nx) para crédito
+            # Log — padronizado (sem movimentar caixa; tipo 'registro', valor 0.0)
             obs = _fmt_obs_saida(
                 forma="CREDITO",
                 valor=float(total_programado),
@@ -343,9 +338,9 @@ class _CreditoLedgerMixin:
                 conn,
                 data=str(compra.date()),
                 banco=cartao_nome,
-                tipo="saida",
-                valor=float(total_programado),
-                origem="saidas_credito_programada",
+                tipo="registro",               # <- não é saída de caixa
+                valor=0.0,                     # <- não impacta saldos
+                origem="credito_programado",
                 observacao=obs,
                 usuario=usuario,
                 referencia_tabela="contas_a_pagar_mov",

@@ -19,6 +19,8 @@ class MovimentacoesRepository:
         self.db_path: str = resolve_db_path(db_path_like)
         self.garantir_schema()  # garante tabela/índices/colunas na inicialização
 
+    # ---------------- conexões ----------------
+
     def _get_conn(self) -> sqlite3.Connection:
         """
         Abre conexão SQLite com PRAGMAs padronizados do projeto
@@ -37,18 +39,31 @@ class MovimentacoesRepository:
         conn.row_factory = sqlite3.Row
         return conn
 
+    # ---------------- schema / migração ----------------
+
     def _colunas_existentes(self, conn: sqlite3.Connection) -> set:
         rows = conn.execute("PRAGMA table_info(movimentacoes_bancarias);").fetchall()
         return {str(r["name"]) if isinstance(r, sqlite3.Row) else str(r[1]) for r in rows}
 
+    def _garantir_unique_trans_uid(self, conn: sqlite3.Connection) -> None:
+        """
+        Garante existência da coluna trans_uid (se legado) e índice UNIQUE idempotente.
+        OBS: Em SQLite não dá para adicionar UNIQUE via ALTER COLUMN, então usamos índice UNIQUE.
+        """
+        existentes = self._colunas_existentes(conn)
+        if "trans_uid" not in existentes:
+            conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "trans_uid" TEXT;')
+        # Índice UNIQUE idempotente (não conflita com a constraint UNIQUE criada na tabela nova)
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_mov_trans_uid ON movimentacoes_bancarias(trans_uid);")
+
     def garantir_schema(self) -> None:
         """
         Cria a tabela `movimentacoes_bancarias` e índices, se não existirem.
-        Também garante colunas opcionais novas (usuario, data_hora).
+        Também garante colunas opcionais novas (usuario, data_hora) e UNIQUE em trans_uid.
         Idempotente.
         """
         with self._get_conn() as conn:
-            # Tabela base
+            # Tabela base (com UNIQUE inline para novas instalações)
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS movimentacoes_bancarias (
@@ -68,16 +83,20 @@ class MovimentacoesRepository:
                 """
             )
 
-            # Migração leve: garantir colunas novas
+            # Migração leve: garantir colunas novas e unique em trans_uid (para bases antigas)
             existentes = self._colunas_existentes(conn)
             if "usuario" not in existentes:
                 conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "usuario" TEXT;')
             if "data_hora" not in existentes:
                 conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "data_hora" TEXT;')
 
+            # Mesmo que a tabela já tenha sido criada sem UNIQUE em trans_uid no passado,
+            # garantimos o índice UNIQUE agora.
+            self._garantir_unique_trans_uid(conn)
+
             conn.commit()
 
-    # ---------- existentes ----------
+    # ---------------- consultas / utilidades ----------------
 
     def ja_existe_transacao(self, trans_uid: str) -> bool:
         """
@@ -97,6 +116,19 @@ class MovimentacoesRepository:
                 (trans_uid,),
             )
             return cur.fetchone() is not None
+
+    def obter_por_trans_uid(self, trans_uid: str) -> Optional[Dict[str, Any]]:
+        """Retorna o registro de movimentação pelo trans_uid (ou None)."""
+        if not trans_uid:
+            return None
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM movimentacoes_bancarias WHERE trans_uid = ? LIMIT 1",
+                (trans_uid,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    # ---------------- inserts brutos ----------------
 
     def inserir_log(
         self,
@@ -118,12 +150,13 @@ class MovimentacoesRepository:
         Mantém retrocompatibilidade com chamadas antigas.
         """
         with self._get_conn() as conn:
-            # Garantir que as colunas novas existem (execuções antigas em runtime)
+            # Garantir que as colunas/índices existem (execuções antigas em runtime)
             existentes = self._colunas_existentes(conn)
             if "usuario" not in existentes:
                 conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "usuario" TEXT;')
             if "data_hora" not in existentes:
                 conn.execute('ALTER TABLE movimentacoes_bancarias ADD COLUMN "data_hora" TEXT;')
+            self._garantir_unique_trans_uid(conn)
 
             cur = conn.cursor()
             cur.execute(
@@ -149,9 +182,9 @@ class MovimentacoesRepository:
                 ),
             )
             conn.commit()
-            return cur.lastrowid
+            return int(cur.lastrowid)
 
-    # ---------- novos helpers (idempotência e semânticos) ----------
+    # ---------------- helpers idempotentes / semânticos ----------------
 
     def _hash_uid(self, payload: Dict[str, Any]) -> str:
         """
@@ -215,7 +248,7 @@ class MovimentacoesRepository:
         if self.ja_existe_transacao(uid):
             with self._get_conn() as conn:
                 row = conn.execute(
-                    "SELECT id FROM movimentacoes_bancarias WHERE trans_uid=? LIMIT 1",
+                    "SELECT id FROM movimentacoes_bancarias WHERE trans_uid = ? LIMIT 1",
                     (uid,),
                 ).fetchone()
                 return int(row[0]) if row else -1
@@ -249,9 +282,7 @@ class MovimentacoesRepository:
         usuario: Optional[str] = None,
         data_hora: Optional[str] = None,
     ) -> int:
-        """
-        Atalho semântico para registrar **entrada** (valor > 0).
-        """
+        """Atalho semântico para registrar **entrada** (valor > 0)."""
         if valor <= 0:
             raise ValueError("Entrada deve ter valor > 0.")
         return self.inserir_generico(
@@ -282,9 +313,7 @@ class MovimentacoesRepository:
         usuario: Optional[str] = None,
         data_hora: Optional[str] = None,
     ) -> int:
-        """
-        Atalho semântico para registrar **saída** (valor > 0).
-        """
+        """Atalho semântico para registrar **saída** (valor > 0)."""
         if valor <= 0:
             raise ValueError("Saída deve ter valor > 0.")
         return self.inserir_generico(
@@ -300,6 +329,14 @@ class MovimentacoesRepository:
             usuario=usuario,
             data_hora=data_hora,
         )
+
+    # ---------------- migração opcional pública ----------------
+
+    def criar_indice_unique_trans_uid(self) -> None:
+        """Exponho publicamente para forçar (re)criação do índice UNIQUE, se necessário."""
+        with self._get_conn() as conn:
+            self._garantir_unique_trans_uid(conn)
+            conn.commit()
 
 
 __all__ = ["MovimentacoesRepository"]

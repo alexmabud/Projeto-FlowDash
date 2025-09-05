@@ -10,7 +10,7 @@ crédito (vencimento e fechamento).
 Funcionalidades principais
 --------------------------
 - Validação de configuração de cartão (dia de vencimento e dias de fechamento).
-- Consulta de cartão por nome → retorna `(vencimento_dia, dias_fechamento)`.
+- Consulta de cartão por nome → retorna `(vencimento_dia, dias_fechamento)` ou dict.
 - Listagem de nomes de cartões (ordenada e normalizada).
 
 Detalhes técnicos
@@ -25,12 +25,13 @@ Detalhes técnicos
 Dependências
 ------------
 - sqlite3
-- typing (Optional, Tuple, List)
-
+- typing (Optional, Tuple, List, Dict)
 """
 
+from __future__ import annotations
+
 import sqlite3
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 
 class CartoesRepository:
@@ -41,8 +42,13 @@ class CartoesRepository:
         db_path (str): Caminho do arquivo SQLite.
     """
     def __init__(self, db_path: str):
+        if not db_path or not isinstance(db_path, str):
+            raise ValueError("db_path inválido para CartoesRepository")
         self.db_path = db_path
 
+    # -------------------------
+    # Conexão com PRAGMAs
+    # -------------------------
     def _get_conn(self) -> sqlite3.Connection:
         """
         Abre conexão SQLite com PRAGMAs de confiabilidade/performance
@@ -54,18 +60,30 @@ class CartoesRepository:
         conn.execute("PRAGMA foreign_keys=ON;")
         return conn
 
+    # -------------------------
+    # Validações de configuração
+    # -------------------------
     def _validar_conf(self, vencimento_dia: int, dias_fechamento: int) -> None:
         """
         Valida parâmetros de configuração de fatura:
 
-        - `vencimento_dia`: 1..31 (o ajuste para último dia do mês ocorre no uso).
+        - `vencimento_dia`: 1..31 (ajuste para último dia do mês ocorre no uso).
         - `dias_fechamento`: 0..28 (dias ANTES do vencimento em que fecha).
         """
-        if not (1 <= int(vencimento_dia) <= 31):
+        try:
+            v = int(vencimento_dia)
+            f = int(dias_fechamento)
+        except Exception:
+            raise ValueError("vencimento/dias_fechamento precisam ser inteiros")
+
+        if not (1 <= v <= 31):
             raise ValueError(f"vencimento inválido ({vencimento_dia}); use 1..31")
-        if not (0 <= int(dias_fechamento) <= 28):
+        if not (0 <= f <= 28):
             raise ValueError(f"fechamento inválido ({dias_fechamento}); use 0..28 (dias antes do vencimento)")
 
+    # -------------------------
+    # Consultas
+    # -------------------------
     def obter_por_nome(self, nome: str) -> Optional[Tuple[int, int]]:
         """
         Retorna `(vencimento_dia, dias_fechamento)` do cartão, ou `None` se não existir.
@@ -82,6 +100,7 @@ class CartoesRepository:
         """
         if not nome or not nome.strip():
             return None
+
         with self._get_conn() as conn:
             row = conn.execute(
                 """
@@ -92,13 +111,46 @@ class CartoesRepository:
                 """,
                 (nome,)
             ).fetchone()
-            if not row:
-                return None
 
-            vencimento_dia = int(row[0] if row[0] is not None else 0)
-            dias_fechamento = int(row[1] if row[1] is not None else 0)
-            self._validar_conf(vencimento_dia, dias_fechamento)
-            return (vencimento_dia, dias_fechamento)
+        if not row:
+            return None
+
+        vencimento_dia = int(row[0] if row[0] is not None else 0)
+        dias_fechamento = int(row[1] if row[1] is not None else 0)
+        self._validar_conf(vencimento_dia, dias_fechamento)
+        return (vencimento_dia, dias_fechamento)
+
+    # Aliases comuns para compatibilidade
+    def get_by_name(self, nome: str) -> Optional[Tuple[int, int]]:
+        """Alias para `obter_por_nome` (compat)."""
+        return self.obter_por_nome(nome)
+
+    def get_config_by_name(self, nome: str) -> Optional[Dict[str, int]]:
+        """
+        Variante que retorna dict:
+        { 'vencimento_dia': int, 'dias_fechamento': int } ou None
+        """
+        t = self.obter_por_nome(nome)
+        if not t:
+            return None
+        v, f = t
+        return {"vencimento_dia": v, "dias_fechamento": f}
+
+    def exists(self, nome: str) -> bool:
+        """Retorna True se o cartão existir, comparando por nome (case/trim-insensitive)."""
+        if not nome or not nome.strip():
+            return False
+        with self._get_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                  FROM cartoes_credito
+                 WHERE LOWER(TRIM(nome)) = LOWER(TRIM(?))
+                 LIMIT 1
+                """,
+                (nome,)
+            ).fetchone()
+        return bool(row)
 
     def listar_nomes(self) -> List[str]:
         """
@@ -106,11 +158,11 @@ class CartoesRepository:
         (case/trim-insensitive).
         """
         with self._get_conn() as conn:
+            conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT nome FROM cartoes_credito ORDER BY LOWER(TRIM(nome)) ASC"
+                "SELECT nome FROM cartoes_credito WHERE COALESCE(TRIM(nome),'') <> '' ORDER BY LOWER(TRIM(nome)) ASC"
             ).fetchall()
-            return [r[0] for r in rows]
-
+        return [str(r["nome"]) for r in rows]
 
 # ----------------------------
 # FUNÇÃO EXTRA — fora da classe
@@ -123,21 +175,21 @@ def listar_destinos_fatura_em_aberto(db_path: str):
     Regra:
         - Base: `contas_a_pagar_mov`
         - Lançamento de fatura: `tipo_obrigacao='FATURA_CARTAO'` e `categoria_evento='LANCAMENTO'`
-        - Pagamentos deduzidos: eventos onde `categoria_evento` começa com `'PAGAMENTO'`
+        - Pagamentos deduzidos: eventos onde `categoria_evento` começa com 'PAGAMENTO'
           (valores negativos somados para obter total pago).
         - `saldo = total_lancado - total_pago` (apenas `saldo > 0` entra no resultado).
 
-    Parâmetros:
-        db_path (str): Caminho do arquivo SQLite.
-
     Retorno:
         list[dict]: Cada item contém:
-            - label (str): Ex.: `"Fatura Bradesco 2025-08 — R$ 400,00"`
+            - label (str): Ex.: "Fatura Bradesco 2025-08 — R$ 400,00"
             - cartao (str)
             - competencia (str)  # YYYY-MM
             - obrigacao_id (int)
             - saldo (float)
     """
+    if not db_path or not isinstance(db_path, str):
+        raise ValueError("db_path inválido em listar_destinos_fatura_em_aberto")
+
     conn = sqlite3.connect(db_path, timeout=30)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -145,7 +197,8 @@ def listar_destinos_fatura_em_aberto(db_path: str):
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.row_factory = sqlite3.Row
 
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             WITH lanc AS (
                 SELECT
                     obrigacao_id,
@@ -175,25 +228,29 @@ def listar_destinos_fatura_em_aberto(db_path: str):
             LEFT JOIN pagos p USING (obrigacao_id)
             WHERE (l.total_lancado - COALESCE(p.total_pago,0)) > 0
             ORDER BY LOWER(TRIM(l.cartao)) ASC, l.competencia ASC
-        """).fetchall()
+            """
+        ).fetchall()
     finally:
         conn.close()
 
     itens = []
     for r in rows:
         cartao = r["cartao"] or ""
-        comp   = r["competencia"] or ""
-        saldo  = float(r["saldo"] or 0.0)
-        label  = f"Fatura {cartao} {comp} — R$ {saldo:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        itens.append({
-            "label": label,
-            "cartao": cartao,
-            "competencia": comp,
-            "obrigacao_id": int(r["obrigacao_id"]),
-            "saldo": saldo,
-        })
+        comp = r["competencia"] or ""
+        saldo = float(r["saldo"] or 0.0)
+        # BRL simples (R$ 1.234,56)
+        label = f"Fatura {cartao} {comp} — R$ {saldo:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        itens.append(
+            {
+                "label": label,
+                "cartao": cartao,
+                "competencia": comp,
+                "obrigacao_id": int(r["obrigacao_id"]),
+                "saldo": saldo,
+            }
+        )
     return itens
 
 
-# (Opcional) API pública explícita
+# API pública explícita
 __all__ = ["CartoesRepository", "listar_destinos_fatura_em_aberto"]

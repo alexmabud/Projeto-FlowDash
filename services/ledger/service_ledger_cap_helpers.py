@@ -4,8 +4,11 @@ Helpers de Contas a Pagar (CAP) — padrão novo
 
 Regras centrais:
 - STATUS e FALTANTE dependem SOMENTE de principal_pago_acumulado vs valor_evento.
-- valor_pago_acumulado = CAIXA GASTO (principal + juros + multa − desconto) — NÃO entra no status/faltante.
-- Encargos: juros_pago_acumulado, multa_paga_acumulada, desconto_aplicado_acumulado (desconto não é caixa).
+- valor_pago_acumulado (no CAP) é BRUTO: principal + DESCONTO + juros + multa.
+  *Esse campo é apenas auditoria de “tamanho do pagamento”; não define status/faltante.*
+- Dinheiro que sai do caixa/banco é controlado em movimentacoes_bancarias (saida_total),
+  e segue: saida_total = principal + juros + multa (desconto NÃO sai do caixa).
+- Encargos acumulados: juros_pago_acumulado, multa_paga_acumulada, desconto_aplicado_acumulado.
 - Coluna legada `valor`: ignorada.
 
 APIs (retrocompat mantida onde possível):
@@ -79,7 +82,8 @@ class _CapHelpersLedgerMixin:
     def _total_pago_acumulado(self, conn: sqlite3.Connection, obrigacao_id: int) -> float:
         """Soma do PRINCIPAL amortizado (`principal_pago_acumulado`) na obrigação.
 
-        Antes somava `valor_pago_acumulado` (caixa); agora soma apenas principal.
+        OBS: Antes alguns fluxos somavam `valor_pago_acumulado` (BRUTO). Agora
+        usamos somente o principal para total pago em termos de quitação.
         """
         with self._conn_ctx(conn) as c:
             cur = c.cursor()
@@ -104,8 +108,8 @@ class _CapHelpersLedgerMixin:
             row = cur.execute(
                 """
                 SELECT
-                    COALESCE(SUM(valor_evento), 0.0)                 AS total_doc,
-                    COALESCE(SUM(principal_pago_acumulado), 0.0)     AS total_principal
+                    COALESCE(SUM(valor_evento), 0.0)             AS total_doc,
+                    COALESCE(SUM(principal_pago_acumulado), 0.0) AS total_principal
                   FROM contas_a_pagar_mov
                  WHERE categoria_evento = 'LANCAMENTO'
                    AND obrigacao_id = ?

@@ -2,23 +2,24 @@
 """
 Service: BOLETO (pagamento de parcelas)
 
-Regras principais deste serviço:
-- Ordem de aplicação: FIFO por vencimento das parcelas em aberto na obrigação.
+Regras principais:
+- FIFO por vencimento das parcelas em aberto da obrigação.
 - Rateio do pagamento:
     • principal → amortiza as parcelas (CASCADE entre parcelas).
     • juros     → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
     • multa     → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
     • desconto  → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-- Saída de caixa/banco: o Repository calcula o caixa gasto de cada aplicação
-  como **(principal + juros + multa)** — **desconto não sai do caixa** — e consolida a movimentação.
-- trans_uid: gerado por operação e retornado ao chamador (não é persistido aqui).
-- Este serviço NÃO cria eventos novos no CAP; ele aplica/acumula nos lançamentos
-  já programados (parcelas).
+- Saída de caixa/banco: **principal + juros + multa** (desconto NÃO sai do caixa), agregado.
+- trans_uid: gerado por operação (idempotência).
+- Este serviço NÃO cria novos eventos no CAP; apenas aplica nos LANCAMENTOS já existentes.
+- Movimentação bancária:
+    • se o pagamento vier do fluxo de SAÍDA (registrar_saida_*), ela é registrada lá;
+    • se o pagamento for direto por aqui, registramos 1 linha em `movimentacoes_bancarias`
+      com checagem de idempotência via `trans_uid`.
 
-Dependências:
-- repository.contas_a_pagar_mov_repository.ContasAPagarMovRepository
-  • listar_parcelas_em_aberto_fifo(conn, obrigacao_id)
-  • aplicar_pagamento_parcela(conn, parcela_id, valor_base, juros, multa, desconto, data_evento, usuario)
+Dependências (Repository):
+- listar_parcelas_em_aberto_fifo(conn, obrigacao_id)
+- aplicar_pagamento_parcela(conn, parcela_id, valor_base, juros, multa, desconto, data_evento, usuario)
 """
 
 from __future__ import annotations
@@ -31,25 +32,14 @@ from uuid import uuid4
 import sqlite3
 
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
+from services.ledger.service_ledger_infra import _fmt_obs_saida, log_mov_bancaria
 
 _EPS = 1e-9  # Tolerância numérica para comparações de ponto flutuante
 
 
 @dataclass
 class ResultadoParcela:
-    """Snapshot resumido do efeito do pagamento em uma parcela.
-
-    Attributes:
-        parcela_id: ID da parcela afetada.
-        aplicado_principal: Valor de principal aplicado nesta parcela (amortização).
-        aplicado_juros: Valor de juros aplicado nesta parcela (somente 1ª aberta).
-        aplicado_multa: Valor de multa aplicado nesta parcela (somente 1ª aberta).
-        aplicado_desconto: Valor de desconto aplicado nesta parcela (somente 1ª aberta).
-        saida_total: Impacto total de caixa/banco nesta parcela
-            (**principal + juros + multa**; desconto **não** sai do caixa), calculado no Repository.
-        status: Novo status da parcela após a aplicação (e.g., "PARCIAL", "QUITADO").
-        restante_principal: Principal ainda em aberto após a aplicação nesta parcela.
-    """
+    """Snapshot resumido do efeito do pagamento em uma parcela."""
     parcela_id: int
     aplicado_principal: float
     aplicado_juros: float
@@ -61,20 +51,50 @@ class ResultadoParcela:
 
 
 class ServiceLedgerBoleto:
-    """Serviço de pagamento de BOLETOS (parcelas) com rateio FIFO e encargos na 1ª aberta."""
+    """Serviço de pagamento de BOLETO com rateio FIFO e encargos na 1ª parcela aberta."""
 
-    def __init__(self, db_path: str):
-        """Inicializa o serviço.
-
-        Args:
-            db_path: Caminho do arquivo SQLite.
-        """
+    def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.cap_repo = ContasAPagarMovRepository(db_path)
 
     # ------------------------------------------------------------------
-    # API moderna
+    # APIs públicas
     # ------------------------------------------------------------------
+    def pagar_parcela_boleto(
+        self,
+        *,
+        obrigacao_id: int,
+        parcela_id: Optional[int] = None,  # ignorado (pagamento é FIFO)
+        valor_base: float,
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+        usuario: str | None = None,
+        data_evento: Optional[str] = None,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> Dict[str, Any]:
+        """
+        Aplica pagamento nas parcelas da obrigação (FIFO).
+        NÃO cria movimentação bancária aqui — indicado quando a Saída foi registrada em outro fluxo.
+        """
+        core = self._pagar_core(
+            obrigacao_id=obrigacao_id,
+            principal=float(valor_base or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
+            data_evento=data_evento,
+            usuario=usuario or "-",
+            conn=conn,
+        )
+        return {
+            "trans_uid": core["trans_uid"],
+            "saida_total": float(core["saida_total"]),
+            "resultados": core["resultados"],
+            "sobra": float(core["sobra"]),
+            **({"mensagem": core["mensagem"]} if core.get("mensagem") else {}),
+        }
+
     def pagar_boleto(
         self,
         *,
@@ -85,40 +105,149 @@ class ServiceLedgerBoleto:
         desconto: float = 0.0,
         data_evento: Optional[str] = None,
         usuario: str = "-",
+        forma_pagamento: Optional[str] = None,
+        origem: Optional[str] = None,
+        ledger_id: Optional[int] = None,
         conn: Optional[sqlite3.Connection] = None,
     ) -> Dict[str, Any]:
-        """Aplica o pagamento de BOLETO seguindo as regras FIFO e de encargos.
-
-        Regras:
-            - O `principal` é aplicado em cascata sobre as parcelas em aberto (FIFO).
-            - `juros`, `multa` e `desconto` são aplicados apenas na PRIMEIRA parcela
-              ainda em aberto no momento da operação (não cascateiam).
-
-        Args:
-            obrigacao_id: Identificador do grupo de parcelas (obrigação).
-            principal: Valor destinado à amortização do principal (>= 0).
-            juros: Encargo de juros a aplicar na 1ª parcela aberta (>= 0).
-            multa: Encargo de multa a aplicar na 1ª parcela aberta (>= 0).
-            desconto: Desconto a aplicar na 1ª parcela aberta (>= 0).
-            data_evento: Data do evento no formato 'YYYY-MM-DD'. Padrão: data de hoje.
-            usuario: Identificação do operador.
-            conn: Conexão SQLite opcional. Se omitida, o serviço gerencia a transação.
-
-        Returns:
-            Dict com:
-                - trans_uid (str): identificador único desta operação.
-                - saida_total (float): soma do impacto de caixa/banco em todas as parcelas.
-                - resultados (list[dict]): lista de snapshots por parcela aplicada.
-                - (opcional) mensagem (str): quando não há parcelas em aberto.
-
-        Notes:
-            - O cálculo da saída (**principal + juros + multa**; desconto não entra) é feito no Repository.
-            - Este serviço não cria linhas em CAP; apenas aplica/acumula na programação existente.
         """
-        data_evt = data_evento or datetime.now().strftime("%Y-%m-%d")
-        trans_uid = f"BOLETO-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        Paga boleto diretamente por aqui.
+        Se `ledger_id` vier None, registra 1 movimento bancário com idempotência por `trans_uid`.
+        """
+        forma = (forma_pagamento or "DINHEIRO").upper()
+        if forma == "DEBITO":
+            forma = "DÉBITO"
+        origem_eff = origem or ("Caixa" if forma == "DINHEIRO" else "Banco 1")
 
-        # Sanitização (não permitir negativos)
+        core = self._pagar_core(
+            obrigacao_id=obrigacao_id,
+            principal=float(principal or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
+            data_evento=data_evento,
+            usuario=usuario or "-",
+            conn=conn,
+        )
+
+        mov_id: Optional[int] = None
+        if ledger_id is None and core["saida_total"] > 0:
+            with self._conn_ctx(conn) as c:
+                # evite duplicar a movimentação (idempotência pelo trans_uid)
+                if not self._mov_ja_existe(c, core["trans_uid"]):
+                    obs = _fmt_obs_saida(
+                        forma=forma,
+                        valor=float(core["saida_total"]),
+                        categoria="BOLETO",
+                        subcategoria=None,
+                        descricao=f"Pagamento boleto (obrigação {obrigacao_id})",
+                        banco=(origem_eff if forma == "DÉBITO" else None),
+                    )
+                    mov_id = log_mov_bancaria(
+                        c,
+                        data=(data_evento or datetime.now().strftime("%Y-%m-%d")),
+                        banco=str(origem_eff or ""),
+                        tipo="saida",
+                        valor=float(core["saida_total"]),
+                        origem="saidas",
+                        observacao=obs,
+                        usuario=usuario,
+                        referencia_id=int(obrigacao_id),
+                        referencia_tabela="contas_a_pagar_mov",
+                        trans_uid=str(core["trans_uid"]),
+                        data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+
+        return {
+            "ok": True,
+            "obrigacao_id": obrigacao_id,
+            "sobra": float(core["sobra"]),
+            "trans_uid": core["trans_uid"],
+            "saida_total": float(core["saida_total"]),
+            "resultados": core["resultados"],
+            "ids": {
+                "ledger_id": ledger_id,
+                "cap_evento_id": None,
+                "mov_id": mov_id if (ledger_id is None and core["saida_total"] > 0) else None,
+            },
+            **({"mensagem": core["mensagem"]} if core.get("mensagem") else {}),
+        }
+
+    def registrar_saida_boleto(
+        self,
+        *,
+        valor: float,
+        forma: Optional[str] = None,
+        origem: Optional[str] = None,
+        banco: Optional[str] = None,
+        descricao: Optional[str] = None,
+        usuario: Optional[str] = None,
+        trans_uid: Optional[str] = None,
+        obrigacao_id: Optional[int] = None,
+        parcela_id: Optional[int] = None,  # ignorado (FIFO)
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+        data_evento: Optional[str] = None,
+        **_ignored: Any,
+    ) -> Dict[str, Any]:
+        """
+        Wrapper usado pelo fluxo de Saídas:
+        - Com `obrigacao_id`: aplica pagamento FIFO no CAP (NÃO cria MB aqui).
+        - Sem `obrigacao_id`: este serviço não lida com saída avulsa; retorna ok=False.
+        """
+        if obrigacao_id is None:
+            return {
+                "ok": False,
+                "mensagem": "registrar_saida_boleto sem obrigacao_id não é suportado neste serviço.",
+            }
+
+        core = self._pagar_core(
+            obrigacao_id=int(obrigacao_id),
+            principal=float(valor or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
+            data_evento=data_evento,
+            usuario=usuario or "-",
+            conn=None,
+            trans_uid_override=trans_uid,  # preserva idempotência entre camadas
+        )
+        return {
+            "ok": True,
+            "obrigacao_id": int(obrigacao_id),
+            "sobra": float(core["sobra"]),
+            "trans_uid": core["trans_uid"],
+            "saida_total": float(core["saida_total"]),
+            "resultados": core["resultados"],
+            "ids": {"ledger_id": None, "cap_evento_id": None, "mov_id": None},
+            **({"mensagem": core["mensagem"]} if core.get("mensagem") else {}),
+        }
+
+    # ------------------------------------------------------------------
+    # Núcleo compartilhado
+    # ------------------------------------------------------------------
+    def _pagar_core(
+        self,
+        *,
+        obrigacao_id: int,
+        principal: float,
+        juros: float,
+        multa: float,
+        desconto: float,
+        data_evento: Optional[str],
+        usuario: str,
+        conn: Optional[sqlite3.Connection],
+        trans_uid_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Aplica o pagamento seguindo FIFO e regras de encargos (desconto não sai do caixa)."""
+        data_evt = data_evento or datetime.now().strftime("%Y-%m-%d")
+        trans_uid = (
+            trans_uid_override
+            if trans_uid_override
+            else f"BOLETO-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
+        )
+
         restante_principal = max(0.0, float(principal or 0.0))
         juros = max(0.0, float(juros or 0.0))
         multa = max(0.0, float(multa or 0.0))
@@ -128,22 +257,20 @@ class ServiceLedgerBoleto:
         saida_total_agregado = 0.0
 
         with self._conn_ctx(conn) as c:
-            # 1) Obter parcelas em aberto (FIFO)
             fifo = self.cap_repo.listar_parcelas_em_aberto_fifo(c, obrigacao_id=obrigacao_id)
             if not fifo:
                 return {
                     "trans_uid": trans_uid,
                     "saida_total": 0.0,
                     "resultados": [],
-                    "mensagem": "Nenhuma parcela em aberto para esta obrigação.",
+                    "sobra": float(restante_principal),
+                    "mensagem": "Nenhuma parcela em aberto para este boleto.",
                 }
 
-            # 2) Encargos são aplicados apenas na 1ª parcela aberta
             encargos_pend = {"juros": juros, "multa": multa, "desconto": desconto}
             primeira = True
 
             for p in fifo:
-                # Se já não há principal a aplicar e já passamos da 1ª parcela (encargos aplicados), encerramos
                 if restante_principal <= _EPS and not primeira:
                     break
 
@@ -151,14 +278,12 @@ class ServiceLedgerBoleto:
                 faltante_parcela = float(p["principal_faltante"] or 0.0)
 
                 aplicar_principal = min(restante_principal, max(0.0, faltante_parcela))
-                # Atualiza o restante do principal (2 casas para manter consistência monetária)
                 restante_principal = round(restante_principal - aplicar_principal, 2)
 
                 if primeira:
                     aplicar_juros = encargos_pend["juros"]
                     aplicar_multa = encargos_pend["multa"]
                     aplicar_desconto = encargos_pend["desconto"]
-                    # Zera pendências de encargos para as próximas parcelas
                     encargos_pend = {"juros": 0.0, "multa": 0.0, "desconto": 0.0}
                     primeira = False
                 else:
@@ -192,7 +317,6 @@ class ServiceLedgerBoleto:
                     )
                 )
 
-                # Se não há mais principal a aplicar e nada foi aplicado nesta iteração, encerramos
                 if restante_principal <= _EPS and aplicar_principal <= _EPS:
                     break
 
@@ -200,142 +324,18 @@ class ServiceLedgerBoleto:
             "trans_uid": trans_uid,
             "saida_total": float(saida_total_agregado),
             "resultados": [r.__dict__ for r in resultados],
+            "sobra": float(restante_principal),
         }
 
     # ------------------------------------------------------------------
-    # Retrocompat: aliases/shims esperados por código legado
+    # Utilitários internos
     # ------------------------------------------------------------------
-    def pagar_parcela_boleto(
-        self,
-        *,
-        obrigacao_id: int,
-        parcela_id: Optional[int] = None,  # Aceito por compat; ignorado (pagamento é FIFO)
-        valor_base: float,
-        juros: float = 0.0,
-        multa: float = 0.0,
-        desconto: float = 0.0,
-        usuario: str = "-",
-        data_evento: Optional[str] = None,
-        **_kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Alias de compatibilidade que delega para `pagar_boleto`.
+    def _mov_ja_existe(self, conn: sqlite3.Connection, trans_uid: str) -> bool:
+        cur = conn.execute("SELECT 1 FROM movimentacoes_bancarias WHERE trans_uid = ? LIMIT 1", (trans_uid,))
+        return cur.fetchone() is not None
 
-        Observações:
-            - `parcela_id` é aceito para manter compatibilidade, porém o pagamento
-              segue FIFO por design.
-            - Parâmetros extras (`forma`, `origem`, `banco`, `trans_uid`, etc.) são
-              ignorados aqui; o débito efetivo em caixa/banco é resolvido no Repository.
-
-        Args:
-            obrigacao_id: Identificador do grupo de parcelas.
-            parcela_id: Ignorado; mantido para compatibilidade.
-            valor_base: Valor de principal a aplicar.
-            juros: Juros a aplicar (na 1ª parcela aberta).
-            multa: Multa a aplicar (na 1ª parcela aberta).
-            desconto: Desconto a aplicar (na 1ª parcela aberta).
-            usuario: Operador.
-            data_evento: Data do evento 'YYYY-MM-DD'.
-            **_kwargs: Parâmetros legados ignorados.
-
-        Returns:
-            Mesmo dicionário retornado por `pagar_boleto`.
-        """
-        return self.pagar_boleto(
-            obrigacao_id=obrigacao_id,
-            principal=valor_base,
-            juros=juros,
-            multa=multa,
-            desconto=desconto,
-            usuario=usuario,
-            data_evento=data_evento,
-        )
-
-    def registrar_saida_boleto(
-        self,
-        *,
-        valor: float,
-        forma: Optional[str] = None,
-        origem: Optional[str] = None,
-        banco: Optional[str] = None,
-        descricao: Optional[str] = None,
-        usuario: str = "-",
-        trans_uid: Optional[str] = None,
-        obrigacao_id: Optional[int] = None,
-        parcela_id: Optional[int] = None,
-        juros: float = 0.0,
-        multa: float = 0.0,
-        desconto: float = 0.0,
-        data_evento: Optional[str] = None,
-        **_kwargs: Any,
-    ) -> Dict[str, Any]:
-        """Shim de compatibilidade para cenários legados que chamavam 'registrar_saida_boleto'.
-
-        Comportamento:
-            - Se `obrigacao_id` for informado, redireciona para `pagar_parcela_boleto`
-              (fluxo moderno, FIFO).
-            - Se NÃO houver `obrigacao_id`, a operação é rejeitada explicitamente,
-              pois este serviço não registra saídas avulsas de boletos sem vínculo de CAP.
-
-        Args:
-            valor: Valor a aplicar como principal (amortização).
-            forma: (Ignorado neste serviço) Forma de pagamento.
-            origem: (Ignorado neste serviço) Origem do recurso (Caixa/Caixa 2/Banco).
-            banco: (Ignorado neste serviço) Nome do banco, quando aplicável.
-            descricao: (Ignorado neste serviço) Descrição legada.
-            usuario: Operador.
-            trans_uid: (Ignorado) ID legada da transação.
-            obrigacao_id: Obrigatório para que o pagamento seja aplicado via FIFO.
-            parcela_id: Aceito para compat, mas ignorado (pagamento é FIFO).
-            juros: Juros a aplicar na 1ª parcela aberta.
-            multa: Multa a aplicar na 1ª parcela aberta.
-            desconto: Desconto a aplicar na 1ª parcela aberta.
-            data_evento: Data do evento 'YYYY-MM-DD'.
-            **_kwargs: Parâmetros legados ignorados.
-
-        Returns:
-            Mesmo dicionário retornado por `pagar_parcela_boleto`.
-
-        Raises:
-            AttributeError: Se `obrigacao_id` não for informado.
-        """
-        if obrigacao_id is not None:
-            return self.pagar_parcela_boleto(
-                obrigacao_id=obrigacao_id,
-                parcela_id=parcela_id,
-                valor_base=valor,
-                juros=juros,
-                multa=multa,
-                desconto=desconto,
-                usuario=usuario,
-                data_evento=data_evento,
-                forma=forma,
-                origem=origem,
-                banco=banco,
-                descricao=descricao,
-                trans_uid=trans_uid,
-            )
-
-        raise AttributeError(
-            "registrar_saida_boleto: uso sem 'obrigacao_id' não é suportado neste serviço. "
-            "Registre saídas avulsas pelo registrador genérico de eventos/saídas."
-        )
-
-    # ------------------------------------------------------------------
-    # Utilitário interno: contexto de conexão/commit
-    # ------------------------------------------------------------------
     @contextmanager
     def _conn_ctx(self, conn: Optional[sqlite3.Connection]) -> Iterator[sqlite3.Connection]:
-        """Gerencia a conexão SQLite.
-
-        Se `conn` for fornecida, a função apenas a reutiliza (sem fechar/commit).
-        Caso contrário, abre uma conexão nova, faz commit e fecha ao final.
-
-        Args:
-            conn: Conexão SQLite existente (opcional).
-
-        Yields:
-            Conexão SQLite utilizável dentro do bloco `with`.
-        """
         if conn is not None:
             yield conn
         else:

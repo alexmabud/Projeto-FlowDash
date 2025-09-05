@@ -6,27 +6,20 @@ Actions de Pagamento (Fatura Cartão, Boleto e Empréstimo)
 Objetivo
 --------
 - Orquestrar pagamentos SEM atualizar CAP diretamente aqui.
-- Preferir a API de alto nível do Ledger (pagar_*) e,
-  na ausência, cair para os registradores de saída (registrar_saida_*),
-  sempre informando `obrigacao_id_*` e encargos (juros/multa/desconto).
+- Preferir a API dos serviços de alto nível (pagar_*). Quando não usar o service,
+  cair para os registradores de saída (registrar_saida_*), sempre informando
+  `tipo_obrigacao` + `obrigacao_id` e os encargos.
 
 Regras Financeiras (padrão vigente)
 -----------------------------------
-- Desconto abate PRIMEIRO o principal faltante.
+- Desconto abate PRIMEIRO o principal faltante (no CAP), mas NÃO sai do caixa.
 - Dinheiro que sai do caixa/banco = principal_em_dinheiro + juros + multa.
-- CAP acumula:
-    principal_pago_acumulado += principal_em_dinheiro + desconto_efetivo
-    juros_pago_acumulado     += juros
-    multa_paga_acumulada     += multa
-    desconto_aplicado_acumulado += desconto_efetivo
-    valor_pago_acumulado (CAP, BRUTO) += principal_em_dinheiro + desconto + juros + multa
 - Status depende SOMENTE do principal acumulado vs valor_evento.
 
 Reduções de redundância
 -----------------------
-- Listagens (faturas/boletos/emp.) NÃO ficam mais aqui: delegamos ao
-  `ContasAPagarMovRepository`.
-- Cálculos de “faltante/status” NÃO ficam aqui: usamos o repository.
+- Listagens delegadas ao ContasAPagarMovRepository.
+- Cálculos de “faltante/status” delegados ao repository.
 
 Compat
 ------
@@ -38,8 +31,11 @@ from __future__ import annotations
 from typing import Optional, Tuple, Dict, Any
 from datetime import datetime
 
-# Ledger e Repository
+# Ledger / Services / Repository
 from services.ledger.service_ledger import LedgerService
+from services.ledger.service_ledger_boleto import ServiceLedgerBoleto
+from services.ledger.service_ledger_emprestimo import ServiceLedgerEmprestimo
+from services.ledger.service_ledger_fatura import ServiceLedgerFatura
 from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
 
 
@@ -51,14 +47,13 @@ def _get_services(caminho_banco: str) -> Tuple[LedgerService, ContasAPagarMovRep
     return LedgerService(caminho_banco), ContasAPagarMovRepository(caminho_banco)
 
 
-def _canonicalizar_banco_safe(caminho_banco: str, banco: Optional[str]) -> Optional[str]:
+def _canonicalizar_banco_safe(_: str, banco: Optional[str]) -> Optional[str]:
     """Normaliza nome de banco de forma defensiva (sem bater no DB)."""
     if not banco:
         return None
     nome = str(banco).strip()
     if not nome:
         return None
-    # Normalizações usuais; ajuste conforme seus nomes canônicos
     aliases = {
         "INTER": "Banco Inter",
         "INFINITEPAY": "InfinitePay",
@@ -90,6 +85,26 @@ def _split_principal_e_desconto(
     return principal_cash, desconto_efetivo
 
 
+def _norm_forma(forma: Optional[str]) -> str:
+    f = (forma or "").strip().upper()
+    return "DÉBITO" if f == "DEBITO" else (f or "DINHEIRO")
+
+
+def _norm_data(s: Optional[str]) -> str:
+    if not s:
+        return datetime.now().strftime("%Y-%m-%d")
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    try:
+        return datetime.fromisoformat(s).date().strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
 def _registrar_saida_pagamento(
     ledger: LedgerService,
     *,
@@ -106,21 +121,20 @@ def _registrar_saida_pagamento(
     juros: float,
     multa: float,
     desconto: float,
-    # Ligações CAP
-    obrigacao_id_fatura: Optional[int] = None,
-    obrigacao_id_boleto: Optional[int] = None,
-    obrigacao_id_emprestimo: Optional[int] = None,
+    # Ligações CAP (genérico)
+    tipo_obrigacao: str,
+    obrigacao_id: int,
 ) -> Tuple[int, Optional[int]]:
     """
     Fallback padronizado para registrar a saída via Ledger:
     - Se forma = DINHEIRO => registrar_saida_dinheiro
     - Caso contrário => registrar_saida_bancaria
-    Passa encargos e o `obrigacao_id_*` correspondente.
+    Passa encargos e (`tipo_obrigacao`, `obrigacao_id`).
     Retorna (id_saida, id_mov) quando disponível.
     """
-    forma_up = (forma_pagamento or "").strip().upper()
+    forma_up = _norm_forma(forma_pagamento)
     kwargs_comuns: Dict[str, Any] = dict(
-        data=data,
+        data=_norm_data(data),
         valor=float(principal_cash),  # **somente principal em dinheiro**
         categoria=categoria,
         sub_categoria=sub_categoria,
@@ -129,25 +143,17 @@ def _registrar_saida_pagamento(
         juros=float(juros or 0.0),
         multa=float(multa or 0.0),
         desconto=float(desconto or 0.0),
+        tipo_obrigacao=tipo_obrigacao,
+        obrigacao_id=int(obrigacao_id),
     )
 
-    # Passa apenas um dos obrigacao_id_* (o que não for None)
-    if obrigacao_id_fatura is not None:
-        kwargs_comuns["obrigacao_id_fatura"] = int(obrigacao_id_fatura)
-    if obrigacao_id_boleto is not None:
-        kwargs_comuns["obrigacao_id_boleto"] = int(obrigacao_id_boleto)
-    if obrigacao_id_emprestimo is not None:
-        kwargs_comuns["obrigacao_id_emprestimo"] = int(obrigacao_id_emprestimo)
-
     if forma_up == "DINHEIRO":
-        # Origem de dinheiro (ex.: "Caixa", "Caixa 2")
         kwargs_comuns["origem_dinheiro"] = origem_dinheiro or "Caixa"
         return ledger.registrar_saida_dinheiro(**kwargs_comuns)
     else:
-        # Saída bancária (PIX/DÉBITO/CRÉDITO/BOLETO pago em conta)
         banco_nome = _canonicalizar_banco_safe(ledger.db_path, banco_nome)
         kwargs_comuns["banco_nome"] = banco_nome or "Banco Inter"
-        kwargs_comuns["forma"] = forma_pagamento
+        kwargs_comuns["forma"] = forma_up
         return ledger.registrar_saida_bancaria(**kwargs_comuns)
 
 
@@ -160,7 +166,7 @@ def pagar_fatura_cartao_action(
     obrigacao_id_fatura: int,
     data: str,
     valor_principal: float,
-    forma_pagamento: str,             # "DINHEIRO" ou bancária (PIX/DÉBITO/CRÉDITO)
+    forma_pagamento: str,             # "DINHEIRO" ou bancária (PIX/DÉBITO)
     banco_nome: Optional[str] = None, # quando bancária
     origem_dinheiro: Optional[str] = None,  # quando dinheiro
     juros: float = 0.0,
@@ -172,34 +178,32 @@ def pagar_fatura_cartao_action(
 ) -> Dict[str, Any]:
     """
     Paga fatura de cartão. Preferência:
-      1) ledger.pagar_fatura_cartao (se existir)
-      2) fallback: registrar_saida_* com obrigacao_id_fatura
+      1) Service direto (registra MB se chamado daqui)
+      2) Fallback: registrar_saida_* com tipo_obrigacao='FATURA_CARTAO'
     """
     ledger, cap_repo = _get_services(caminho_banco)
 
-    # Clamp correto para principal e desconto (seguro mesmo se o Ledger já fizer isso)
     principal_cash, desconto_efetivo = _split_principal_e_desconto(
         cap_repo, int(obrigacao_id_fatura), float(valor_principal), float(desconto)
     )
 
-    # 1) API de alto nível (se disponível)
-    if hasattr(ledger, "pagar_fatura_cartao"):
-        result = ledger.pagar_fatura_cartao(
-            data=data,
-            valor_principal=float(principal_cash),
-            forma_pagamento=forma_pagamento,
-            banco_nome=banco_nome,
-            origem_dinheiro=origem_dinheiro,
-            juros=float(juros),
-            multa=float(multa),
-            desconto=float(desconto_efetivo),
-            obrigacao_id_fatura=int(obrigacao_id_fatura),
-            descricao=descricao,
-            usuario=usuario,
-            sub_categoria=sub_categoria,
-        )
-    else:
-        # 2) Fallback: registra saída e deixa o Ledger aplicar o CAP pelo obrigacao_id_*
+    # 1) Service direto (garante log idempotente quando não há ledger_id)
+    svc = ServiceLedgerFatura(caminho_banco)
+    res = svc.pagar_fatura_cartao(
+        obrigacao_id=int(obrigacao_id_fatura),
+        valor_base=float(principal_cash),           # <- usar alias aceito
+        juros=float(juros),
+        multa=float(multa),
+        desconto=float(desconto_efetivo),
+        forma_pagamento=_norm_forma(forma_pagamento),
+        origem=(origem_dinheiro if _norm_forma(forma_pagamento) == "DINHEIRO"
+                else (_canonicalizar_banco_safe(caminho_banco, banco_nome) or "Banco 1")),
+        data_evento=_norm_data(data),
+        usuario=usuario,
+    )
+
+    # 2) Fallback apenas se service falhar de forma inesperada
+    if not isinstance(res, dict) or res.get("ok") is False:
         id_saida, id_mov = _registrar_saida_pagamento(
             ledger,
             data=data,
@@ -214,11 +218,11 @@ def pagar_fatura_cartao_action(
             juros=juros,
             multa=multa,
             desconto=desconto_efetivo,
-            obrigacao_id_fatura=int(obrigacao_id_fatura),
+            tipo_obrigacao="FATURA_CARTAO",
+            obrigacao_id=int(obrigacao_id_fatura),
         )
-        result = {"id_saida": id_saida, "id_mov": id_mov}
+        res = {"id_saida": id_saida, "id_mov": id_mov, "ok": True}
 
-    # Snapshot pós-pagamento para UI
     faltante, status = cap_repo.obter_restante_e_status(None, int(obrigacao_id_fatura))
     return {
         "ok": True,
@@ -228,7 +232,7 @@ def pagar_fatura_cartao_action(
         "desconto": float(desconto_efetivo),
         "restante": float(faltante),
         "status": status,
-        **(result if isinstance(result, dict) else {}),
+        **(res if isinstance(res, dict) else {}),
     }
 
 
@@ -250,30 +254,29 @@ def pagar_boleto_action(
 ) -> Dict[str, Any]:
     """
     Paga parcela de BOLETO. Preferência:
-      1) ledger.pagar_parcela_boleto (se existir)
-      2) fallback registrar_saida_* com obrigacao_id_boleto
+      1) Service direto (registra MB se chamado daqui)
+      2) Fallback registrar_saida_* com tipo_obrigacao='BOLETO'
     """
     ledger, cap_repo = _get_services(caminho_banco)
     principal_cash, desconto_efetivo = _split_principal_e_desconto(
         cap_repo, int(obrigacao_id_boleto), float(valor_principal), float(desconto)
     )
 
-    if hasattr(ledger, "pagar_parcela_boleto"):
-        result = ledger.pagar_parcela_boleto(
-            data=data,
-            valor_principal=float(principal_cash),
-            forma_pagamento=forma_pagamento,
-            banco_nome=banco_nome,
-            origem_dinheiro=origem_dinheiro,
-            juros=float(juros),
-            multa=float(multa),
-            desconto=float(desconto_efetivo),
-            obrigacao_id_boleto=int(obrigacao_id_boleto),
-            descricao=descricao,
-            usuario=usuario,
-            sub_categoria=sub_categoria,
-        )
-    else:
+    svc = ServiceLedgerBoleto(caminho_banco)
+    res = svc.pagar_boleto(
+        obrigacao_id=int(obrigacao_id_boleto),
+        principal=float(principal_cash),
+        juros=float(juros),
+        multa=float(multa),
+        desconto=float(desconto_efetivo),
+        data_evento=_norm_data(data),
+        usuario=usuario,
+        forma_pagamento=_norm_forma(forma_pagamento),
+        origem=(origem_dinheiro if _norm_forma(forma_pagamento) == "DINHEIRO"
+                else (_canonicalizar_banco_safe(caminho_banco, banco_nome) or "Banco 1")),
+    )
+
+    if not isinstance(res, dict) or res.get("ok") is False:
         id_saida, id_mov = _registrar_saida_pagamento(
             ledger,
             data=data,
@@ -288,9 +291,10 @@ def pagar_boleto_action(
             juros=juros,
             multa=multa,
             desconto=desconto_efetivo,
-            obrigacao_id_boleto=int(obrigacao_id_boleto),
+            tipo_obrigacao="BOLETO",
+            obrigacao_id=int(obrigacao_id_boleto),
         )
-        result = {"id_saida": id_saida, "id_mov": id_mov}
+        res = {"id_saida": id_saida, "id_mov": id_mov, "ok": True}
 
     faltante, status = cap_repo.obter_restante_e_status(None, int(obrigacao_id_boleto))
     return {
@@ -301,7 +305,7 @@ def pagar_boleto_action(
         "desconto": float(desconto_efetivo),
         "restante": float(faltante),
         "status": status,
-        **(result if isinstance(result, dict) else {}),
+        **(res if isinstance(res, dict) else {}),
     }
 
 
@@ -323,30 +327,29 @@ def pagar_emprestimo_action(
 ) -> Dict[str, Any]:
     """
     Paga parcela de EMPRÉSTIMO. Preferência:
-      1) ledger.pagar_parcela_emprestimo (se existir)
-      2) fallback registrar_saida_* com obrigacao_id_emprestimo
+      1) Service direto (registra MB se chamado daqui)
+      2) Fallback registrar_saida_* com tipo_obrigacao='EMPRESTIMO'
     """
     ledger, cap_repo = _get_services(caminho_banco)
     principal_cash, desconto_efetivo = _split_principal_e_desconto(
         cap_repo, int(obrigacao_id_emprestimo), float(valor_principal), float(desconto)
     )
 
-    if hasattr(ledger, "pagar_parcela_emprestimo"):
-        result = ledger.pagar_parcela_emprestimo(
-            data=data,
-            valor_principal=float(principal_cash),
-            forma_pagamento=forma_pagamento,
-            banco_nome=banco_nome,
-            origem_dinheiro=origem_dinheiro,
-            juros=float(juros),
-            multa=float(multa),
-            desconto=float(desconto_efetivo),
-            obrigacao_id_emprestimo=int(obrigacao_id_emprestimo),
-            descricao=descricao,
-            usuario=usuario,
-            sub_categoria=sub_categoria,
-        )
-    else:
+    svc = ServiceLedgerEmprestimo(caminho_banco)
+    res = svc.pagar_emprestimo(
+        obrigacao_id=int(obrigacao_id_emprestimo),
+        principal=float(principal_cash),
+        juros=float(juros),
+        multa=float(multa),
+        desconto=float(desconto_efetivo),
+        data_evento=_norm_data(data),
+        usuario=usuario,
+        forma_pagamento=_norm_forma(forma_pagamento),
+        origem=(origem_dinheiro if _norm_forma(forma_pagamento) == "DINHEIRO"
+                else (_canonicalizar_banco_safe(caminho_banco, banco_nome) or "Banco 1")),
+    )
+
+    if not isinstance(res, dict) or res.get("ok") is False:
         id_saida, id_mov = _registrar_saida_pagamento(
             ledger,
             data=data,
@@ -361,9 +364,10 @@ def pagar_emprestimo_action(
             juros=juros,
             multa=multa,
             desconto=desconto_efetivo,
-            obrigacao_id_emprestimo=int(obrigacao_id_emprestimo),
+            tipo_obrigacao="EMPRESTIMO",
+            obrigacao_id=int(obrigacao_id_emprestimo),
         )
-        result = {"id_saida": id_saida, "id_mov": id_mov}
+        res = {"id_saida": id_saida, "id_mov": id_mov, "ok": True}
 
     faltante, status = cap_repo.obter_restante_e_status(None, int(obrigacao_id_emprestimo))
     return {
@@ -374,7 +378,7 @@ def pagar_emprestimo_action(
         "desconto": float(desconto_efetivo),
         "restante": float(faltante),
         "status": status,
-        **(result if isinstance(result, dict) else {}),
+        **(res if isinstance(res, dict) else {}),
     }
 
 

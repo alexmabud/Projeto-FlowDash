@@ -79,9 +79,9 @@ class ServiceLedgerFatura:
         - Aceita `conn` como 1º argumento posicional (opcional).
         - Aceita `valor_base` **ou** `valor` (alias para principal) ou `principal`.
         - Aceita `juros/multa/desconto`, `data_evento`, `usuario`.
-        - Usa (quando fornecidos) `forma_pagamento` e `origem` para registrar
-          uma linha em `movimentacoes_bancarias` quando o pagamento é feito
-          diretamente por este serviço (sem passar por registrar_saida_*).
+        - Usa (quando fornecidos) `forma_pagamento` e `origem` (ou `banco_nome`/`origem_dinheiro`)
+          para registrar uma linha em `movimentacoes_bancarias` quando o pagamento
+          é feito diretamente por este serviço (sem passar por registrar_saida_*).
         - Retorna dict com `ok`, `sobra`, `obrigacao_id`, `ids`, `trans_uid`,
           `saida_total` (dinheiro que sai: principal + juros + multa), `resultados`,
           e opcional `mensagem`.
@@ -110,7 +110,12 @@ class ServiceLedgerFatura:
         forma_pagamento = (kwargs.get("forma_pagamento") or kwargs.get("forma") or "DINHEIRO").upper()
         if forma_pagamento == "DEBITO":
             forma_pagamento = "DÉBITO"
-        origem = kwargs.get("origem") or ("Caixa" if forma_pagamento == "DINHEIRO" else "Banco 1")
+        origem = (
+            kwargs.get("origem")
+            or kwargs.get("banco_nome")
+            or kwargs.get("origem_dinheiro")
+            or ("Caixa" if forma_pagamento == "DINHEIRO" else "Banco 1")
+        )
 
         ledger_id = kwargs.get("ledger_id")  # quando pagamento veio do fluxo de SAÍDA
         trans_uid_ext = kwargs.get("trans_uid")  # se vier de fora, preservamos
@@ -129,6 +134,7 @@ class ServiceLedgerFatura:
 
         # Se NÃO veio do fluxo de SAÍDA (sem ledger_id), registramos a movimentação aqui.
         # Evita duplicidade usando o mesmo trans_uid.
+        mov_id: Optional[int] = None
         if ledger_id is None and core["saida_total"] > 0:
             with self._conn_ctx(conn) as c:
                 if not self._mov_ja_existe(c, core["trans_uid"]):
@@ -141,7 +147,7 @@ class ServiceLedgerFatura:
                         descricao=f"Pagamento fatura (obrigação {obrigacao_id})",
                         banco=(origem if forma_pagamento == "DÉBITO" else None),
                     )
-                    c.execute(
+                    cur = c.execute(
                         """
                         INSERT INTO movimentacoes_bancarias
                             (data, banco, tipo, valor, origem, observacao,
@@ -159,7 +165,7 @@ class ServiceLedgerFatura:
                             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         ),
                     )
-                    # Commit é feito pelo _conn_ctx quando abrimos a conexão internamente
+                    mov_id = int(cur.lastrowid)
 
         # Monta resposta padronizada (esperada pelo helper compat)
         resp = {
@@ -169,7 +175,11 @@ class ServiceLedgerFatura:
             "trans_uid": core["trans_uid"],
             "saida_total": float(core["saida_total"]),  # dinheiro que sai: principal + juros + multa
             "resultados": core["resultados"],
-            "ids": {"ledger_id": ledger_id if ledger_id is not None else None, "cap_evento_id": None, "mov_id": None},
+            "ids": {
+                "ledger_id": ledger_id if ledger_id is not None else None,
+                "cap_evento_id": None,
+                "mov_id": mov_id,
+            },
         }
         if core.get("mensagem"):
             resp["ok"] = False

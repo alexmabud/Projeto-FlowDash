@@ -14,7 +14,7 @@ Inclui:
 Observações
 -----------
 - `formatar_moeda` / `formatar_percentual` aceitam int/float/str/Decimal.
-- `gerar_hash_senha` usa SHA‑256 (sem sal). Para produção, considere sal/pepper.
+- `gerar_hash_senha` usa SHA-256 (sem sal). Para produção, considere sal/pepper.
 """
 
 from __future__ import annotations
@@ -118,64 +118,55 @@ formatar_porcentagem = formatar_percentual
 # -----------------------------------------------------------------------------
 def garantir_trigger_totais_saldos_caixas(caminho_banco: str) -> None:
     """
-    Garante (idempotente) a estrutura mínima e o registro inicial da tabela `saldos_caixas`.
+    Garante (idempotente) a estrutura mínima da tabela `saldos_caixas`
+    no formato esperado pelo Ledger:
 
-    Compatível com esquemas existentes que possuam coluna `data` NOT NULL sem default.
-    Detecta colunas via PRAGMA e preenche dinamicamente no INSERT inicial.
+        data TEXT PRIMARY KEY,
+        caixa REAL, caixa_2 REAL, caixa_vendas REAL,
+        caixa2_dia REAL, caixa_total REAL, caixa2_total REAL
+
+    Observações:
+    - Não insere um registro fixo (ex.: id=1). A criação da linha do dia
+      é responsabilidade de quem chama (_garantir_linha_saldos_caixas no Ledger).
+    - Se a tabela já existir com layout diferente, adiciona as colunas faltantes
+      com DEFAULT 0 (idempotente).
     """
     import sqlite3
+
+    colunas_necessarias = {
+        "data": "TEXT",
+        "caixa": "REAL",
+        "caixa_2": "REAL",
+        "caixa_vendas": "REAL",
+        "caixa2_dia": "REAL",
+        "caixa_total": "REAL",
+        "caixa2_total": "REAL",
+    }
 
     with sqlite3.connect(caminho_banco, timeout=30) as conn:
         conn.execute("PRAGMA foreign_keys = ON;")
 
-        # Cria tabela se não existir (com defaults para evitar NOT NULL)
+        # Cria tabela se não existir (com 'data' como chave natural)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS saldos_caixas (
-                id INTEGER PRIMARY KEY CHECK (id=1),
-                data TEXT NOT NULL DEFAULT (date('now','localtime')),
-                caixa REAL NOT NULL DEFAULT 0,
-                caixa2 REAL NOT NULL DEFAULT 0,
-                atualizado_em TEXT DEFAULT (datetime('now','localtime'))
+                data TEXT PRIMARY KEY,
+                caixa REAL DEFAULT 0,
+                caixa_2 REAL DEFAULT 0,
+                caixa_vendas REAL DEFAULT 0,
+                caixa2_dia REAL DEFAULT 0,
+                caixa_total REAL DEFAULT 0,
+                caixa2_total REAL DEFAULT 0
             );
         """)
 
-        # Inspeciona colunas atuais
-        cols_info = conn.execute("PRAGMA table_info('saldos_caixas');").fetchall()
-        col_names = {row[1] for row in cols_info}
-        notnull_cols = {row[1] for row in cols_info if int(row[3]) == 1}
-        defaults = {row[1]: row[4] for row in cols_info}  # dflt_value string ou None
+        # Garante colunas faltantes
+        cols = {row[1] for row in conn.execute("PRAGMA table_info('saldos_caixas');").fetchall()}
+        for nome, tipo in colunas_necessarias.items():
+            if nome not in cols:
+                conn.execute(f'ALTER TABLE saldos_caixas ADD COLUMN "{nome}" {tipo} DEFAULT 0;')
 
-        # Insere o registro id=1 se não existir, respeitando NOT NULL
-        already = conn.execute("SELECT 1 FROM saldos_caixas WHERE id=1;").fetchone()
-        if already is None:
-            insert_cols = ["id"]
-            insert_vals = [1]
+        conn.commit()
 
-            if "data" in col_names and ("data" in notnull_cols) and (defaults.get("data") is None):
-                insert_cols.append("data")
-                insert_vals.append(conn.execute("SELECT date('now','localtime');").fetchone()[0])
-            if "caixa" in col_names and ("caixa" in notnull_cols) and (defaults.get("caixa") is None):
-                insert_cols.append("caixa")
-                insert_vals.append(0.0)
-            if "caixa2" in col_names and ("caixa2" in notnull_cols) and (defaults.get("caixa2") is None):
-                insert_cols.append("caixa2")
-                insert_vals.append(0.0)
-
-            placeholders = ",".join(["?"] * len(insert_cols))
-            sql = f"INSERT INTO saldos_caixas ({','.join(insert_cols)}) VALUES ({placeholders});"
-            conn.execute(sql, insert_vals)
-
-        # Trigger de "touch" (se a coluna existir)
-        if "atualizado_em" in col_names:
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS trg_saldos_caixas_touch
-                AFTER UPDATE ON saldos_caixas
-                BEGIN
-                    UPDATE saldos_caixas
-                       SET atualizado_em = datetime('now','localtime')
-                     WHERE id = NEW.id;
-                END;
-            """)
 
 def limpar_valor_formatado(valor, *, as_decimal: bool = False):
     """
