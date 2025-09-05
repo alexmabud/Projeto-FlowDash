@@ -176,19 +176,37 @@ def render_saida(
         st.warning("⚠️ Confirme os dados antes de salvar.")
         return
 
-    # Execução (com rastreio de erro detalhado)
+    # Execução (com rastreio de erro detalhado) — TRATANDO ValueError (ex.: pagar acima do saldo)
     from shared.debug_trace import debug_wrap_ctx
 
     with debug_wrap_ctx("Salvar Saída"):
-        res = registrar_saida(
-            caminho_banco=_db_path,
-            data_lanc=_data_lanc,
-            usuario_nome=usuario_nome,
-            payload=payload,
-        )
+        try:
+            res = registrar_saida(
+                caminho_banco=_db_path,
+                data_lanc=_data_lanc,
+                usuario_nome=usuario_nome,
+                payload=payload,
+            )
+        except ValueError:
+            # Mensagem fixa e curta para pagamento acima do saldo
+            st.warning("Valor do pagamento maior que valor da fatura.")
+            return
+        except Exception as e:
+            # Erros inesperados
+            st.error("Erro ao registrar a saída.")
+            st.exception(e)
+            return
 
-        # Feedbacks idênticos aos do original
-        st.session_state["msg_ok"] = res["msg"]
+        # --- Mensagem de sucesso (override para Fatura) ---
+        msg_ok = res.get("msg", "")
+        if payload.get("is_pagamentos") and payload.get("tipo_pagamento_sel") == "Fatura Cartão de Crédito":
+            # Se não for caso de idempotência, sobrescreve a mensagem
+            if "idempotência" not in str(msg_ok) and "já registrada" not in str(msg_ok):
+                valor_pag = float(payload.get("valor_saida") or 0.0)
+                msg_ok = f"Pagamento de fatura registrado! Pago: R$ {valor_pag:.2f}"
+
+        # Feedbacks
+        st.session_state["msg_ok"] = msg_ok
 
         # Info de classificação (somente para Pagamentos fora de Boletos)
         if payload.get("is_pagamentos") and payload.get("tipo_pagamento_sel") != "Boletos":
@@ -198,5 +216,5 @@ def render_saida(
             )
 
         st.session_state.form_saida = False
-        st.success(res["msg"])
+        st.success(msg_ok)
         st.rerun()

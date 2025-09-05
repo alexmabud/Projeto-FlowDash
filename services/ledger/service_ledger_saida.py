@@ -10,6 +10,11 @@ Compat e robustez:
 - Aceita datas em 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD/MM/YYYY' ou 'DD-MM-YYYY'.
 - Aceita aliases de forma: forma/forma_pagamento/metodo/meio_pagamento.
 - Garante strings seguras para sanitização e idempotência (evita len(int) nos UIDs).
+
+Integrações CAP (novas):
+- Suporte a pagamento de BOLETO e EMPRESTIMO além de FATURA_CARTAO.
+- Sempre usa **saida_total = principal + juros + multa** (desconto NÃO sai do caixa).
+- Para FATURA_CARTAO evitamos duplicidade de mov. usando `ledger_id` no service de fatura.
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ from services.ledger.service_ledger_infra import (  # noqa: E402
     _ensure_mov_cols,
     _fmt_obs_saida,
 )
+from services.ledger.service_ledger_boleto import ServiceLedgerBoleto  # noqa: E402
+from services.ledger.service_ledger_fatura import ServiceLedgerFatura  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +86,7 @@ class _SaidasLedgerMixin:
                 return float(s)
         except Exception:
             try:
-                return float(s.replace(",", "."))
+                return float(s.replace(",", "."))  # último recurso
             except Exception:
                 return 0.0
 
@@ -126,6 +133,15 @@ class _SaidasLedgerMixin:
                 (float(sobra), mov_id),
             )
 
+    # -------------------------- Helpers de services --------------------------
+
+    def _svc_boleto(self) -> ServiceLedgerBoleto:
+        # Este mixin assume que self.db_path existe no objeto “pai”
+        return ServiceLedgerBoleto(self.db_path)
+
+    def _svc_fatura(self) -> ServiceLedgerFatura:
+        return ServiceLedgerFatura(self.db_path)
+
     # ------------------------- API de compatibilidade -------------------------
 
     def registrar_lancamento(
@@ -149,9 +165,13 @@ class _SaidasLedgerMixin:
         usuario: Optional[str] = None,
         trans_uid: Optional[str] = None,
         data_evento: Optional[str] = None,
+        # ---- NOVOS (integração CAP genérica) ----
+        tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
+        obrigacao_id: Optional[int] = None,
+        obrigacao_id_fatura: Optional[int] = None,  # legado (continua aceito)
         **_ignored: Any,
     ) -> Tuple[int, int]:
-        """Registrador genérico para **saídas avulsas**."""
+        """Registrador genérico. Redireciona para saída DINHEIRO ou BANCÁRIA com integração CAP opcional."""
         tipo = (self._sane(tipo_evento) or "SAIDA").upper()
         if tipo != "SAIDA":
             raise NotImplementedError("registrar_lancamento: apenas SAIDA é suportado neste mixin.")
@@ -170,11 +190,18 @@ class _SaidasLedgerMixin:
         mv = self._parse_money(multa)
         dv = self._parse_money(desconto)
 
+        # Determina forma efetiva
         forma_eff = self._infer_forma(
             forma=(forma or forma_pagamento or metodo or meio_pagamento),
             banco=banco,
             origem=origem,
         )
+
+        # Normaliza tipo/obrigação (compat mantém obrigacao_id_fatura)
+        tipo_obr_norm = (self._sane(tipo_obrigacao) or (categoria or "")).upper() if (tipo_obrigacao or categoria) else None
+        if obrigacao_id_fatura and not obrigacao_id:
+            obrigacao_id = int(obrigacao_id_fatura)
+            tipo_obr_norm = "FATURA_CARTAO"
 
         if forma_eff == "DINHEIRO":
             origem_din = origem if origem in ("Caixa", "Caixa 2") else "Caixa"
@@ -188,6 +215,9 @@ class _SaidasLedgerMixin:
                 usuario=usuario_s,
                 trans_uid=trans_uid,
                 juros=jv, multa=mv, desconto=dv,
+                # CAP genérico (novos)
+                tipo_obrigacao=tipo_obr_norm,
+                obrigacao_id=obrigacao_id,
             )
 
         banco_nome = self._sane(banco) or (self._sane(origem) or "Banco 1")
@@ -202,6 +232,9 @@ class _SaidasLedgerMixin:
             usuario=usuario_s,
             trans_uid=trans_uid,
             juros=jv, multa=mv, desconto=dv,
+            # CAP genérico (novos)
+            tipo_obrigacao=tipo_obr_norm,
+            obrigacao_id=obrigacao_id,
         )
 
     def _pagar_fatura_por_obrigacao(self, conn, *args, **kwargs) -> Dict[str, Any]:
@@ -274,10 +307,13 @@ class _SaidasLedgerMixin:
         pagamento_tipo: Optional[str] = None,
         pagamento_destino: Optional[str] = None,
         competencia_pagamento: Optional[str] = None,
-        obrigacao_id_fatura: Optional[int] = None,
+        obrigacao_id_fatura: Optional[int] = None,  # legado
         juros: float | str = 0.0,
         multa: float | str = 0.0,
         desconto: float | str = 0.0,
+        # ---- NOVOS (CAP genérico) ----
+        tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
+        obrigacao_id: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Registra uma saída **em dinheiro** (Caixa/Caixa 2) e integra com CAP (opcional)."""
         if float(valor) <= 0:
@@ -294,7 +330,7 @@ class _SaidasLedgerMixin:
         mv = self._parse_money(multa)
         dv = self._parse_money(desconto)
 
-        # **IMPORTANTE**: gerar trans_uid a partir do valor digitado garante idempotência do UI
+        # trans_uid idempotente baseado no valor DIGITADO (principal informado na tela)
         valor_str = f"{float(valor):.2f}"
         tuid = trans_uid or uid_saida_dinheiro(
             data, valor_str, origem_dinheiro, categoria, sub_categoria, descricao, usuario
@@ -306,11 +342,17 @@ class _SaidasLedgerMixin:
                 logger.info("registrar_saida_dinheiro: trans_uid já existe (%s) — ignorando", trans_uid_str)
                 return (-1, -1)
 
+        # Normaliza tipo/obrigação (mantém compat com obrigacao_id_fatura)
+        tipo_eff = (self._sane(tipo_obrigacao) or (categoria or "")).upper() if (tipo_obrigacao or categoria) else None
+        if obrigacao_id_fatura and not obrigacao_id:
+            obrigacao_id = int(obrigacao_id_fatura)
+            tipo_eff = "FATURA_CARTAO"
+
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
             self._garantir_linha_saldos_caixas(conn, data)
 
-            # (1) INSERT saida (Valor = valor digitado; usamos saida_total só nos saldos/mov.)
+            # (1) INSERT na tabela 'saida' com o VALOR digitado (principal informado)
             cur.execute(
                 """
                 INSERT INTO saida (Data, Categoria, Sub_Categoria, Descricao,
@@ -322,83 +364,71 @@ class _SaidasLedgerMixin:
             )
             id_saida = int(cur.lastrowid)
 
-            # (2) Se for FATURA: primeiro paga no CAP e obtém saida_total; depois ajusta saldos/mov.
-            if obrigacao_id_fatura:
-                res = self._pagar_fatura_por_obrigacao(
-                    conn,
-                    obrigacao_id=int(obrigacao_id_fatura),
-                    valor=float(valor),
-                    juros=jv,
-                    multa=mv,
-                    desconto=dv,
-                    data_evento=data,
-                    forma_pagamento="DINHEIRO",
-                    origem=origem_dinheiro,
-                    ledger_id=id_saida,
-                    usuario=usuario,
-                )
-                saida_total = float(res.get("saida_total", valor))
-                sobra = float(res.get("sobra", 0.0))
+            saida_total = float(valor)  # padrão para saídas avulsas
+            sobra_reg = 0.0
+            mov_desc = descricao
 
-                # (2.1) Ajusta saldos pelo valor **líquido** que realmente saiu
-                col_map = {"Caixa": "caixa", "Caixa 2": "caixa_2"}
-                col = col_map.get(origem_dinheiro)
-                cur.execute(
-                    f"UPDATE saldos_caixas SET {col} = COALESCE({col},0) - ? WHERE data = ?",
-                    (saida_total, data),
-                )
+            # (2) Integra CAP quando informado tipo/obrigação
+            if tipo_eff and obrigacao_id:
+                if tipo_eff == "FATURA_CARTAO":
+                    res = self._pagar_fatura_por_obrigacao(
+                        conn,
+                        obrigacao_id=int(obrigacao_id),
+                        valor=float(valor),
+                        juros=jv,
+                        multa=mv,
+                        desconto=dv,
+                        data_evento=data,
+                        forma_pagamento="DINHEIRO",
+                        origem=origem_dinheiro,
+                        ledger_id=id_saida,   # evita duplicidade de movimentação no service de fatura
+                        usuario=usuario,
+                    )
+                    saida_total = float(res.get("saida_total", valor))
+                    sobra_reg = float(res.get("sobra", 0.0))
+                    mov_desc = descricao or f"Pagamento fatura (obrigação {obrigacao_id})"
+                    mov_cat = categoria or "FATURA_CARTAO"
+                elif tipo_eff in ("BOLETO", "EMPRESTIMO"):
+                    res = self._svc_boleto().pagar_boleto(
+                        obrigacao_id=int(obrigacao_id),
+                        principal=float(valor),
+                        juros=jv,
+                        multa=mv,
+                        desconto=dv,
+                        data_evento=data,
+                        usuario=usuario,
+                        conn=conn,
+                    )
+                    saida_total = float(res.get("saida_total", valor))
+                    # Sobra = principal digitado - principal realmente aplicado (somatório)
+                    try:
+                        soma_principal_aplicado = sum(float(r.get("aplicado_principal", 0.0)) for r in res.get("resultados", []))
+                    except Exception:
+                        soma_principal_aplicado = 0.0
+                    sobra_reg = max(0.0, float(valor) - soma_principal_aplicado)
+                    mov_desc = descricao or (f"Pagamento {tipo_eff.lower()} (obrigação {obrigacao_id})")
+                    mov_cat = categoria or tipo_eff
+                else:
+                    mov_cat = categoria  # tipo não reconhecido, trata como avulsa
+            else:
+                mov_cat = categoria  # saída avulsa
 
-                # (2.2) Log movimentação bancária com valor **líquido**
-                _ensure_mov_cols(cur)
-                obs = _fmt_obs_saida(
-                    forma="DINHEIRO",
-                    valor=saida_total,
-                    categoria=categoria or "FATURA_CARTAO",
-                    subcategoria=sub_categoria,
-                    descricao=descricao or f"Pagamento fatura (obrigação {obrigacao_id_fatura})",
-                )
-                cur.execute(
-                    """
-                    INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao,
-                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
-                    VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?, ?, ?)
-                    """,
-                    (
-                        data,
-                        origem_dinheiro,
-                        saida_total,
-                        obs,
-                        id_saida,
-                        trans_uid_str,
-                        usuario,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
-                )
-                id_mov = int(cur.lastrowid)
-                self._registrar_sobra_obs(cur, id_mov, sobra)
-                conn.commit()
-                logger.debug("registrar_saida_dinheiro(fatura): id_saida=%s id_mov=%s liquido=%.2f sobra=%.2f",
-                             id_saida, id_mov, saida_total, sobra)
-                return (id_saida, id_mov)
-
-            # (3) Saída avulsa (não-fatura): comportamento anterior
-            # Ajuste saldos com o valor digitado (não há encargos)
+            # (3) Ajusta saldos do CAIXA pelo **valor líquido que saiu** (saida_total)
             col_map = {"Caixa": "caixa", "Caixa 2": "caixa_2"}
             col = col_map.get(origem_dinheiro)
             cur.execute(
                 f"UPDATE saldos_caixas SET {col} = COALESCE({col},0) - ? WHERE data = ?",
-                (float(valor), data),
+                (saida_total, data),
             )
 
-            # Log movimentação com valor digitado
+            # (4) Log movimentação bancária (mesmo para DINHEIRO registramos em mov. para auditoria)
             _ensure_mov_cols(cur)
             obs = _fmt_obs_saida(
                 forma="DINHEIRO",
-                valor=float(valor),
-                categoria=categoria,
+                valor=saida_total,
+                categoria=mov_cat,
                 subcategoria=sub_categoria,
-                descricao=descricao,
+                descricao=mov_desc,
             )
             cur.execute(
                 """
@@ -410,7 +440,7 @@ class _SaidasLedgerMixin:
                 (
                     data,
                     origem_dinheiro,
-                    float(valor),
+                    saida_total,
                     obs,
                     id_saida,
                     trans_uid_str,
@@ -420,8 +450,14 @@ class _SaidasLedgerMixin:
             )
             id_mov = int(cur.lastrowid)
 
+            # (5) Anota sobra de principal (se houver)
+            self._registrar_sobra_obs(cur, id_mov, sobra_reg)
+
             conn.commit()
-            logger.debug("registrar_saida_dinheiro: id_saida=%s id_mov=%s", id_saida, id_mov)
+            logger.debug(
+                "registrar_saida_dinheiro: id_saida=%s id_mov=%s liquido=%.2f sobra=%.2f tipo=%s obrigacao=%s",
+                id_saida, id_mov, saida_total, sobra_reg, (tipo_eff or "-"), (obrigacao_id or "-"),
+            )
             return (id_saida, id_mov)
 
     def registrar_saida_bancaria(
@@ -440,10 +476,13 @@ class _SaidasLedgerMixin:
         pagamento_tipo: Optional[str] = None,
         pagamento_destino: Optional[str] = None,
         competencia_pagamento: Optional[str] = None,
-        obrigacao_id_fatura: Optional[int] = None,
+        obrigacao_id_fatura: Optional[int] = None,  # legado
         juros: float | str = 0.0,
         multa: float | str = 0.0,
         desconto: float | str = 0.0,
+        # ---- NOVOS (CAP genérico) ----
+        tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
+        obrigacao_id: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Registra uma saída **bancária** (PIX/DÉBITO) e integra com CAP (opcional)."""
         forma_u = (self._sane(forma) or "").upper()
@@ -475,6 +514,12 @@ class _SaidasLedgerMixin:
                 logger.info("registrar_saida_bancaria: trans_uid já existe (%s) — ignorando", trans_uid_str)
                 return (-1, -1)
 
+        # Normaliza tipo/obrigação (mantém compat com obrigacao_id_fatura)
+        tipo_eff = (self._sane(tipo_obrigacao) or (categoria or "")).upper() if (tipo_obrigacao or categoria) else None
+        if obrigacao_id_fatura and not obrigacao_id:
+            obrigacao_id = int(obrigacao_id_fatura)
+            tipo_eff = "FATURA_CARTAO"
+
         with get_conn(self.db_path) as conn:
             cur = conn.cursor()
 
@@ -490,74 +535,65 @@ class _SaidasLedgerMixin:
             )
             id_saida = int(cur.lastrowid)
 
-            if obrigacao_id_fatura:
-                # (2) Paga fatura primeiro para obter saida_total; depois ajusta banco/mov.
-                res = self._pagar_fatura_por_obrigacao(
-                    conn,
-                    obrigacao_id=int(obrigacao_id_fatura),
-                    valor=float(valor),
-                    juros=jv,
-                    multa=mv,
-                    desconto=dv,
-                    data_evento=data,
-                    forma_pagamento=forma_u,
-                    origem=banco_nome,
-                    ledger_id=id_saida,
-                    usuario=usuario,
-                )
-                saida_total = float(res.get("saida_total", valor))
-                sobra = float(res.get("sobra", 0.0))
+            saida_total = float(valor)  # padrão para avulsas
+            sobra_reg = 0.0
+            mov_desc = descricao
 
-                # (2.1) Ajusta saldo do banco pelo valor **líquido**
-                self._garantir_linha_saldos_bancos(conn, data)
-                self._ajustar_banco_dynamic(conn, banco_col=banco_nome, delta=-saida_total, data=data)
+            if tipo_eff and obrigacao_id:
+                if tipo_eff == "FATURA_CARTAO":
+                    res = self._pagar_fatura_por_obrigacao(
+                        conn,
+                        obrigacao_id=int(obrigacao_id),
+                        valor=float(valor),
+                        juros=jv,
+                        multa=mv,
+                        desconto=dv,
+                        data_evento=data,
+                        forma_pagamento=forma_u,
+                        origem=banco_nome,
+                        ledger_id=id_saida,  # evita duplicidade no service de fatura
+                        usuario=usuario,
+                    )
+                    saida_total = float(res.get("saida_total", valor))
+                    sobra_reg = float(res.get("sobra", 0.0))
+                    mov_desc = descricao or f"Pagamento fatura (obrigação {obrigacao_id})"
+                    mov_cat = categoria or "FATURA_CARTAO"
+                elif tipo_eff in ("BOLETO", "EMPRESTIMO"):
+                    res = self._svc_boleto().pagar_boleto(
+                        obrigacao_id=int(obrigacao_id),
+                        principal=float(valor),
+                        juros=jv,
+                        multa=mv,
+                        desconto=dv,
+                        data_evento=data,
+                        usuario=usuario,
+                        conn=conn,
+                    )
+                    saida_total = float(res.get("saida_total", valor))
+                    try:
+                        soma_principal_aplicado = sum(float(r.get("aplicado_principal", 0.0)) for r in res.get("resultados", []))
+                    except Exception:
+                        soma_principal_aplicado = 0.0
+                    sobra_reg = max(0.0, float(valor) - soma_principal_aplicado)
+                    mov_desc = descricao or (f"Pagamento {tipo_eff.lower()} (obrigação {obrigacao_id})")
+                    mov_cat = categoria or tipo_eff
+                else:
+                    mov_cat = categoria
+            else:
+                mov_cat = categoria
 
-                # (2.2) Log movimentação com valor **líquido**
-                _ensure_mov_cols(cur)
-                obs = _fmt_obs_saida(
-                    forma=forma_u,
-                    valor=saida_total,
-                    categoria=categoria or "FATURA_CARTAO",
-                    subcategoria=sub_categoria,
-                    descricao=descricao or f"Pagamento fatura (obrigação {obrigacao_id_fatura})",
-                    banco=(banco_nome if forma_u == "DÉBITO" else None),
-                )
-                cur.execute(
-                    """
-                    INSERT INTO movimentacoes_bancarias
-                        (data, banco, tipo, valor, origem, observacao,
-                         referencia_tabela, referencia_id, trans_uid, usuario, data_hora)
-                    VALUES (?, ?, 'saida', ?, 'saidas', ?, 'saida', ?, ?, ?, ?)
-                    """,
-                    (
-                        data,
-                        banco_nome,
-                        saida_total,
-                        obs,
-                        id_saida,
-                        trans_uid_str,
-                        usuario,
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    ),
-                )
-                id_mov = int(cur.lastrowid)
-                self._registrar_sobra_obs(cur, id_mov, sobra)
-                conn.commit()
-                logger.debug("registrar_saida_bancaria(fatura): id_saida=%s id_mov=%s liquido=%.2f sobra=%.2f",
-                             id_saida, id_mov, saida_total, sobra)
-                return (id_saida, id_mov)
-
-            # (3) Saída bancária avulsa (não-fatura): comportamento anterior
+            # (2) Ajusta saldo do banco pelo **valor líquido** (saida_total)
             self._garantir_linha_saldos_bancos(conn, data)
-            self._ajustar_banco_dynamic(conn, banco_col=banco_nome, delta=-float(valor), data=data)
+            self._ajustar_banco_dynamic(conn, banco_col=banco_nome, delta=-saida_total, data=data)
 
+            # (3) Log movimentação bancária
             _ensure_mov_cols(cur)
             obs = _fmt_obs_saida(
                 forma=forma_u,
-                valor=float(valor),
-                categoria=categoria,
+                valor=saida_total,
+                categoria=mov_cat,
                 subcategoria=sub_categoria,
-                descricao=descricao,
+                descricao=mov_desc,
                 banco=(banco_nome if forma_u == "DÉBITO" else None),
             )
             cur.execute(
@@ -570,7 +606,7 @@ class _SaidasLedgerMixin:
                 (
                     data,
                     banco_nome,
-                    float(valor),
+                    saida_total,
                     obs,
                     id_saida,
                     trans_uid_str,
@@ -580,6 +616,12 @@ class _SaidasLedgerMixin:
             )
             id_mov = int(cur.lastrowid)
 
+            # (4) Sobra (se houver)
+            self._registrar_sobra_obs(cur, id_mov, sobra_reg)
+
             conn.commit()
-            logger.debug("registrar_saida_bancaria: id_saida=%s id_mov=%s", id_saida, id_mov)
+            logger.debug(
+                "registrar_saida_bancaria: id_saida=%s id_mov=%s liquido=%.2f sobra=%.2f tipo=%s obrigacao=%s",
+                id_saida, id_mov, saida_total, sobra_reg, (tipo_eff or "-"), (obrigacao_id or "-"),
+            )
             return (id_saida, id_mov)

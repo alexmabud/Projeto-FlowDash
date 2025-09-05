@@ -1,497 +1,396 @@
 # flowdash_pages/lancamentos/saida/actions_pagamentos.py
 """
-Actions de Pagamento (Fatura Cartão e Boleto)
----------------------------------------------
-- Padrão ÚNICO aplicado aos dois fluxos:
-  • MB (movimentações bancárias) registra o DINHEIRO que sai: (principal + juros + multa − desconto), mínimo 0
-  • CAP recebe (via Ledger quando suportado; senão fallback local):
-      principal_pago_acumulado += principal_cash
-      desconto_aplicado_*      += desconto
-      juros_pago_*             += juros
-      multa_paga_*             += multa
-      data_pagamento_*         =  data_str (coluna detectada dinamicamente)
-  • Status QUITA quando principal_pago_acumulado + desconto_aplicado_* >= valor_evento.
+Actions de Pagamento (Fatura Cartão, Boleto e Empréstimo)
+--------------------------------------------------------
 
-Observação
-----------
-Estas actions não alteram o comportamento do Ledger; apenas chamam os registradores
-com parâmetros corretos. Quando o Ledger não propaga tudo ao CAP, aplicamos um
-fallback local idempotente diretamente na parcela/lançamento.
+Objetivo
+--------
+- Orquestrar pagamentos SEM atualizar CAP diretamente aqui.
+- Preferir a API de alto nível do Ledger (pagar_*) e,
+  na ausência, cair para os registradores de saída (registrar_saida_*),
+  sempre informando `obrigacao_id_*` e encargos (juros/multa/desconto).
+
+Regras Financeiras (padrão vigente)
+-----------------------------------
+- Desconto abate PRIMEIRO o principal faltante.
+- Dinheiro que sai do caixa/banco = principal_em_dinheiro + juros + multa.
+- CAP acumula:
+    principal_pago_acumulado += principal_em_dinheiro + desconto_efetivo
+    juros_pago_acumulado     += juros
+    multa_paga_acumulada     += multa
+    desconto_aplicado_acumulado += desconto_efetivo
+    valor_pago_acumulado (CAP, BRUTO) += principal_em_dinheiro + desconto + juros + multa
+- Status depende SOMENTE do principal acumulado vs valor_evento.
+
+Reduções de redundância
+-----------------------
+- Listagens (faturas/boletos/emp.) NÃO ficam mais aqui: delegamos ao
+  `ContasAPagarMovRepository`.
+- Cálculos de “faltante/status” NÃO ficam aqui: usamos o repository.
+
+Compat
+------
+- Mantém assinatura simples nas funções públicas `pagar_*_action`.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
-from shared.db import get_conn
+from typing import Optional, Tuple, Dict, Any
+from datetime import datetime
+
+# Ledger e Repository
+from services.ledger.service_ledger import LedgerService
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository
 
 
-# ---------------------------- Helpers ----------------------------
-
-def _num(x) -> float:
-    try:
-        return float(x or 0.0)
-    except Exception:
-        return 0.0
-
-
-def _mk_trans_uid(prefixo: str,
-                  data_str: str,
-                  identificador: str,
-                  principal_cash: float,
-                  juros: float,
-                  multa: float,
-                  desconto: float) -> str:
-    # UID estável para idempotência
-    return f"{prefixo}:{identificador}:{data_str}:{principal_cash:.2f}:{juros:.2f}:{multa:.2f}:{desconto:.2f}"
+# =============================================================================
+# Helpers internos (sem SQL direto)
+# =============================================================================
+def _get_services(caminho_banco: str) -> Tuple[LedgerService, ContasAPagarMovRepository]:
+    """Factory simples para obter Ledger e Repository."""
+    return LedgerService(caminho_banco), ContasAPagarMovRepository(caminho_banco)
 
 
-def _fmt_desc_pagamento(base: str,
-                        principal_cash: float,
-                        juros: float,
-                        multa: float,
-                        desconto: float) -> str:
-    partes = [
-        (base or "").strip() or "Pagamento",
-        f"principal R${principal_cash:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."),
-    ]
-    if juros:
-        partes.append(f"juros R${juros:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    if multa:
-        partes.append(f"multa R${multa:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    if desconto:
-        partes.append(f"desconto R${desconto:,.2f} (abatimento)".replace(",", "X").replace(".", ",").replace("X", "."))
-    return " — ".join([p for p in partes if p])
+def _canonicalizar_banco_safe(caminho_banco: str, banco: Optional[str]) -> Optional[str]:
+    """Normaliza nome de banco de forma defensiva (sem bater no DB)."""
+    if not banco:
+        return None
+    nome = str(banco).strip()
+    if not nome:
+        return None
+    # Normalizações usuais; ajuste conforme seus nomes canônicos
+    aliases = {
+        "INTER": "Banco Inter",
+        "INFINITEPAY": "InfinitePay",
+        "BRADESCO": "Bradesco",
+        "CAIXA": "Caixa",
+    }
+    up = nome.upper()
+    return aliases.get(up, nome)
 
 
-def _pick_first_existing(cols_set: set[str], candidates: list[str]) -> Optional[str]:
-    for c in candidates:
-        if c in cols_set:
-            return c
-    return None
-
-
-# ---------------------------------------------------------------------
-# PAGAMENTO DE FATURA (Cartão de Crédito)
-# ---------------------------------------------------------------------
-def pagar_fatura_action(*,
-                        ledger,
-                        data_str: str,
-                        forma_pagamento: str,         # "DINHEIRO" ou bancária (PIX/DÉBITO etc.)
-                        usuario_nome: str,
-                        categoria: str,
-                        subcat_nome: Optional[str],
-                        descricao_base: str,
-                        obrigacao_id_fatura: int,
-                        # DINHEIRO:
-                        origem_dinheiro: Optional[str] = None,
-                        # BANCÁRIA:
-                        caminho_banco: Optional[str] = None,      # usado no fallback de data_pagamento
-                        banco_escolhido_in: Optional[str] = None,
-                        # COMPONENTES:
-                        principal_cash: float = 0.0,  # valor em dinheiro destinado ao principal
-                        juros: float = 0.0,
-                        multa: float = 0.0,
-                        desconto: float = 0.0) -> Tuple[int, Optional[int]]:
+def _split_principal_e_desconto(
+    cap_repo: ContasAPagarMovRepository,
+    obrigacao_id: int,
+    principal_informado: float,
+    desconto_informado: float,
+) -> Tuple[float, float]:
     """
-    Retorna (id_saida, id_mov_bancaria | None)
+    Aplica o clamp correto:
+    - desconto_efetivo <= faltante_principal
+    - principal_cash <= faltante_principal - desconto_efetivo
     """
-    principal_cash = _num(principal_cash)
-    juros          = _num(juros)
-    multa          = _num(multa)
-    desconto       = _num(desconto)
+    faltante, _status = cap_repo.obter_restante_e_status(None, int(obrigacao_id))
+    faltante = max(0.0, float(faltante or 0.0))
 
-    if principal_cash < 0 or juros < 0 or multa < 0 or desconto < 0:
-        raise ValueError("Valores negativos não são permitidos.")
+    desconto_efetivo = min(max(0.0, float(desconto_informado or 0.0)), faltante)
+    restante_apos_desc = max(0.0, round(faltante - desconto_efetivo, 2))
 
-    desc_final = _fmt_desc_pagamento(
-        base=descricao_base or "Pagamento de fatura",
-        principal_cash=principal_cash, juros=juros, multa=multa, desconto=desconto
+    principal_cash = min(max(0.0, float(principal_informado or 0.0)), restante_apos_desc)
+    return principal_cash, desconto_efetivo
+
+
+def _registrar_saida_pagamento(
+    ledger: LedgerService,
+    *,
+    data: str,
+    principal_cash: float,
+    forma_pagamento: str,
+    banco_nome: Optional[str],
+    origem_dinheiro: Optional[str],
+    categoria: str,
+    sub_categoria: Optional[str],
+    descricao: str,
+    usuario: str,
+    # Encargos
+    juros: float,
+    multa: float,
+    desconto: float,
+    # Ligações CAP
+    obrigacao_id_fatura: Optional[int] = None,
+    obrigacao_id_boleto: Optional[int] = None,
+    obrigacao_id_emprestimo: Optional[int] = None,
+) -> Tuple[int, Optional[int]]:
+    """
+    Fallback padronizado para registrar a saída via Ledger:
+    - Se forma = DINHEIRO => registrar_saida_dinheiro
+    - Caso contrário => registrar_saida_bancaria
+    Passa encargos e o `obrigacao_id_*` correspondente.
+    Retorna (id_saida, id_mov) quando disponível.
+    """
+    forma_up = (forma_pagamento or "").strip().upper()
+    kwargs_comuns: Dict[str, Any] = dict(
+        data=data,
+        valor=float(principal_cash),  # **somente principal em dinheiro**
+        categoria=categoria,
+        sub_categoria=sub_categoria,
+        descricao=descricao,
+        usuario=usuario,
+        juros=float(juros or 0.0),
+        multa=float(multa or 0.0),
+        desconto=float(desconto or 0.0),
     )
 
-    uid = _mk_trans_uid(
-        prefixo="PAG_FATURA",
-        data_str=data_str,
-        identificador=str(obrigacao_id_fatura),
-        principal_cash=principal_cash, juros=juros, multa=multa, desconto=desconto
-    )
+    # Passa apenas um dos obrigacao_id_* (o que não for None)
+    if obrigacao_id_fatura is not None:
+        kwargs_comuns["obrigacao_id_fatura"] = int(obrigacao_id_fatura)
+    if obrigacao_id_boleto is not None:
+        kwargs_comuns["obrigacao_id_boleto"] = int(obrigacao_id_boleto)
+    if obrigacao_id_emprestimo is not None:
+        kwargs_comuns["obrigacao_id_emprestimo"] = int(obrigacao_id_emprestimo)
 
-    # Dinheiro que sai do caixa/banco: principal + juros + multa − desconto (mín. 0)
-    valor_mb = principal_cash + juros + multa - desconto
-    if valor_mb < 0:
-        valor_mb = 0.0
-
-    # ---------- Registrar saída ----------
-    if forma_pagamento == "DINHEIRO":
-        try:
-            id_saida, id_mov = ledger.registrar_saida_dinheiro(
-                data=data_str,
-                valor=float(principal_cash),
-                origem_dinheiro=origem_dinheiro,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                obrigacao_id_fatura=int(obrigacao_id_fatura),
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-                trans_uid=uid,
-            )
-        except TypeError:
-            id_saida, id_mov = ledger.registrar_saida_dinheiro(
-                data=data_str,
-                valor=float(principal_cash),
-                origem_dinheiro=origem_dinheiro,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                obrigacao_id_fatura=int(obrigacao_id_fatura),
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-            )
+    if forma_up == "DINHEIRO":
+        # Origem de dinheiro (ex.: "Caixa", "Caixa 2")
+        kwargs_comuns["origem_dinheiro"] = origem_dinheiro or "Caixa"
+        return ledger.registrar_saida_dinheiro(**kwargs_comuns)
     else:
-        try:
-            from flowdash_pages.lancamentos.shared_ui import canonicalizar_banco
-            banco_nome = canonicalizar_banco(caminho_banco or "", (banco_escolhido_in or "").strip()) or (banco_escolhido_in or "").strip()
-        except Exception:
-            banco_nome = (banco_escolhido_in or "").strip() or "Banco 1"
-
-        try:
-            id_saida, id_mov = ledger.registrar_saida_bancaria(
-                data=data_str,
-                valor=float(principal_cash),
-                banco_nome=banco_nome,
-                forma=forma_pagamento,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                obrigacao_id_fatura=int(obrigacao_id_fatura),
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-                trans_uid=uid,
-            )
-        except TypeError:
-            id_saida, id_mov = ledger.registrar_saida_bancaria(
-                data=data_str,
-                valor=float(principal_cash),
-                banco_nome=banco_nome,
-                forma=forma_pagamento,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                obrigacao_id_fatura=int(obrigacao_id_fatura),
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-            )
-
-    # ---------- Ajuste opcional do valor da MB (força sair = principal+juros+multa−desconto) ----------
-    try:
-        if hasattr(ledger, "ajustar_valor_movimentacao_por_uid"):
-            ledger.ajustar_valor_movimentacao_por_uid(trans_uid=uid, novo_valor=float(valor_mb))
-    except Exception:
-        pass
-
-    # ---------- Fallback: marcar data de pagamento no CAP da fatura ----------
-    try:
-        if caminho_banco:
-            with get_conn(caminho_banco) as conn:
-                cur = conn.cursor()
-                cols = {r[1] for r in cur.execute("PRAGMA table_info(contas_a_pagar_mov)").fetchall()}
-                col_data_pgto = _pick_first_existing(cols, [
-                    "data_pagamento", "data_pgto", "data_baixa", "data_ultimo_pagamento",
-                    "data_ultima_baixa", "data_pago"
-                ])
-                if col_data_pgto:
-                    cur.execute(
-                        f"""
-                        UPDATE contas_a_pagar_mov
-                           SET {col_data_pgto} = ?
-                         WHERE obrigacao_id = ?
-                           AND categoria_evento = 'LANCAMENTO'
-                        """,
-                        (data_str, int(obrigacao_id_fatura)),
-                    )
-                    conn.commit()
-    except Exception:
-        pass
-
-    return id_saida, id_mov
+        # Saída bancária (PIX/DÉBITO/CRÉDITO/BOLETO pago em conta)
+        banco_nome = _canonicalizar_banco_safe(ledger.db_path, banco_nome)
+        kwargs_comuns["banco_nome"] = banco_nome or "Banco Inter"
+        kwargs_comuns["forma"] = forma_pagamento
+        return ledger.registrar_saida_bancaria(**kwargs_comuns)
 
 
-# ---------------------------------------------------------------------
-# PAGAMENTO DE BOLETO (Parcela)
-# ---------------------------------------------------------------------
-def pagar_boleto_action(*,
-                        ledger,
-                        data_str: str,
-                        forma_pagamento: str,         # "DINHEIRO" ou bancária
-                        usuario_nome: str,
-                        categoria: str,
-                        subcat_nome: Optional[str],
-                        descricao_base: str,
-                        obrigacao_id_boleto: int,     # mantido por compat, NÃO enviado ao Ledger
-                        parcela_id_boleto: Optional[int] = None,  # ESSENCIAL p/ CAP fallback
-                        # DINHEIRO:
-                        origem_dinheiro: Optional[str] = None,
-                        # BANCÁRIA:
-                        caminho_banco: Optional[str] = None,
-                        banco_escolhido_in: Optional[str] = None,
-                        # COMPONENTES:
-                        principal_cash: float = 0.0,
-                        juros: float = 0.0,
-                        multa: float = 0.0,
-                        desconto: float = 0.0) -> Tuple[int, Optional[int]]:
+# =============================================================================
+# Pagamentos Públicos (UI chama estas funções)
+# =============================================================================
+def pagar_fatura_cartao_action(
+    *,
+    caminho_banco: str,
+    obrigacao_id_fatura: int,
+    data: str,
+    valor_principal: float,
+    forma_pagamento: str,             # "DINHEIRO" ou bancária (PIX/DÉBITO/CRÉDITO)
+    banco_nome: Optional[str] = None, # quando bancária
+    origem_dinheiro: Optional[str] = None,  # quando dinheiro
+    juros: float = 0.0,
+    multa: float = 0.0,
+    desconto: float = 0.0,
+    descricao: str = "",
+    usuario: str = "-",
+    sub_categoria: Optional[str] = None,    # ex.: "Fatura Itaucard"
+) -> Dict[str, Any]:
     """
-    Retorna (id_saida, id_mov_bancaria | None)
-
-    - Não envia obrigacao_id_boleto/parcela_id_boleto para o Ledger (API não suporta).
-    - Após registrar a saída, aplica fallback idempotente no CAP da PARCELA (se informado),
-      e marca data de pagamento.
+    Paga fatura de cartão. Preferência:
+      1) ledger.pagar_fatura_cartao (se existir)
+      2) fallback: registrar_saida_* com obrigacao_id_fatura
     """
-    principal_cash = _num(principal_cash)
-    juros          = _num(juros)
-    multa          = _num(multa)
-    desconto       = _num(desconto)
+    ledger, cap_repo = _get_services(caminho_banco)
 
-    if principal_cash < 0 or juros < 0 or multa < 0 or desconto < 0:
-        raise ValueError("Valores negativos não são permitidos.")
-
-    desc_final = _fmt_desc_pagamento(
-        base=descricao_base or "Pagamento de boleto",
-        principal_cash=principal_cash, juros=juros, multa=multa, desconto=desconto
+    # Clamp correto para principal e desconto (seguro mesmo se o Ledger já fizer isso)
+    principal_cash, desconto_efetivo = _split_principal_e_desconto(
+        cap_repo, int(obrigacao_id_fatura), float(valor_principal), float(desconto)
     )
 
-    uid = _mk_trans_uid(
-        prefixo="PAG_BOLETO",
-        data_str=data_str,
-        identificador=str(parcela_id_boleto or obrigacao_id_boleto),
-        principal_cash=principal_cash, juros=juros, multa=multa, desconto=desconto
-    )
-
-    # Dinheiro que sai do caixa/banco: principal + juros + multa − desconto (mín. 0)
-    valor_mb = principal_cash + juros + multa - desconto
-    if valor_mb < 0:
-        valor_mb = 0.0
-
-    # ---------- 1) Registrar a saída no Ledger (sem kwargs não suportados) ----------
-    if forma_pagamento == "DINHEIRO":
-        try:
-            id_saida, id_mov = ledger.registrar_saida_dinheiro(
-                data=data_str,
-                valor=float(principal_cash),
-                origem_dinheiro=origem_dinheiro,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-                trans_uid=uid,  # se o Ledger ignorar, não falha
-            )
-        except TypeError:
-            id_saida, id_mov = ledger.registrar_saida_dinheiro(
-                data=data_str,
-                valor=float(principal_cash),
-                origem_dinheiro=origem_dinheiro,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-            )
+    # 1) API de alto nível (se disponível)
+    if hasattr(ledger, "pagar_fatura_cartao"):
+        result = ledger.pagar_fatura_cartao(
+            data=data,
+            valor_principal=float(principal_cash),
+            forma_pagamento=forma_pagamento,
+            banco_nome=banco_nome,
+            origem_dinheiro=origem_dinheiro,
+            juros=float(juros),
+            multa=float(multa),
+            desconto=float(desconto_efetivo),
+            obrigacao_id_fatura=int(obrigacao_id_fatura),
+            descricao=descricao,
+            usuario=usuario,
+            sub_categoria=sub_categoria,
+        )
     else:
-        # Bancária
-        try:
-            from flowdash_pages.lancamentos.shared_ui import canonicalizar_banco
-            banco_nome = canonicalizar_banco(caminho_banco or "", (banco_escolhido_in or "").strip()) or (banco_escolhido_in or "").strip()
-        except Exception:
-            banco_nome = (banco_escolhido_in or "").strip() or "Banco 1"
+        # 2) Fallback: registra saída e deixa o Ledger aplicar o CAP pelo obrigacao_id_*
+        id_saida, id_mov = _registrar_saida_pagamento(
+            ledger,
+            data=data,
+            principal_cash=principal_cash,
+            forma_pagamento=forma_pagamento,
+            banco_nome=banco_nome,
+            origem_dinheiro=origem_dinheiro,
+            categoria="Fatura Cartão de Crédito",
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            usuario=usuario,
+            juros=juros,
+            multa=multa,
+            desconto=desconto_efetivo,
+            obrigacao_id_fatura=int(obrigacao_id_fatura),
+        )
+        result = {"id_saida": id_saida, "id_mov": id_mov}
 
-        try:
-            id_saida, id_mov = ledger.registrar_saida_bancaria(
-                data=data_str,
-                valor=float(principal_cash),
-                banco_nome=banco_nome,
-                forma=forma_pagamento,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-                trans_uid=uid,
-            )
-        except TypeError:
-            id_saida, id_mov = ledger.registrar_saida_bancaria(
-                data=data_str,
-                valor=float(principal_cash),
-                banco_nome=banco_nome,
-                forma=forma_pagamento,
-                categoria=categoria,
-                sub_categoria=subcat_nome,
-                descricao=desc_final,
-                usuario=usuario_nome,
-                juros=float(juros),
-                multa=float(multa),
-                desconto=float(desconto),
-            )
+    # Snapshot pós-pagamento para UI
+    faltante, status = cap_repo.obter_restante_e_status(None, int(obrigacao_id_fatura))
+    return {
+        "ok": True,
+        "principal_em_dinheiro": float(principal_cash),
+        "juros": float(juros),
+        "multa": float(multa),
+        "desconto": float(desconto_efetivo),
+        "restante": float(faltante),
+        "status": status,
+        **(result if isinstance(result, dict) else {}),
+    }
 
-    # ---------- Ajuste opcional do valor da MB (força sair = principal+juros+multa−desconto) ----------
-    try:
-        if hasattr(ledger, "ajustar_valor_movimentacao_por_uid"):
-            ledger.ajustar_valor_movimentacao_por_uid(trans_uid=uid, novo_valor=float(valor_mb))
-    except Exception:
-        pass
 
-    # ---------- 2) Fallback CAP idempotente na PARCELA + data de pagamento ----------
-    try:
-        if caminho_banco and parcela_id_boleto:
-            with get_conn(caminho_banco) as conn:
-                cur = conn.cursor()
+def pagar_boleto_action(
+    *,
+    caminho_banco: str,
+    obrigacao_id_boleto: int,
+    data: str,
+    valor_principal: float,
+    forma_pagamento: str,
+    banco_nome: Optional[str] = None,
+    origem_dinheiro: Optional[str] = None,
+    juros: float = 0.0,
+    multa: float = 0.0,
+    desconto: float = 0.0,
+    descricao: str = "",
+    usuario: str = "-",
+    sub_categoria: Optional[str] = "Boleto",
+) -> Dict[str, Any]:
+    """
+    Paga parcela de BOLETO. Preferência:
+      1) ledger.pagar_parcela_boleto (se existir)
+      2) fallback registrar_saida_* com obrigacao_id_boleto
+    """
+    ledger, cap_repo = _get_services(caminho_banco)
+    principal_cash, desconto_efetivo = _split_principal_e_desconto(
+        cap_repo, int(obrigacao_id_boleto), float(valor_principal), float(desconto)
+    )
 
-                # Quais colunas existem?
-                cols = {r[1] for r in cur.execute("PRAGMA table_info(contas_a_pagar_mov)").fetchall()}
+    if hasattr(ledger, "pagar_parcela_boleto"):
+        result = ledger.pagar_parcela_boleto(
+            data=data,
+            valor_principal=float(principal_cash),
+            forma_pagamento=forma_pagamento,
+            banco_nome=banco_nome,
+            origem_dinheiro=origem_dinheiro,
+            juros=float(juros),
+            multa=float(multa),
+            desconto=float(desconto_efetivo),
+            obrigacao_id_boleto=int(obrigacao_id_boleto),
+            descricao=descricao,
+            usuario=usuario,
+            sub_categoria=sub_categoria,
+        )
+    else:
+        id_saida, id_mov = _registrar_saida_pagamento(
+            ledger,
+            data=data,
+            principal_cash=principal_cash,
+            forma_pagamento=forma_pagamento,
+            banco_nome=banco_nome,
+            origem_dinheiro=origem_dinheiro,
+            categoria="Pagamento de Boleto",
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            usuario=usuario,
+            juros=juros,
+            multa=multa,
+            desconto=desconto_efetivo,
+            obrigacao_id_boleto=int(obrigacao_id_boleto),
+        )
+        result = {"id_saida": id_saida, "id_mov": id_mov}
 
-                # Selecionar dinamicamente colunas para leitura
-                # valor_evento
-                if "valor_evento" in cols:
-                    col_evento = "valor_evento"
-                elif "valor" in cols:
-                    col_evento = "valor"
-                elif "valor_total" in cols:
-                    col_evento = "valor_total"
-                elif "valor_original" in cols:
-                    col_evento = "valor_original"
-                else:
-                    col_evento = None  # literal 0.0
+    faltante, status = cap_repo.obter_restante_e_status(None, int(obrigacao_id_boleto))
+    return {
+        "ok": True,
+        "principal_em_dinheiro": float(principal_cash),
+        "juros": float(juros),
+        "multa": float(multa),
+        "desconto": float(desconto_efetivo),
+        "restante": float(faltante),
+        "status": status,
+        **(result if isinstance(result, dict) else {}),
+    }
 
-                # principal pago acumulado (ou total pago)
-                if "principal_pago_acumulado" in cols:
-                    col_princ = "principal_pago_acumulado"
-                elif "valor_pago_acumulado" in cols:
-                    col_princ = "valor_pago_acumulado"
-                else:
-                    col_princ = None
 
-                # desconto acumulado
-                if "desconto_aplicado_acumulado" in cols:
-                    col_desc = "desconto_aplicado_acumulado"
-                elif "desconto_aplicado" in cols:
-                    col_desc = "desconto_aplicado"
-                elif "desconto" in cols:
-                    col_desc = "desconto"
-                else:
-                    col_desc = None
+def pagar_emprestimo_action(
+    *,
+    caminho_banco: str,
+    obrigacao_id_emprestimo: int,
+    data: str,
+    valor_principal: float,
+    forma_pagamento: str,
+    banco_nome: Optional[str] = None,
+    origem_dinheiro: Optional[str] = None,
+    juros: float = 0.0,
+    multa: float = 0.0,
+    desconto: float = 0.0,
+    descricao: str = "",
+    usuario: str = "-",
+    sub_categoria: Optional[str] = "Parcela Empréstimo",
+) -> Dict[str, Any]:
+    """
+    Paga parcela de EMPRÉSTIMO. Preferência:
+      1) ledger.pagar_parcela_emprestimo (se existir)
+      2) fallback registrar_saida_* com obrigacao_id_emprestimo
+    """
+    ledger, cap_repo = _get_services(caminho_banco)
+    principal_cash, desconto_efetivo = _split_principal_e_desconto(
+        cap_repo, int(obrigacao_id_emprestimo), float(valor_principal), float(desconto)
+    )
 
-                # juros/multa acumulados
-                col_juros = "juros_pago_acumulado" if "juros_pago_acumulado" in cols else None
-                col_multa = "multa_paga_acumulada" if "multa_paga_acumulada" in cols else None
+    if hasattr(ledger, "pagar_parcela_emprestimo"):
+        result = ledger.pagar_parcela_emprestimo(
+            data=data,
+            valor_principal=float(principal_cash),
+            forma_pagamento=forma_pagamento,
+            banco_nome=banco_nome,
+            origem_dinheiro=origem_dinheiro,
+            juros=float(juros),
+            multa=float(multa),
+            desconto=float(desconto_efetivo),
+            obrigacao_id_emprestimo=int(obrigacao_id_emprestimo),
+            descricao=descricao,
+            usuario=usuario,
+            sub_categoria=sub_categoria,
+        )
+    else:
+        id_saida, id_mov = _registrar_saida_pagamento(
+            ledger,
+            data=data,
+            principal_cash=principal_cash,
+            forma_pagamento=forma_pagamento,
+            banco_nome=banco_nome,
+            origem_dinheiro=origem_dinheiro,
+            categoria="Pagamento de Empréstimo",
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            usuario=usuario,
+            juros=juros,
+            multa=multa,
+            desconto=desconto_efetivo,
+            obrigacao_id_emprestimo=int(obrigacao_id_emprestimo),
+        )
+        result = {"id_saida": id_saida, "id_mov": id_mov}
 
-                # coluna de data de pagamento
-                col_data_pgto = _pick_first_existing(cols, [
-                    "data_pagamento", "data_pgto", "data_baixa", "data_ultimo_pagamento",
-                    "data_ultima_baixa", "data_pago"
-                ])
+    faltante, status = cap_repo.obter_restante_e_status(None, int(obrigacao_id_emprestimo))
+    return {
+        "ok": True,
+        "principal_em_dinheiro": float(principal_cash),
+        "juros": float(juros),
+        "multa": float(multa),
+        "desconto": float(desconto_efetivo),
+        "restante": float(faltante),
+        "status": status,
+        **(result if isinstance(result, dict) else {}),
+    }
 
-                select_list = []
-                select_list.append(f"COALESCE({col_evento}, 0.0) AS valor_evento" if col_evento else "0.0 AS valor_evento")
-                select_list.append(f"COALESCE({col_princ}, 0.0) AS principal_pago_acum" if col_princ else "0.0 AS principal_pago_acum")
-                select_list.append(f"COALESCE({col_desc}, 0.0) AS desconto_acum" if col_desc else "0.0 AS desconto_acum")
-                select_list.append(f"COALESCE({col_juros}, 0.0) AS juros_acum" if col_juros else "0.0 AS juros_acum")
-                select_list.append(f"COALESCE({col_multa}, 0.0) AS multa_acum" if col_multa else "0.0 AS multa_acum")
 
-                sql_sel = f"""
-                    SELECT {", ".join(select_list)}
-                      FROM contas_a_pagar_mov
-                     WHERE id = ?
-                       AND categoria_evento = 'LANCAMENTO'
-                     LIMIT 1
-                """
+# =============================================================================
+# Listagens simplificadas (sem duplicação de SQL)
+# =============================================================================
+def listar_faturas_abertas(caminho_banco: str):
+    _, cap_repo = _get_services(caminho_banco)
+    return cap_repo.listar_faturas_cartao_abertas()
 
-                row = cur.execute(sql_sel, (int(parcela_id_boleto),)).fetchone()
 
-                if row:
-                    valor_evento, princ_acum, desc_acum, juros_acum, multa_acum = map(float, row)
+def listar_boletos_abertos(caminho_banco: str):
+    _, cap_repo = _get_services(caminho_banco)
+    return cap_repo.listar_boletos_em_aberto()
 
-                    # Quanto de principal ainda cabe (após o que já foi aplicado)
-                    saldo_principal = max(valor_evento - princ_acum - desc_acum, 0.0)
-                    inc_principal   = max(0.0, min(principal_cash, saldo_principal))
 
-                    # Desconto também abate principal; limitar ao saldo remanescente pós-inc_principal
-                    saldo_pos_princ = max(valor_evento - (princ_acum + inc_principal) - desc_acum, 0.0)
-                    inc_desconto    = max(0.0, min(desconto, saldo_pos_princ))
-
-                    # Juros/multa acumulam
-                    inc_juros = float(juros) if abs(float(juros)) > 0.0005 else 0.0
-                    inc_multa = float(multa) if abs(float(multa)) > 0.0005 else 0.0
-
-                    set_parts, params = [], []
-
-                    if "principal_pago_acumulado" in cols and inc_principal > 0.0005:
-                        set_parts.append("principal_pago_acumulado = COALESCE(principal_pago_acumulado,0) + ?")
-                        params.append(inc_principal)
-
-                    if inc_desconto > 0.0005:
-                        if "desconto_aplicado_acumulado" in cols:
-                            set_parts.append("desconto_aplicado_acumulado = COALESCE(desconto_aplicado_acumulado,0) + ?")
-                        elif "desconto_aplicado" in cols:
-                            set_parts.append("desconto_aplicado = COALESCE(desconto_aplicado,0) + ?")
-                        elif "desconto" in cols:
-                            set_parts.append("desconto = COALESCE(desconto,0) + ?")
-                        else:
-                            inc_desconto = 0.0
-                        if inc_desconto > 0.0:
-                            params.append(inc_desconto)
-
-                    if "juros_pago_acumulado" in cols and inc_juros > 0.0005:
-                        set_parts.append("juros_pago_acumulado = COALESCE(juros_pago_acumulado,0) + ?")
-                        params.append(inc_juros)
-
-                    if "multa_paga_acumulada" in cols and inc_multa > 0.0005:
-                        set_parts.append("multa_paga_acumulada = COALESCE(multa_paga_acumulada,0) + ?")
-                        params.append(inc_multa)
-
-                    # Compat legado: total pago em dinheiro (sem desconto)
-                    soma_total_inc = inc_principal + inc_juros + inc_multa
-                    if "valor_pago_acumulado" in cols and soma_total_inc > 0.0005:
-                        set_parts.append("valor_pago_acumulado = COALESCE(valor_pago_acumulado,0) + ?")
-                        params.append(soma_total_inc)
-
-                    # Status
-                    novo_princ = princ_acum + inc_principal
-                    novo_desc  = desc_acum + inc_desconto
-                    quitada = (novo_princ + novo_desc) >= (valor_evento - 0.005)
-                    if "status" in cols:
-                        set_parts.append("status = ?")
-                        params.append("QUITADA" if quitada else "PARCIAL")
-
-                    # Data de pagamento
-                    if col_data_pgto:
-                        set_parts.append(f"{col_data_pgto} = ?")
-                        params.append(data_str)
-
-                    if set_parts:
-                        sql_upd = f"""
-                            UPDATE contas_a_pagar_mov
-                               SET {", ".join(set_parts)}
-                             WHERE id = ?
-                               AND categoria_evento = 'LANCAMENTO'
-                        """
-                        params.append(int(parcela_id_boleto))
-                        cur.execute(sql_upd, params)
-                        conn.commit()
-    except Exception:
-        # Falha no fallback CAP não deve travar o pagamento
-        pass
-
-    return id_saida, id_mov
+def listar_emprestimos_abertos(caminho_banco: str):
+    _, cap_repo = _get_services(caminho_banco)
+    return cap_repo.listar_emprestimos_em_aberto()

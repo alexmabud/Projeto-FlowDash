@@ -5,12 +5,12 @@ Service: BOLETO (pagamento de parcelas)
 Regras principais deste serviço:
 - Ordem de aplicação: FIFO por vencimento das parcelas em aberto na obrigação.
 - Rateio do pagamento:
-    • principal → vai para `valor_pago_acumulado` da(s) parcela(s) (CASCADE entre parcelas).
-    • juros     → vai para `juros_pago` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-    • multa     → vai para `multa_paga` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-    • desconto  → vai para `desconto_aplicado` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • principal → amortiza as parcelas (CASCADE entre parcelas).
+    • juros     → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • multa     → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • desconto  → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
 - Saída de caixa/banco: o Repository calcula o caixa gasto de cada aplicação
-  como (principal + juros + multa − desconto), consolidando a movimentação.
+  como **(principal + juros + multa)** — **desconto não sai do caixa** — e consolida a movimentação.
 - trans_uid: gerado por operação e retornado ao chamador (não é persistido aqui).
 - Este serviço NÃO cria eventos novos no CAP; ele aplica/acumula nos lançamentos
   já programados (parcelas).
@@ -46,7 +46,7 @@ class ResultadoParcela:
         aplicado_multa: Valor de multa aplicado nesta parcela (somente 1ª aberta).
         aplicado_desconto: Valor de desconto aplicado nesta parcela (somente 1ª aberta).
         saida_total: Impacto total de caixa/banco nesta parcela
-            (principal + juros + multa − desconto), calculado no Repository.
+            (**principal + juros + multa**; desconto **não** sai do caixa), calculado no Repository.
         status: Novo status da parcela após a aplicação (e.g., "PARCIAL", "QUITADO").
         restante_principal: Principal ainda em aberto após a aplicação nesta parcela.
     """
@@ -112,7 +112,7 @@ class ServiceLedgerBoleto:
                 - (opcional) mensagem (str): quando não há parcelas em aberto.
 
         Notes:
-            - O cálculo da saída (principal + juros + multa − desconto) é feito no Repository.
+            - O cálculo da saída (**principal + juros + multa**; desconto não entra) é feito no Repository.
             - Este serviço não cria linhas em CAP; apenas aplica/acumula na programação existente.
         """
         data_evt = data_evento or datetime.now().strftime("%Y-%m-%d")
@@ -350,4 +350,4 @@ class ServiceLedgerBoleto:
 # --- Retrocompat (mantém nomes antigos esperados por imports legados) ---
 BoletoMixin = ServiceLedgerBoleto
 _BoletoLedgerMixin = BoletoMixin
-__all__ = ["BoletoMixin", "_BoletoLedgerMixin", "ServiceLedgerBoleto"]
+__all__ = ["BoletoMixin", "_BoletoLedgerMixin", "ServiceLedgerBoleto", "ResultadoParcela"]

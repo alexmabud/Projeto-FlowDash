@@ -8,10 +8,19 @@ Modelo (Lei do Sistema)
 - principal_pago_acumulado ...... soma do PRINCIPAL amortizado (inclui desconto).
 - juros_pago_acumulado .......... soma dos JUROS pagos.
 - multa_paga_acumulada .......... soma das MULTAS pagas.
-- desconto_aplicado_acumulado ... soma dos DESCONTOS aplicados (desconto NÃO é caixa).
-- valor_pago_acumulado .......... GASTO DE CAIXA acumulado = principal + juros + multa  (desconto não entra).
+- desconto_aplicado_acumulado ... soma dos DESCONTOS aplicados.
+- valor_pago_acumulado .......... BRUTO (principal + desconto + juros + multa).
+                                  (Auditoria do “tamanho do pagamento” por parcela.
+                                   O caixa efetivo — dinheiro que sai — é registrado em movimentacoes_bancarias.)
 - status/faltante ............... dependem APENAS de principal_pago_acumulado.
 - Não criamos linhas 'PAGAMENTO' no CAP (auditoria fica em movimentacoes_bancarias).
+
+Refatoração (2025-09-04)
+------------------------
+- Adicionados helpers para evitar duplicação em actions_*:
+    • obter_parcela_lancamento_por_obrigacao(obrigacao_id)
+    • obter_restante_e_status(obrigacao_id)
+    • aplicar_pagamento_por_obrigacao(...)  (atalho usando aplicar_pagamento_parcela)
 """
 
 from __future__ import annotations
@@ -19,7 +28,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 STATUS_ABERTO = "EM ABERTO"
 STATUS_PARCIAL = "PARCIAL"
@@ -44,17 +53,7 @@ class ContasAPagarMovRepository:
     # ---------------------------------------------------------------------
     @contextmanager
     def _conn_ctx(self, conn: Optional[sqlite3.Connection]) -> Iterator[sqlite3.Connection]:
-        """Garante `row_factory=sqlite3.Row` para retornos dict-like.
-
-        Se `conn` for fornecida, apenas ajusta/recupera o `row_factory` no escopo.
-        Caso contrário, abre/commita/fecha a conexão automaticamente.
-
-        Args:
-            conn: Conexão SQLite existente (opcional).
-
-        Yields:
-            Conexão SQLite com `row_factory` configurado.
-        """
+        """Garante `row_factory=sqlite3.Row` para retornos dict-like."""
         if conn is not None:
             old_rf = getattr(conn, "row_factory", None)
             conn.row_factory = sqlite3.Row
@@ -77,15 +76,7 @@ class ContasAPagarMovRepository:
         return cur.fetchone()
 
     def obter_por_id(self, conn: Optional[sqlite3.Connection], parcela_id: int) -> Optional[dict]:
-        """Obtém um lançamento por ID.
-
-        Args:
-            conn: Conexão SQLite (opcional).
-            parcela_id: ID do lançamento/parcela.
-
-        Returns:
-            Dicionário com as colunas do registro ou None se não encontrado.
-        """
+        """Obtém um lançamento por ID."""
         with self._conn_ctx(conn) as c:
             cur = c.cursor()
             cur.execute("SELECT * FROM contas_a_pagar_mov WHERE id = ?", (int(parcela_id),))
@@ -98,6 +89,87 @@ class ContasAPagarMovRepository:
             cur = c.cursor()
             cur.execute("SELECT COALESCE(MAX(obrigacao_id), 0) + 1 FROM contas_a_pagar_mov")
             return int(cur.fetchone()[0] or 1)
+
+    # ---------------------------------------------------------------------
+    # Helpers NOVOS para evitar duplicação em actions_*
+    # ---------------------------------------------------------------------
+    def obter_parcela_lancamento_por_obrigacao(
+        self,
+        conn: Optional[sqlite3.Connection],
+        obrigacao_id: int,
+    ) -> Optional[dict]:
+        """Retorna a linha LANCAMENTO (parcela “cabeça”) de uma obrigação."""
+        with self._conn_ctx(conn) as c:
+            cur = c.cursor()
+            row = cur.execute(
+                """
+                SELECT *
+                  FROM contas_a_pagar_mov
+                 WHERE obrigacao_id = ?
+                   AND categoria_evento = 'LANCAMENTO'
+                 LIMIT 1
+                """,
+                (int(obrigacao_id),),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def obter_restante_e_status(
+        self,
+        conn: Optional[sqlite3.Connection],
+        obrigacao_id: int,
+    ) -> Tuple[float, str]:
+        """Calcula faltante de PRINCIPAL e status da obrigação (pela linha LANCAMENTO)."""
+        with self._conn_ctx(conn) as c:
+            cur = c.cursor()
+            row = cur.execute(
+                """
+                SELECT
+                    COALESCE(valor_evento, 0.0)          AS valor_evento,
+                    COALESCE(principal_pago_acumulado,0) AS principal_pago_acumulado
+                  FROM contas_a_pagar_mov
+                 WHERE obrigacao_id = ?
+                   AND categoria_evento = 'LANCAMENTO'
+                 LIMIT 1
+                """,
+                (int(obrigacao_id),),
+            ).fetchone()
+
+            if not row:
+                return 0.0, STATUS_ABERTO
+
+            valor_evento = float(row["valor_evento"] or 0.0)
+            principal_acum = float(row["principal_pago_acumulado"] or 0.0)
+            restante = round(max(valor_evento - principal_acum, 0.0), 2)
+            status = STATUS_PARCIAL if restante > _EPS else STATUS_QUITADO
+            return restante, status
+
+    def aplicar_pagamento_por_obrigacao(
+        self,
+        conn: Optional[sqlite3.Connection],
+        *,
+        obrigacao_id: int,
+        valor_base: float,
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+        data_evento: Optional[str] = None,
+        usuario: str = "-",
+    ) -> Dict[str, Any]:
+        """Atalho: aplica pagamento na PARCELA LANCAMENTO usando `aplicar_pagamento_parcela`."""
+        parc = self.obter_parcela_lancamento_por_obrigacao(conn, int(obrigacao_id))
+        if not parc:
+            raise ValueError(f"Obrigação {obrigacao_id} não encontrada.")
+
+        return self.aplicar_pagamento_parcela(
+            conn,
+            parcela_id=int(parc["id"]),
+            valor_base=float(valor_base or 0.0),
+            juros=float(juros or 0.0),
+            multa=float(multa or 0.0),
+            desconto=float(desconto or 0.0),
+            data_evento=str(data_evento or datetime.now().strftime("%Y-%m-%d")),
+            usuario=str(usuario or "-"),
+        )
 
     # ---------------------------------------------------------------------
     # Criação de Lançamento
@@ -121,29 +193,7 @@ class ContasAPagarMovRepository:
         cartao_id: Optional[int] = None,
         emprestimo_id: Optional[int] = None,
     ) -> int:
-        """Insere um LANCAMENTO (principal a pagar) com acumuladores zerados.
-
-        Define status inicial como 'EM ABERTO'.
-
-        Args:
-            obrigacao_id: Identificador da obrigação (agrupador de parcelas).
-            tipo_obrigacao: BOLETO, FATURA_CARTAO, EMPRESTIMO, etc.
-            valor_total: Principal da parcela.
-            data_evento: Data do evento (YYYY-MM-DD).
-            vencimento: Vencimento da parcela (YYYY-MM-DD).
-            descricao: Descrição do lançamento.
-            credor: Nome do credor.
-            competencia: Competência (YYYY-MM).
-            parcela_num: Número da parcela.
-            parcelas_total: Total de parcelas na obrigação.
-            usuario: Usuário operador.
-            tipo_origem: Campo auxiliar de origem.
-            cartao_id: Relacionamento com cartão (quando aplicável).
-            emprestimo_id: Relacionamento com empréstimo (quando aplicável).
-
-        Returns:
-            ID do lançamento inserido.
-        """
+        """Insere um LANCAMENTO (principal a pagar) com acumuladores zerados."""
         with self._conn_ctx(conn) as c:
             cur = c.cursor()
             cur.execute(
@@ -153,7 +203,7 @@ class ContasAPagarMovRepository:
                      valor_evento, descricao, credor, competencia, parcela_num, parcelas_total,
                      forma_pagamento, origem, ledger_id, usuario, created_at,
                      tipo_origem, cartao_id, emprestimo_id, status,
-                     valor_pago_acumulado,                -- CAIXA gasto
+                     valor_pago_acumulado,                -- BRUTO (principal+desconto+juros+multa)
                      juros_pago_acumulado, multa_paga_acumulada, desconto_aplicado_acumulado,
                      valor, data_pagamento,
                      principal_pago_acumulado)
@@ -246,24 +296,14 @@ class ContasAPagarMovRepository:
         """Aplica pagamento **parcial** na PARCELA (padrão novo).
 
         Regras aplicadas:
+        - **Aplica desconto primeiro** ao principal faltante.
         - principal_pago_acumulado += principal_aplicado + desconto_efetivo
         - juros/multa acumulam nos respectivos *_acumulado/a
         - desconto_aplicado_acumulado += desconto_efetivo
-        - valor_pago_acumulado (CAIXA) += principal_aplicado + juros + multa
-          (desconto NÃO entra no caixa)
+        - valor_pago_acumulado (CAP, **BRUTO**) += principal_aplicado + desconto_efetivo + juros + multa
+        - **saida_total** (para movimentacoes_bancarias) = principal_aplicado + juros + multa
+          (desconto NÃO sai do caixa)
         - status depende SOMENTE de principal_pago_acumulado vs valor_evento
-
-        NOTA: não cria linha 'PAGAMENTO' (auditoria é em movimentacoes_bancarias).
-
-        Args:
-            conn: Conexão SQLite (opcional).
-            payload/kwargs: Campos esperados:
-                parcela_id (int), valor_base (float),
-                juros (float), multa (float), desconto (float),
-                data_evento (YYYY-MM-DD), usuario (str)
-
-        Returns:
-            Snapshot do efeito na parcela (dicionário com campos utilizados pelos serviços).
         """
         d = dict(payload or {})
         d.update(kwargs or {})
@@ -291,26 +331,35 @@ class ContasAPagarMovRepository:
             juros_atual = float(row["juros_pago_acumulado"] or 0.0)
             multa_atual = float(row["multa_paga_acumulada"] or 0.0)
             desc_atual = float(row["desconto_aplicado_acumulado"] or 0.0)
-            caixa_atual = float(row["valor_pago_acumulado"] or 0.0)
+            valor_pago_atual = float(row["valor_pago_acumulado"] or 0.0)
 
-            # faltante de principal (independe de desconto acumulado)
+            # faltante de principal
             faltante = max(0.0, round(valor_evento - principal_atual, 2))
 
-            principal_aplicado = min(max(0.0, principal_in), faltante)
-            faltante_pos = max(0.0, round(faltante - principal_aplicado, 2))
-            desconto_efetivo = min(max(0.0, desc_in), faltante_pos)
+            # 1) aplica desconto primeiro ao principal faltante
+            desconto_efetivo = min(max(0.0, desc_in), faltante)
+            faltante_pos = max(0.0, round(faltante - desconto_efetivo, 2))
 
+            # 2) aplica principal em dinheiro no restante
+            principal_aplicado = min(max(0.0, principal_in), faltante_pos)
+
+            # encargos em dinheiro
             juros_aplicado = max(0.0, juros_in)
             multa_aplicada = max(0.0, multa_in)
 
-            # caixa deste evento: principal + juros + multa (desconto não é caixa)
-            saida_evento = round(principal_aplicado + juros_aplicado + multa_aplicada, 2)
+            # caixa real do evento (dinheiro que sai): principal_aplicado + juros + multa
+            caixa_evento = round(principal_aplicado + juros_aplicado + multa_aplicada, 2)
 
+            # acumuladores (CAP)
             novo_principal = round(principal_atual + principal_aplicado + desconto_efetivo, 2)
             novo_juros = round(juros_atual + juros_aplicado, 2)
             novo_multa = round(multa_atual + multa_aplicada, 2)
             novo_desc = round(desc_atual + desconto_efetivo, 2)
-            novo_caixa = round(caixa_atual + saida_evento, 2)
+
+            # BRUTO (para CAP.valor_pago_acumulado) = principal + desconto + juros + multa
+            novo_valor_pago = round(
+                valor_pago_atual + principal_aplicado + desconto_efetivo + juros_aplicado + multa_aplicada, 2
+            )
 
             if novo_principal + 1e-9 >= valor_evento:
                 novo_status = STATUS_QUITADO
@@ -326,7 +375,7 @@ class ContasAPagarMovRepository:
                     juros_pago_acumulado         = ?,
                     multa_paga_acumulada         = ?,
                     desconto_aplicado_acumulado  = ?,
-                    valor_pago_acumulado         = ?,
+                    valor_pago_acumulado         = ?, -- BRUTO (principal+desconto+juros+multa)
                     status                       = ?,
                     data_pagamento               = ?
                 WHERE id = ?
@@ -336,7 +385,7 @@ class ContasAPagarMovRepository:
                     novo_juros,
                     novo_multa,
                     novo_desc,
-                    novo_caixa,
+                    novo_valor_pago,
                     novo_status,
                     data_evt,
                     parcela_id,
@@ -351,9 +400,9 @@ class ContasAPagarMovRepository:
                 "juros_aplicado": float(juros_aplicado),
                 "multa_aplicada": float(multa_aplicada),
                 "desconto_aplicado": float(desconto_efetivo),
-                "saida_total": float(saida_evento),
+                "saida_total": float(caixa_evento),             # dinheiro que saiu
                 "valor_evento": float(valor_evento),
-                "valor_pago_acumulado": float(novo_caixa),
+                "valor_pago_acumulado": float(novo_valor_pago), # BRUTO acumulado no CAP
                 "restante": float(restante_depois),
                 "status": novo_status,
                 "data_pagamento": data_evt,
@@ -377,15 +426,9 @@ class ContasAPagarMovRepository:
         """Quita a parcela inteira com as novas regras.
 
         Regras:
-            - `desconto` amortiza principal (até o faltante).
-            - caixa = principal_aplicado + juros + multa  (desconto NÃO entra).
-
-        Observação:
-            Parâmetros `forma_pagamento`, `origem`, `ledger_id` são mantidos por compatibilidade,
-            mas não alteram a regra de cálculo.
-
-        Returns:
-            Snapshot do efeito da quitação (dicionário).
+            - **Aplica desconto primeiro** no faltante; depois o principal em dinheiro quita o restante.
+            - CAP.valor_pago_acumulado += principal_em_dinheiro + **desconto** + juros + multa  (BRUTO).
+            - caixa (saida_total) = principal_em_dinheiro + juros + multa  (desconto NÃO sai do caixa).
         """
         with self._conn_ctx(conn) as c:
             cur = c.cursor()
@@ -400,16 +443,22 @@ class ContasAPagarMovRepository:
             juros_atual = float(row["juros_pago_acumulado"] or 0.0)
             multa_atual = float(row["multa_paga_acumulada"] or 0.0)
             desc_atual = float(row["desconto_aplicado_acumulado"] or 0.0)
-            caixa_atual = float(row["valor_pago_acumulado"] or 0.0)
+            valor_pago_atual = float(row["valor_pago_acumulado"] or 0.0)
 
             faltante = max(0.0, round(valor_evento - principal_atual, 2))
+
+            # aplica desconto primeiro
             desconto_efetivo = min(max(0.0, float(desconto or 0.0)), faltante)
-            principal_aplicado = max(0.0, round(faltante - desconto_efetivo, 2))
+            restante_apos_desc = max(0.0, round(faltante - desconto_efetivo, 2))
+
+            # principal em dinheiro quita o restante
+            principal_aplicado = restante_apos_desc
 
             juros_aplicado = max(0.0, float(juros or 0.0))
             multa_aplicada = max(0.0, float(multa or 0.0))
 
-            saida_evento = round(principal_aplicado + juros_aplicado + multa_aplicada, 2)
+            # caixa do evento (dinheiro que sai)
+            caixa_evento = round(principal_aplicado + juros_aplicado + multa_aplicada, 2)
 
             novo_principal = round(principal_atual + principal_aplicado + desconto_efetivo, 2)
             if novo_principal > valor_evento:
@@ -418,7 +467,11 @@ class ContasAPagarMovRepository:
             novo_juros = round(juros_atual + juros_aplicado, 2)
             novo_multa = round(multa_atual + multa_aplicada, 2)
             novo_desc = round(desc_atual + desconto_efetivo, 2)
-            novo_caixa = round(caixa_atual + saida_evento, 2)
+
+            # BRUTO (para CAP.valor_pago_acumulado) = principal + desconto + juros + multa
+            novo_valor_pago = round(
+                valor_pago_atual + principal_aplicado + desconto_efetivo + juros_aplicado + multa_aplicada, 2
+            )
 
             cur.execute(
                 """
@@ -427,7 +480,7 @@ class ContasAPagarMovRepository:
                        juros_pago_acumulado         = ?,
                        multa_paga_acumulada         = ?,
                        desconto_aplicado_acumulado  = ?,
-                       valor_pago_acumulado         = ?,  -- CAIXA
+                       valor_pago_acumulado         = ?,  -- BRUTO (principal+desconto+juros+multa)
                        status                       = ?,
                        data_pagamento               = ?
                  WHERE id = ?
@@ -437,7 +490,7 @@ class ContasAPagarMovRepository:
                     novo_juros,
                     novo_multa,
                     novo_desc,
-                    novo_caixa,
+                    novo_valor_pago,
                     STATUS_QUITADO,
                     str(data_evento),
                     int(parcela_id),
@@ -451,9 +504,10 @@ class ContasAPagarMovRepository:
                 "juros_aplicado": float(juros_aplicado),
                 "multa_aplicada": float(multa_aplicada),
                 "desconto_aplicado": float(desconto_efetivo),
-                "saida_total": float(saida_evento),
+                "saida_total": float(caixa_evento),              # dinheiro que saiu
                 "valor_evento": float(valor_evento),
                 "principal_pago_acumulado": float(novo_principal),
+                "valor_pago_acumulado": float(novo_valor_pago),  # BRUTO acumulado no CAP
                 "restante": 0.0,
                 "status": STATUS_QUITADO,
                 "data_pagamento": str(data_evento),
@@ -478,15 +532,17 @@ class ContasAPagarMovRepository:
         """Atualiza acumuladores da parcela a partir de deltas (sem FIFO).
 
         Regras:
-            - Se `caixa_gasto_delta` for None, usa (principal + juros + multa).
-              (desconto não é caixa; informe explicitamente se precisar outra regra).
+            - Se `caixa_gasto_delta` for None, acumula em `valor_pago_acumulado` o **BRUTO**:
+              (principal_delta + desconto_delta + juros_delta + multa_delta).
             - Clampa principal em [0, valor_evento] e recalcula status por principal.
-
-        Returns:
-            Snapshot atualizado da parcela (dict) ou dict mínimo com `parcela_id`.
         """
         if caixa_gasto_delta is None:
-            caixa_gasto_delta = (principal_delta or 0.0) + (juros_delta or 0.0) + (multa_delta or 0.0)
+            caixa_gasto_delta = (
+                (principal_delta or 0.0)
+                + (desconto_delta or 0.0)
+                + (juros_delta or 0.0)
+                + (multa_delta or 0.0)
+            )
         principal_delta = max(0.0, float(principal_delta or 0.0))
         juros_delta = max(0.0, float(juros_delta or 0.0))
         multa_delta = max(0.0, float(multa_delta or 0.0))
@@ -508,7 +564,7 @@ class ContasAPagarMovRepository:
                        juros_pago_acumulado         = COALESCE(juros_pago_acumulado,0) + ?,
                        multa_paga_acumulada         = COALESCE(multa_paga_acumulada,0) + ?,
                        desconto_aplicado_acumulado  = COALESCE(desconto_aplicado_acumulado,0) + ?,
-                       valor_pago_acumulado         = COALESCE(valor_pago_acumulado,0) + ?, -- CAIXA
+                       valor_pago_acumulado         = COALESCE(valor_pago_acumulado,0) + ?, -- BRUTO
                        data_pagamento               = ?
                  WHERE id = ?;
                 """,
@@ -657,10 +713,7 @@ class ContasAPagarMovRepository:
     def obter_em_aberto(
         self, conn: Optional[sqlite3.Connection], tipo_obrigacao: Optional[str] = None
     ) -> List[dict]:
-        """Lista LANCAMENTOS em aberto/parcial (qualquer tipo).
-
-        `em_aberto` representa o faltante de PRINCIPAL.
-        """
+        """Lista LANCAMENTOS em aberto/parcial (qualquer tipo)."""
         with self._conn_ctx(conn) as c:
             cur = c.cursor()
             filtro = ""
@@ -695,19 +748,7 @@ class ContasAPagarMovRepository:
         obrigacao_id: int,
         limite: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Lista parcelas de uma obrigação com faltante de PRINCIPAL > 0 (FIFO).
-
-        Ordena por vencimento e, em caso de empate, por id.
-
-        Args:
-            conn: Conexão SQLite (opcional).
-            obrigacao_id: Identificador da obrigação.
-            limite: Limite opcional de registros.
-
-        Returns:
-            Lista de dicionários com: parcela_id, vencimento, valor_evento,
-            principal_pago_acumulado e principal_faltante.
-        """
+        """Lista parcelas de uma obrigação com faltante de PRINCIPAL > 0 (FIFO)."""
         sql = """
             SELECT
                 id AS parcela_id,

@@ -6,11 +6,11 @@ Regras principais:
 - Operamos sobre um `obrigacao_id` (a fatura do mês).
 - Ordem de aplicação: FIFO por vencimento das parcelas em aberto da obrigação.
 - Rateio do pagamento:
-    • principal → vai para `valor_pago_acumulado` das parcelas (CASCADE entre parcelas).
-    • juros     → vai para `juros_*` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-    • multa     → vai para `multa_*` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-    • desconto  → vai para `desconto_*` apenas na PRIMEIRA parcela ainda aberta (não cascateia).
-- Saída de caixa/banco: (principal + juros + multa − desconto) agregado.
+    • principal → amortiza as parcelas (CASCADE entre parcelas).
+    • juros     → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • multa     → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+    • desconto  → aplica apenas na PRIMEIRA parcela ainda aberta (não cascateia).
+- Saída de caixa/banco: **principal + juros + multa** (desconto **não** sai do caixa), agregado.
 - trans_uid: gerado por operação (idempotência).
 - Este serviço atualiza CAP; a criação de movimentação:
   • se o pagamento vier do fluxo de SAÍDA (registrar_saida_*), a mov. já é registrada lá;
@@ -40,7 +40,19 @@ _EPS = 1e-9  # Tolerância numérica para comparações de ponto flutuante
 
 @dataclass
 class ResultadoParcela:
-    """Snapshot resumido do efeito do pagamento em uma parcela de fatura."""
+    """Snapshot resumido do efeito do pagamento em uma parcela de fatura.
+
+    Attributes:
+        parcela_id: ID da parcela afetada.
+        aplicado_principal: Valor de principal aplicado nesta parcela (amortização).
+        aplicado_juros: Valor de juros aplicado nesta parcela (somente 1ª aberta).
+        aplicado_multa: Valor de multa aplicado nesta parcela (somente 1ª aberta).
+        aplicado_desconto: Valor de desconto aplicado nesta parcela (somente 1ª aberta).
+        saida_total: Impacto total de caixa/banco nesta parcela
+            (**principal + juros + multa**; desconto **não** sai do caixa), calculado no Repository.
+        status: Novo status da parcela após a aplicação (e.g., "PARCIAL", "QUITADO").
+        restante_principal: Principal ainda em aberto após a aplicação nesta parcela.
+    """
     parcela_id: int
     aplicado_principal: float
     aplicado_juros: float
@@ -71,7 +83,8 @@ class ServiceLedgerFatura:
           uma linha em `movimentacoes_bancarias` quando o pagamento é feito
           diretamente por este serviço (sem passar por registrar_saida_*).
         - Retorna dict com `ok`, `sobra`, `obrigacao_id`, `ids`, `trans_uid`,
-          `saida_total`, `resultados`, e opcional `mensagem`.
+          `saida_total` (dinheiro que sai: principal + juros + multa), `resultados`,
+          e opcional `mensagem`.
         """
         conn: Optional[sqlite3.Connection] = None
         if args and isinstance(args[0], sqlite3.Connection):
@@ -154,7 +167,7 @@ class ServiceLedgerFatura:
             "obrigacao_id": obrigacao_id,
             "sobra": float(core["sobra"]),
             "trans_uid": core["trans_uid"],
-            "saida_total": float(core["saida_total"]),
+            "saida_total": float(core["saida_total"]),  # dinheiro que sai: principal + juros + multa
             "resultados": core["resultados"],
             "ids": {"ledger_id": ledger_id if ledger_id is not None else None, "cap_evento_id": None, "mov_id": None},
         }
@@ -191,7 +204,7 @@ class ServiceLedgerFatura:
         )
         return {
             "trans_uid": core["trans_uid"],
-            "saida_total": float(core["saida_total"]),
+            "saida_total": float(core["saida_total"]),  # dinheiro que sai: principal + juros + multa
             "resultados": core["resultados"],
             "sobra": float(core["sobra"]),
             **({"mensagem": core["mensagem"]} if core.get("mensagem") else {}),
@@ -296,7 +309,7 @@ class ServiceLedgerFatura:
 
         return {
             "trans_uid": trans_uid,
-            "saida_total": float(saida_total_agregado),
+            "saida_total": float(saida_total_agregado),  # dinheiro que sai: principal + juros + multa
             "resultados": [r.__dict__ for r in resultados],
             "sobra": float(restante_principal),
         }

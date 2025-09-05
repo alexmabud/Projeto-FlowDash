@@ -416,3 +416,39 @@ def log_mov_bancaria(
         )
 
     return mov_id
+
+
+# === Helper: vincular movimento bancário à parcela de BOLETO =================
+def vincular_mov_a_parcela_boleto(caminho_banco: str, id_mov: int, parcela_id_boleto: int) -> None:
+    """
+    Amarra o movimento bancário (movimentacoes_bancarias.id) à parcela de BOLETO
+    (contas_a_pagar_mov.id), preenchendo referencia_tabela/referencia_id.
+
+    Uso: chame logo após criar o movimento, quando tiver `parcela_id_boleto`.
+    É idempotente e silencioso se parâmetros forem inválidos.
+    """
+    try:
+        if not id_mov or not parcela_id_boleto:
+            return
+        from shared.db import get_conn  # import local para evitar ciclos
+        with get_conn(caminho_banco) as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE movimentacoes_bancarias
+                   SET referencia_tabela = 'contas_a_pagar_mov',
+                       referencia_id     = ?
+                 WHERE id = ?
+                """,
+                (int(parcela_id_boleto), int(id_mov)),
+            )
+            conn.commit()
+    except Exception:
+        # Não quebrar o fluxo principal por causa do vínculo (apenas log se tiver logger)
+        try:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Falha ao vincular mov %s à parcela boleto %s", id_mov, parcela_id_boleto
+            )
+        except Exception:
+            pass
