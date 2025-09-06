@@ -8,11 +8,19 @@ Actions: Saídas (Dinheiro e Bancária)
 
 Retorno padrão das ações:
 - dict: { ok: bool, id_saida: int|None, id_mov: int|None, mensagem: str|None }
+
+Atualizações:
+- Carga de categorias/subcategorias agora busca IDs reais em:
+    • categorias_saida (id, nome)
+    • subcategorias_saida (id, nome, categoria_id)
+- Fornece provider: listar_subcategorias_por_categoria(categoria_id) -> list[dict]
+- registrar_saida_action agora enriquece a descrição com "[Categoria / Subcategoria]"
+  para refletir também em movimentacoes_bancarias.observacao.
 """
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, Tuple, List, Iterable
+from typing import Optional, Dict, Any, Tuple, List, Iterable, Callable
 from datetime import datetime
 import contextlib
 
@@ -135,7 +143,14 @@ def registrar_saida_action(
     obrigacao_id_boleto: Optional[int] = None,
     obrigacao_id_emprestimo: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Normaliza os dados e delega ao `LedgerService.registrar_lancamento`."""
+    """Normaliza os dados e delega ao `LedgerService.registrar_lancamento`.
+
+    Ajuste: a `descricao` é enriquecida com "[Categoria / Subcategoria]" para
+    que:
+      • saida.descricao armazene também a referência de classificação, e
+      • movimentacoes_bancarias.observacao traga esse complemento junto
+        com o que já aparece (o Ledger costuma usar essa mesma `descricao`).
+    """
     valor_f = _money(valor)
     if valor_f <= 0:
         return {"ok": False, "mensagem": "Valor da saída deve ser maior que zero."}
@@ -150,12 +165,33 @@ def registrar_saida_action(
         obrigacao_id_emprestimo=obrigacao_id_emprestimo,
     )
 
+    # --- enriquecer descricao: "<descricao> [Categoria / Subcategoria]" ---
+    cat_str = _norm_str(categoria)
+    subcat_str = _norm_str(subcategoria)
+    desc_user = _norm_str(descricao)
+    sufixo_cat = None
+    if cat_str or subcat_str:
+        sufixo_cat = f"[{cat_str or '-'} / {subcat_str or '-'}]"
+
+    if desc_user and sufixo_cat:
+        descricao_enriquecida = f"{desc_user} {sufixo_cat}"
+    elif desc_user:
+        descricao_enriquecida = desc_user
+    elif sufixo_cat:
+        descricao_enriquecida = sufixo_cat
+    else:
+        descricao_enriquecida = None
+
     try:
         ledger = LedgerService(caminho_banco)
         id_saida, id_mov = ledger.registrar_lancamento(
             tipo_evento="SAIDA",
-            categoria_evento=_norm_str(categoria),
-            subcategoria_evento=_norm_str(subcategoria),
+            # Estes dois vão para as colunas categoria/subcategoria da tabela `saida`
+            categoria_evento=cat_str,
+            subcategoria_evento=subcat_str,
+            # Esta vai para saida.descricao e, tipicamente, para movimentacoes_bancarias.observacao
+            descricao=descricao_enriquecida,
+            # Demais campos
             valor_evento=valor_f,
             forma=forma_norm,
             origem=_norm_str(origem),
@@ -163,7 +199,6 @@ def registrar_saida_action(
             juros=_money(juros),
             multa=_money(multa),
             desconto=_money(desconto),
-            descricao=_norm_str(descricao),
             usuario=_norm_str(usuario) or "-",
             trans_uid=_norm_str(trans_uid),
             data_evento=data_norm,
@@ -298,6 +333,22 @@ def _fetch_names(conn, sql: str) -> List[str]:
     return []
 
 
+def _fetch_dicts(conn, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    """Executa SELECT e devolve lista de dicts (coluna->valor)."""
+    with contextlib.suppress(Exception):
+        conn.row_factory = sqlite3.Row
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = {k: r[k] for k in r.keys()}
+            out.append(d)
+        # reset row_factory
+        conn.row_factory = None
+        return out
+    return []
+
+
 def _first_nonempty_from(conn, tables: Iterable[str], column: str = "nome") -> List[str]:
     """Retorna a primeira lista não-vazia de nomes dentre possíveis tabelas."""
     for t in tables:
@@ -342,22 +393,59 @@ def _try_get_bandeiras(conn) -> List[str]:
     return _first_nonempty_from(conn, ["bandeiras_cartao", "cartoes_bandeiras", "bandeiras"]) or DEFAULT_BANDEIRAS[:]
 
 
-def _try_get_categorias(conn) -> List[str]:
-    return _first_nonempty_from(conn, ["categorias_saida", "categorias", "cadastro_categorias_saida"])
+def _get_categorias_full(conn) -> List[Dict[str, Any]]:
+    """
+    Retorna categorias com IDs reais.
+    Preferência: categorias_saida(id, nome) -> fallback: categorias(nome) sem id.
+    """
+    cats = _fetch_dicts(
+        conn,
+        """
+        SELECT id, nome
+          FROM categorias_saida
+         WHERE COALESCE(TRIM(nome), '') <> ''
+         ORDER BY LOWER(TRIM(nome))
+        """,
+    )
+    if cats:
+        return cats
+    # Fallback sem id (gera id sintético na page, se necessário)
+    nomes = _first_nonempty_from(conn, ["categorias", "cadastro_categorias_saida"])
+    return [{"id": idx + 1, "nome": n} for idx, n in enumerate(nomes)]
 
 
-def _try_get_subcategorias(conn) -> List[str]:
-    return _first_nonempty_from(conn, ["subcategorias_saida", "subcategorias", "cadastro_subcategorias_saida"])
+def _get_subcategorias_full(conn) -> List[Dict[str, Any]]:
+    """
+    Retorna subcategorias com IDs reais e vínculo por categoria_id.
+    Preferência: subcategorias_saida(id, nome, categoria_id) -> fallback plano (sem vínculo).
+    """
+    subs = _fetch_dicts(
+        conn,
+        """
+        SELECT id, nome, categoria_id
+          FROM subcategorias_saida
+         WHERE COALESCE(TRIM(nome), '') <> ''
+         ORDER BY LOWER(TRIM(nome))
+        """,
+    )
+    if subs:
+        return subs
+    # Fallback sem relação
+    nomes = _first_nonempty_from(conn, ["subcategorias", "cadastro_subcategorias_saida"])
+    return [{"id": idx + 1, "nome": n, "categoria_id": None} for idx, n in enumerate(nomes)]
 
 
-def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str, List[str]]:
+def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str, Any]:
     """
     Carrega listas auxiliares para o formulário de Saída.
 
     Retorna dict com chaves:
-      - bancos, formas, origens_dinheiro, categorias, subcategorias, cartoes, bandeiras
+      - bancos, formas, origens_dinheiro, cartoes, bandeiras
+      - categorias: list[{'id','nome'}]
+      - subcategorias: list[{'id','nome','categoria_id'}]
+      - listar_subcategorias_por_categoria: Callable[[int|str|None], list[dict]]
     """
-    def _defaults():
+    def _defaults() -> Dict[str, Any]:
         return {
             "bancos": DEFAULT_BANCOS[:],
             "formas": DEFAULT_FORMAS[:],
@@ -366,35 +454,54 @@ def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str,
             "subcategorias": [],
             "cartoes": [],
             "bandeiras": DEFAULT_BANDEIRAS[:],
+            # Provider default (sem DB): filtra por categoria_id se existir
+            "listar_subcategorias_por_categoria": lambda categoria_id: [],
         }
 
-    # Validação forte do db_path (evita erros como slice(None,6,None))
     valid_path = isinstance(db_path, (str, bytes, bytearray)) and str(db_path).strip() != ""
-
     if not sqlite3 or not valid_path:
         return _defaults()
 
+    conn = None
     try:
         conn = _open_sqlite(str(db_path))
+
         bancos = _try_get_bancos(conn)
         cartoes = _try_get_cartoes(conn)
         bandeiras = _try_get_bandeiras(conn)
-        categorias = _try_get_categorias(conn)
-        subcategorias = _try_get_subcategorias(conn)
+        categorias = _get_categorias_full(conn)          # [{'id','nome'}]
+        subcategorias = _get_subcategorias_full(conn)    # [{'id','nome','categoria_id'}]
+
+        # Provider que respeita a relação categoria -> subcategorias (via FK)
+        def _provider_subs_por_categoria(categoria_id: Any) -> List[Dict[str, Any]]:
+            try:
+                if categoria_id in (None, "", 0, "0"):
+                    return []
+                # categoria_id pode vir como str; normaliza para int quando possível
+                try:
+                    cat_id = int(categoria_id)
+                except Exception:
+                    cat_id = categoria_id
+                return [s for s in subcategorias if s.get("categoria_id") == cat_id]
+            except Exception:
+                return []
+
         return {
             "bancos": bancos or DEFAULT_BANCOS[:],
             "formas": DEFAULT_FORMAS[:],
             "origens_dinheiro": DEFAULT_ORIGENS[:],
-            "categorias": categorias or [],
-            "subcategorias": subcategorias or [],
+            "categorias": categorias,
+            "subcategorias": subcategorias,
             "cartoes": cartoes or [],
             "bandeiras": bandeiras or DEFAULT_BANDEIRAS[:],
+            "listar_subcategorias_por_categoria": _provider_subs_por_categoria,
         }
     except Exception:
         return _defaults()
     finally:
         with contextlib.suppress(Exception):
-            conn.close()
+            if conn:
+                conn.close()
 
 
 # =============================================================================
