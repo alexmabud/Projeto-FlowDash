@@ -1,0 +1,6 @@
+# Dependências essenciais do FlowDash
+streamlit
+pandas
+plotly
+workalendar
+matplotlib

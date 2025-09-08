@@ -29,7 +29,8 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
 | `services/`             | Regras de negócio reutilizáveis (ex: cálculo de comissão, metas).        |
 | `ui/`                   | Componentes visuais e estilizações personalizadas com Streamlit.         |
 | `utils/`                | Funções auxiliares (formatação, datas úteis, hash de senha etc.).        |
-| `data/flowdash_data.db` | Banco de dados SQLite com as tabelas do sistema.                         |
+| `data/flowdash_data.db` | Banco de dados SQLite com as tabelas do sistema (ignorado no GitHub por conter dados reais). |
+| `data/flowdash_template.db` | Banco de dados vazio (somente esquema + usuário admin padrão).        |
 | `fluxograma/`           | Contém o diagrama do fluxo da aplicação (`Fluxograma FlowDash.png`).     |
 | `README.md`             | Apresentação geral do projeto (este arquivo).                            |
 | `README_ESTRUTURA.md`   | Explicação técnica da estrutura de pastas e organização do sistema.      |
@@ -42,24 +43,20 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
   - Administrador
   - Gerente
   - Vendedor
-
 - **Lançamentos do Dia**:
   - Cadastro de entradas
   - Cadastro de saídas
   - Transferência entre Caixas
-
 - **Cadastro**:
   - Usuários com ativação/desativação
   - Taxas de maquininhas por forma, bandeira e parcelas
   - Cartões de crédito (vencimento e fechamento)
   - Saldos bancários e de caixa
   - Metas por vendedor (diária, semanal, mensal e por nível)
-
 - **Fechamento de Caixa**:
   - Entradas confirmadas (com taxas aplicadas)
   - Saldo final esperado por caixa e banco
   - Correções manuais e controle de saldos acumulados
-
 - **Dashboard**: em construção  
 - **DRE (Demonstrativo de Resultado)**: em construção
 
@@ -75,10 +72,10 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
 
 ## 🛠️ Tecnologias Utilizadas
 
-- **Linguagem:** Python 3.10+
+- **Linguagem:** Python 3.12+
 - **Interface:** Streamlit
 - **Banco de Dados:** SQLite3
-- **Visualizações:** Plotly
+- **Visualizações:** Plotly / Matplotlib
 - **Manipulação de Dados:** Pandas
 - **Calendário de Feriados:** Workalendar (com suporte ao DF)
 - **Criptografia de Senhas:** hashlib (SHA-256)
@@ -88,45 +85,83 @@ Criar uma aplicação robusta, modular e escalável para controle financeiro, co
 
 ## 📦 Bibliotecas e Dependências
 
-| Biblioteca         | Tipo      | Finalidade                                                       |
-|--------------------|-----------|------------------------------------------------------------------|
-| `streamlit`        | Externa   | Interface gráfica interativa                                     |
-| `sqlite3`          | Nativa    | Acesso ao banco SQLite                                           |
-| `os`               | Nativa    | Manipulação de diretórios e caminhos                             |
-| `hashlib`          | Nativa    | Hash de senhas com SHA-256                                       |
-| `pandas`           | Externa   | Manipulação de dados financeiros (entradas, saídas, metas)       |
-| `re`               | Nativa    | Validação de expressões regulares (ex: senha forte)              |
-| `datetime`         | Nativa    | Cálculo de datas e períodos                                      |
-| `plotly.graph_objects` | Externa | Geração de gráficos interativos                                |
-| `workalendar.america.BrazilDistritoFederal` | Externa | Cálculo de dias úteis e feriados regionais (DF) |
+As dependências externas estão listadas no arquivo `requirements.txt`.
+
+Principais bibliotecas utilizadas:
+
+- `streamlit` → Interface gráfica interativa  
+- `pandas` → Manipulação de dados financeiros  
+- `plotly` → Geração de gráficos interativos  
+- `matplotlib` → Visualizações complementares  
+- `workalendar` → Cálculo de dias úteis e feriados regionais (DF)
 
 ---
 
 ## 📝 Banco de Dados
 
-- Arquivo: `data/flowdash_data.db`
-- Tabelas principais:
-  - `entrada`, `saida`
-  - `usuarios`, `taxas_maquinas`, `metas`
-  - `saldos_caixas`, `saldos_bancos`
-  - `correcao_caixa`, `fechamento_caixa`
-  - `cartoes_credito`, `fatura_cartao`
-  - `compras`, `contas_a_pagar`, `emprestimos_financiamentos`
+- Arquivo real: `data/flowdash_data.db` (**ignorado no GitHub**, pois contém dados reais).  
+- Arquivo modelo: `data/flowdash_template.db` (**incluso no repositório**, sem dados, apenas esquema e um usuário admin).  
+
+**Credenciais padrão do template:**
+- Usuário: `admin@local`
+- Senha: `admin`
+
+**Copiar o template para o banco ativo (obrigatório antes de rodar):**
+
+Windows (CMD):
+~~~bat
+if not exist data mkdir data
+copy /Y data\flowdash_template.db data\flowdash_data.db
+~~~
+
+Linux/Mac:
+~~~bash
+mkdir -p data
+cp -f data/flowdash_template.db data/flowdash_data.db
+~~~
 
 ---
 
 ## 🚀 Como Executar o Projeto
 
 1. Clone o repositório:
-```bash
-git clone https://github.com/seu-usuario/flowdash.git
-cd flowdash
-```
+   ~~~bash
+   git clone https://github.com/seu-usuario/flowdash.git
+   cd flowdash
+   ~~~
 
-2. Instale as dependências:
-```bash
-pip install -r requirements.txt
-```
+2. Crie e ative um ambiente virtual (recomendado):
+   ~~~bash
+   conda create -n flowdash python=3.12 -y
+   conda activate flowdash
+   ~~~
+   *(ou, se preferir venv: `python -m venv venv && venv\Scripts\activate` no Windows)*
+
+3. Instale as dependências:
+   ~~~bash
+   pip install -r requirements.txt
+   ~~~
+
+4. Prepare o banco de dados (copie o template para o ativo):
+
+Windows (CMD):
+~~~bat
+if not exist data mkdir data
+copy /Y data\flowdash_template.db data\flowdash_data.db
+~~~
+
+Linux/Mac:
+~~~bash
+mkdir -p data
+cp -f data/flowdash_template.db data/flowdash_data.db
+~~~
+
+5. Execute o sistema:
+   ~~~bash
+   streamlit run main.py
+   ~~~
+
+O navegador abrirá em `http://localhost:8501` (ou outra porta disponível).
 
 ---
 

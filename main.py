@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import importlib
 import inspect
+import traceback
 import streamlit as st
 
 from auth.auth import (
@@ -25,15 +26,22 @@ from utils.utils import garantir_trigger_totais_saldos_caixas
 # ======================================================================================
 st.set_page_config(page_title="FlowDash", layout="wide")
 
-# Caminho do banco de dados
-caminho_banco = os.path.join("data", "flowdash_data.db")
-os.makedirs("data", exist_ok=True)
+# Flag de debug (opcional): defina DEBUG_FLOWDASH=1 no ambiente para ver stacktraces
+DEBUG = os.environ.get("DEBUG_FLOWDASH", "0") in {"1", "true", "True"}
+
+# Caminho do banco de dados (mantido conforme seu projeto atual)
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+caminho_banco = os.path.join(DATA_DIR, "flowdash_data.db")
 
 # Infra mínima de BD (idempotente)
 try:
     garantir_trigger_totais_saldos_caixas(caminho_banco)
 except Exception as e:
-    st.warning(f"Trigger de totais não criada: {e}")
+    if DEBUG:
+        st.exception(e)
+    else:
+        st.warning(f"Trigger de totais não criada: {e}")
 
 
 # ======================================================================================
@@ -57,16 +65,20 @@ def _call_page(module_path: str):
       page_<tail>, show_<tail>, <seg> (se for callable)
     - fallbacks: 1ª função que comece com 'pagina_' ou 'render_'
 
-    Suporta parâmetros:
+    Provedor de parâmetros:
       - sempre fornece 'caminho_banco' se a função aceitar;
       - para outros parâmetros OBRIGATÓRIOS, usa valores do session_state se existirem;
         caso contrário preenche com None. Se o parâmetro for posicional/aceitar posicional,
-        passamos como **posicional** para evitar erro do tipo “missing required positional argument”.
+        passamos como posicional para evitar “missing required positional argument”.
     """
     try:
         mod = importlib.import_module(module_path)
     except Exception as e:
-        st.error(f"Falha ao importar módulo '{module_path}': {e}")
+        if DEBUG:
+            st.error(f"Falha ao importar módulo '{module_path}':")
+            st.exception(e)
+        else:
+            st.error(f"Falha ao importar módulo '{module_path}': {e}")
         return
 
     def _invoke(fn):
@@ -86,17 +98,12 @@ def _call_page(module_path: str):
         }
 
         # Construção obedecendo a ordem dos parâmetros
-        # Regra:
-        # - Se for 'caminho_banco', colocamos **posicional** (para não depender de keywords).
-        # - Se for obrigatório sem default e não houver valor no estado/conhecidos -> passamos None.
-        #   * Se o parâmetro for POSITIONAL_ONLY ou POSITIONAL_OR_KEYWORD -> vai em args (posicional).
-        #   * Se for KEYWORD_ONLY -> vai em kwargs.
         for p in sig.parameters.values():
             name = p.name
             kind = p.kind
             has_default = (p.default is not inspect._empty)
 
-            # 1) caminho_banco sempre fornecido
+            # 1) caminho_banco sempre fornecido (como posicional se possível)
             if name == "caminho_banco":
                 args.append(caminho_banco)
                 continue
@@ -104,7 +111,6 @@ def _call_page(module_path: str):
             # 2) valor conhecido/estado?
             if name in known:
                 val = known[name]
-                # preferir posicional quando o parâmetro aceita posicional
                 if kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
                     args.append(val)
                 else:
@@ -154,7 +160,11 @@ def _call_page(module_path: str):
             try:
                 return _invoke(fn)
             except Exception as e:
-                st.error(f"Erro ao executar {module_path}.{fn_name}: {e}")
+                if DEBUG:
+                    st.error(f"Erro ao executar {module_path}.{fn_name}:")
+                    st.exception(e)
+                else:
+                    st.error(f"Erro ao executar {module_path}.{fn_name}: {e}")
                 return
 
     # fallbacks: primeira função começando com 'pagina_' ou 'render_'
@@ -164,15 +174,30 @@ def _call_page(module_path: str):
                 try:
                     return _invoke(obj)
                 except Exception as e:
-                    st.error(f"Erro ao executar {module_path}.{name}: {e}")
+                    if DEBUG:
+                        st.error(f"Erro ao executar {module_path}.{name}:")
+                        st.exception(e)
+                    else:
+                        st.error(f"Erro ao executar {module_path}.{name}: {e}")
                     return
 
-    st.warning(f"O módulo '{module_path}' não possui função compatível (render/page/main/pagina*/show).")
+    # Loga de forma mais informativa quando não há entrypoint compatível
+    candidatos = [n for n, o in vars(mod).items() if callable(o)]
+    msg = (
+        f"O módulo '{module_path}' não possui função compatível "
+        f"(esperado: render/page/main/pagina*/show). "
+        f"Funções encontradas: {', '.join(candidatos) or 'nenhuma'}."
+    )
+    st.warning(msg)
 
 
 # ======================================================================================
 # LOGIN
 # ======================================================================================
+# Banner informativo do ambiente/banco (ajuda a evitar confusão entre dev/prod)
+with st.container():
+    st.caption(f"🗄️ Banco em uso: `{caminho_banco}`  •  DEBUG={'ON' if DEBUG else 'OFF'}")
+
 if not st.session_state.usuario_logado:
     st.title("🔐 Login")
 
@@ -182,7 +207,15 @@ if not st.session_state.usuario_logado:
         submitted = st.form_submit_button("Entrar")
 
         if submitted:
-            usuario = validar_login(email, senha, caminho_banco)
+            try:
+                usuario = validar_login(email, senha, caminho_banco)
+            except Exception as e:
+                if DEBUG:
+                    st.exception(e)
+                else:
+                    st.error(f"Erro no processo de login: {e}")
+                st.stop()
+
             if usuario:
                 st.session_state.usuario_logado = usuario
                 # Redirecionamento inicial por perfil

@@ -3,5 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# --- Pastas "data" (na raiz e em qualquer subpasta) ---
-data/
+# --- Banco de dados ---
+# Ignora o banco real com dados
+data/flowdash_data.db
+
+# Permite o template (vai para o GitHub)
+!data/flowdash_template.db
