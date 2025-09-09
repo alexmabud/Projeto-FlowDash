@@ -1,33 +1,33 @@
 # flowdash_pages/lancamentos/saida/actions_saida.py
 """
-Actions: Saídas (Dinheiro e Bancária)
+Actions de Saída (dinheiro e bancária).
 
-- Normaliza inputs e delega para `LedgerService.registrar_lancamento`.
-- Integra CAP (BOLETO/FATURA_CARTAO/EMPRESTIMO).
-- Mantém compatibilidade com funções/assinaturas antigas via aliases.
+Responsabilidades:
+- Normalizar entradas e delegar ao `LedgerService` (registrar saída em dinheiro ou bancária).
+- Integrar obrigações (FATURA_CARTAO, BOLETO, EMPRESTIMO).
+- Manter compatibilidade com chamadas antigas (aliases de parâmetros).
+- Garantir persistência de `Categoria`, `Sub_Categoria` e `Descricao` via fix-up pós-inserção.
 
-Retorno padrão das ações:
-- dict: { ok: bool, id_saida: int|None, id_mov: int|None, mensagem: str|None }
-
-Atualizações:
-- Carga de categorias/subcategorias agora busca IDs reais em:
-    • categorias_saida (id, nome)
-    • subcategorias_saida (id, nome, categoria_id)
-- Fornece provider: listar_subcategorias_por_categoria(categoria_id) -> list[dict]
-- registrar_saida_action agora enriquece a descrição com "[Categoria / Subcategoria]"
-  para refletir também em movimentacoes_bancarias.observacao.
+Retorno padrão:
+    dict: { ok: bool, id_saida: int|None, id_mov: int|None, mensagem: str|None }
 """
 
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, Tuple, List, Iterable, Callable
-from datetime import datetime
 import contextlib
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    import sqlite3
+except Exception:  # pragma: no cover
+    sqlite3 = None  # permite rodar sem sqlite em ambientes de teste
 
 from services.ledger.service_ledger import LedgerService
 
+
 # =============================================================================
-# Constantes de UI / defaults
+# Constantes (listas auxiliares para a UI)
 # =============================================================================
 DEFAULT_FORMAS = ["DINHEIRO", "PIX", "DÉBITO", "CRÉDITO", "BOLETO"]
 DEFAULT_ORIGENS = ["Caixa", "Caixa 2"]
@@ -39,14 +39,21 @@ DEFAULT_BANCOS = ["Banco 1", "Banco 2", "Banco 3", "Banco 4"]
 # Helpers de normalização
 # =============================================================================
 def _norm_str(v: Any) -> Optional[str]:
+    """Converte para str aparada; retorna None se vazio."""
     if v is None:
         return None
     s = str(v).strip()
     return s or None
 
 
+def _str_or_empty(v: Any) -> str:
+    """String aparada; retorna '' se vazio/None."""
+    s = _norm_str(v)
+    return s if s is not None else ""
+
+
 def _money(v: Any) -> float:
-    """Converte string BR/US em float. Heurística: último separador define decimal."""
+    """Converte valores BR/US em float. Usa o último separador como decimal."""
     if v is None:
         return 0.0
     if isinstance(v, (int, float)):
@@ -58,7 +65,7 @@ def _money(v: Any) -> float:
     try:
         if dot == -1 and comma == -1:
             return float(s)
-        if dot > comma:
+        if dot > comma:  # estilo 1.234,56 ou 1,234.56 -> considera '.' decimal
             return float(s.replace(",", ""))
         return float(s.replace(".", "").replace(",", "."))
     except Exception:
@@ -68,7 +75,7 @@ def _money(v: Any) -> float:
 
 
 def _norm_date(s: Optional[str]) -> str:
-    """YYYY-MM-DD. Aceita formatos comuns/ISO; se vazio/erro, usa hoje."""
+    """Normaliza para 'YYYY-MM-DD'. Se inválido/None, usa hoje."""
     if not s:
         return datetime.now().strftime("%Y-%m-%d")
     s = s.strip()
@@ -81,6 +88,7 @@ def _norm_date(s: Optional[str]) -> str:
 
 
 def _norm_forma(forma: Optional[str]) -> str:
+    """Normaliza a forma de pagamento para o padrão da aplicação."""
     f = (forma or "").strip().upper()
     if f == "DEBITO":
         return "DÉBITO"
@@ -95,7 +103,7 @@ def _resolve_obrigacao(
     obrigacao_id_boleto: Optional[int],
     obrigacao_id_emprestimo: Optional[int],
 ) -> Tuple[Optional[str], Optional[int]]:
-    """Resolve (tipo_obrigacao, obrigacao_id) com suporte a campos legados."""
+    """Resolve (tipo_obrigacao, obrigacao_id) aceitando campos legados."""
     t = _norm_str(tipo_obrigacao)
 
     oid: Optional[int] = None
@@ -118,38 +126,88 @@ def _resolve_obrigacao(
 
 
 # =============================================================================
+# Persistência auxiliar (fix-up em tabela `saida`)
+# =============================================================================
+def _open_sqlite(db_path: str):
+    """Abre conexão SQLite com pragmas seguros."""
+    conn = sqlite3.connect(db_path, timeout=30)
+    with contextlib.suppress(Exception):
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def _fixup_saida_row(
+    db_path: str,
+    saida_id: Optional[int],
+    categoria: str,
+    sub_categoria: str,
+    descricao: str,
+) -> None:
+    """Garante `Categoria`, `Sub_Categoria` e `Descricao` na linha recém-criada."""
+    if not sqlite3 or not saida_id:
+        return
+    try:
+        conn = _open_sqlite(db_path)
+        conn.execute(
+            """
+            UPDATE saida
+               SET Categoria     = COALESCE(?, Categoria),
+                   Sub_Categoria = COALESCE(?, Sub_Categoria),
+                   Descricao     = COALESCE(?, Descricao)
+             WHERE id = ?
+            """,
+            (categoria, sub_categoria, descricao, int(saida_id)),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+# =============================================================================
 # Ações principais
 # =============================================================================
 def registrar_saida_action(
     *,
     caminho_banco: str,
     valor: Any,
-    forma: Optional[str] = None,                 # "DINHEIRO" | "PIX" | "DÉBITO"
-    origem: Optional[str] = None,                # "Caixa"/"Caixa 2" (para DINHEIRO) ou nome da conta
-    banco: Optional[str] = None,                 # nome do banco/conta quando bancária
+    forma: Optional[str] = None,                 # "DINHEIRO" | "PIX" | "DÉBITO" | "CRÉDITO"
+    origem: Optional[str] = None,                # "Caixa"/"Caixa 2" ou nome da conta
+    banco: Optional[str] = None,                 # conta/banco (saídas bancárias)
+
+    # Aliases aceitos (compat com UI/rotas antigas)
     categoria: Optional[str] = None,
+    cat_nome: Optional[str] = None,
     subcategoria: Optional[str] = None,
+    sub_categoria: Optional[str] = None,
     descricao: Optional[str] = None,
+    descricao_final: Optional[str] = None,
+
     usuario: Optional[str] = None,
     data: Optional[str] = None,
     juros: Any = 0.0,
     multa: Any = 0.0,
     desconto: Any = 0.0,
     trans_uid: Optional[str] = None,
-    # Integração CAP (genérico + compat)
+    parcelas: Any = None,
+
+    # CAP
     tipo_obrigacao: Optional[str] = None,
     obrigacao_id: Optional[int] = None,
     obrigacao_id_fatura: Optional[int] = None,
     obrigacao_id_boleto: Optional[int] = None,
     obrigacao_id_emprestimo: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Normaliza os dados e delega ao `LedgerService.registrar_lancamento`.
+    """
+    Registra uma saída. Decide o fluxo:
+      - DINHEIRO  -> LedgerService.registrar_saida_dinheiro
+      - Bancária  -> LedgerService.registrar_saida_bancaria (PIX/DÉBITO/CRÉDITO)
 
-    Ajuste: a `descricao` é enriquecida com "[Categoria / Subcategoria]" para
-    que:
-      • saida.descricao armazene também a referência de classificação, e
-      • movimentacoes_bancarias.observacao traga esse complemento junto
-        com o que já aparece (o Ledger costuma usar essa mesma `descricao`).
+    Após gravar, aplica fix-up direto na tabela `saida` (defensivo).
     """
     valor_f = _money(valor)
     if valor_f <= 0:
@@ -157,6 +215,8 @@ def registrar_saida_action(
 
     data_norm = _norm_date(data)
     forma_norm = _norm_forma(forma)
+
+    # Resolver obrigação (mantém compat)
     tipo_obr, obr_id = _resolve_obrigacao(
         tipo_obrigacao=tipo_obrigacao,
         obrigacao_id=obrigacao_id,
@@ -165,47 +225,57 @@ def registrar_saida_action(
         obrigacao_id_emprestimo=obrigacao_id_emprestimo,
     )
 
-    # --- enriquecer descricao: "<descricao> [Categoria / Subcategoria]" ---
-    cat_str = _norm_str(categoria)
-    subcat_str = _norm_str(subcategoria)
-    desc_user = _norm_str(descricao)
-    sufixo_cat = None
-    if cat_str or subcat_str:
-        sufixo_cat = f"[{cat_str or '-'} / {subcat_str or '-'}]"
-
-    if desc_user and sufixo_cat:
-        descricao_enriquecida = f"{desc_user} {sufixo_cat}"
-    elif desc_user:
-        descricao_enriquecida = desc_user
-    elif sufixo_cat:
-        descricao_enriquecida = sufixo_cat
-    else:
-        descricao_enriquecida = None
+    # Normalização de campos textuais (somente o digitado; sem enriquecer descrição)
+    cat_str = _str_or_empty(categoria if _norm_str(categoria) else cat_nome)
+    subcat_str = _str_or_empty(subcategoria if _norm_str(subcategoria) else sub_categoria)
+    desc_user = _str_or_empty(descricao if _norm_str(descricao) else descricao_final)
 
     try:
         ledger = LedgerService(caminho_banco)
-        id_saida, id_mov = ledger.registrar_lancamento(
-            tipo_evento="SAIDA",
-            # Estes dois vão para as colunas categoria/subcategoria da tabela `saida`
-            categoria_evento=cat_str,
-            subcategoria_evento=subcat_str,
-            # Esta vai para saida.descricao e, tipicamente, para movimentacoes_bancarias.observacao
-            descricao=descricao_enriquecida,
-            # Demais campos
-            valor_evento=valor_f,
+
+        if forma_norm == "DINHEIRO":
+            id_saida, _ = ledger.registrar_saida_dinheiro(
+                data=data_norm,
+                valor=float(valor_f),
+                origem_dinheiro=_norm_str(origem) or "Caixa",
+                categoria=cat_str,
+                sub_categoria=subcat_str,
+                descricao=desc_user,
+                usuario=_norm_str(usuario) or "-",
+                juros=_money(juros),
+                multa=_money(multa),
+                desconto=_money(desconto),
+                trans_uid=_norm_str(trans_uid),
+                parcelas=parcelas,
+                obrigacao_id_fatura=obr_id if tipo_obr == "FATURA_CARTAO" else None,
+                obrigacao_id_boleto=obr_id if tipo_obr == "BOLETO" else None,
+                obrigacao_id_emprestimo=obr_id if tipo_obr == "EMPRESTIMO" else None,
+            )
+            _fixup_saida_row(caminho_banco, id_saida, cat_str, subcat_str, desc_user)
+            return {"ok": True, "id_saida": id_saida, "id_mov": None, "mensagem": None}
+
+        # Fluxo bancário (PIX/DÉBITO/CRÉDITO)
+        id_saida, id_mov = ledger.registrar_saida_bancaria(
+            data=data_norm,
+            valor=float(valor_f),
+            banco_nome=_norm_str(banco) or _norm_str(origem) or "Banco 1",
             forma=forma_norm,
-            origem=_norm_str(origem),
-            banco=_norm_str(banco),
+            categoria=cat_str,
+            sub_categoria=subcat_str,
+            descricao=desc_user,
+            usuario=_norm_str(usuario) or "-",
             juros=_money(juros),
             multa=_money(multa),
             desconto=_money(desconto),
-            usuario=_norm_str(usuario) or "-",
             trans_uid=_norm_str(trans_uid),
-            data_evento=data_norm,
-            tipo_obrigacao=tipo_obr,
-            obrigacao_id=obr_id,
+            parcelas=parcelas,
+            obrigacao_id_fatura=obr_id if tipo_obr == "FATURA_CARTAO" else None,
+            obrigacao_id_boleto=obr_id if tipo_obr == "BOLETO" else None,
+            obrigacao_id_emprestimo=obr_id if tipo_obr == "EMPRESTIMO" else None,
         )
+        _fixup_saida_row(caminho_banco, id_saida, cat_str, subcat_str, desc_user)
         return {"ok": True, "id_saida": id_saida, "id_mov": id_mov, "mensagem": None}
+
     except Exception as e:
         return {"ok": False, "mensagem": f"Falha ao registrar saída: {e}"}
 
@@ -214,31 +284,37 @@ def registrar_saida_dinheiro_action(
     *,
     caminho_banco: str,
     valor: Any,
-    origem_dinheiro: Optional[str] = None,      # "Caixa" | "Caixa 2"
+    origem_dinheiro: Optional[str] = None,
     categoria: Optional[str] = None,
+    cat_nome: Optional[str] = None,
     subcategoria: Optional[str] = None,
+    sub_categoria: Optional[str] = None,
     descricao: Optional[str] = None,
+    descricao_final: Optional[str] = None,
     usuario: Optional[str] = None,
     data: Optional[str] = None,
     juros: Any = 0.0,
     multa: Any = 0.0,
     desconto: Any = 0.0,
     trans_uid: Optional[str] = None,
-    # CAP
     tipo_obrigacao: Optional[str] = None,
     obrigacao_id: Optional[int] = None,
     obrigacao_id_fatura: Optional[int] = None,
     obrigacao_id_boleto: Optional[int] = None,
     obrigacao_id_emprestimo: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Convenience: força fluxo DINHEIRO."""
     return registrar_saida_action(
         caminho_banco=caminho_banco,
         valor=valor,
         forma="DINHEIRO",
         origem=origem_dinheiro or "Caixa",
         categoria=categoria,
+        cat_nome=cat_nome,
         subcategoria=subcategoria,
+        sub_categoria=sub_categoria,
         descricao=descricao,
+        descricao_final=descricao_final,
         usuario=usuario,
         data=data,
         juros=juros,
@@ -257,32 +333,38 @@ def registrar_saida_bancaria_action(
     *,
     caminho_banco: str,
     valor: Any,
-    forma: str,                                  # "PIX" | "DÉBITO" (aceita "DEBITO")
+    forma: str,                                  # "PIX" | "DÉBITO" | "CRÉDITO"
     banco_nome: Optional[str] = None,
     categoria: Optional[str] = None,
+    cat_nome: Optional[str] = None,
     subcategoria: Optional[str] = None,
+    sub_categoria: Optional[str] = None,
     descricao: Optional[str] = None,
+    descricao_final: Optional[str] = None,
     usuario: Optional[str] = None,
     data: Optional[str] = None,
     juros: Any = 0.0,
     multa: Any = 0.0,
     desconto: Any = 0.0,
     trans_uid: Optional[str] = None,
-    # CAP
     tipo_obrigacao: Optional[str] = None,
     obrigacao_id: Optional[int] = None,
     obrigacao_id_fatura: Optional[int] = None,
     obrigacao_id_boleto: Optional[int] = None,
     obrigacao_id_emprestimo: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """Convenience: fluxo bancário (PIX/DÉBITO/CRÉDITO)."""
     return registrar_saida_action(
         caminho_banco=caminho_banco,
         valor=valor,
         forma=forma,
         banco=banco_nome,
         categoria=categoria,
+        cat_nome=cat_nome,
         subcategoria=subcategoria,
+        sub_categoria=sub_categoria,
         descricao=descricao,
+        descricao_final=descricao_final,
         usuario=usuario,
         data=data,
         juros=juros,
@@ -298,25 +380,10 @@ def registrar_saida_bancaria_action(
 
 
 # =============================================================================
-# SQLite utilitários para a UI (listas)
+# Utilitários de listas para o formulário
 # =============================================================================
-try:
-    import sqlite3
-except Exception:  # pragma: no cover
-    sqlite3 = None  # permite rodar sem sqlite em ambientes de teste
-
-
-def _open_sqlite(db_path: str):
-    conn = sqlite3.connect(db_path, timeout=30)
-    with contextlib.suppress(Exception):
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA busy_timeout=30000;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
-
-
 def _fetch_names(conn, sql: str) -> List[str]:
-    """Executa SELECT de uma coluna e devolve lista de strings limpas."""
+    """Executa SELECT de única coluna e retorna lista de strings limpas."""
     with contextlib.suppress(Exception):
         cur = conn.execute(sql)
         rows = cur.fetchall()
@@ -334,23 +401,19 @@ def _fetch_names(conn, sql: str) -> List[str]:
 
 
 def _fetch_dicts(conn, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-    """Executa SELECT e devolve lista de dicts (coluna->valor)."""
+    """Executa SELECT e retorna lista de dicts (coluna->valor)."""
     with contextlib.suppress(Exception):
         conn.row_factory = sqlite3.Row
         cur = conn.execute(sql, params)
         rows = cur.fetchall()
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            d = {k: r[k] for k in r.keys()}
-            out.append(d)
-        # reset row_factory
+        out = [{k: r[k] for k in r.keys()} for r in rows]
         conn.row_factory = None
         return out
     return []
 
 
 def _first_nonempty_from(conn, tables: Iterable[str], column: str = "nome") -> List[str]:
-    """Retorna a primeira lista não-vazia de nomes dentre possíveis tabelas."""
+    """Retorna a primeira lista não-vazia de nomes dentre tabelas candidatas."""
     for t in tables:
         lst = _fetch_names(
             conn,
@@ -367,21 +430,16 @@ def _first_nonempty_from(conn, tables: Iterable[str], column: str = "nome") -> L
 
 
 def _try_get_bancos(conn) -> List[str]:
-    # 1) Tabelas de cadastro
     lst = _first_nonempty_from(conn, ["cadastro_bancos", "bancos"])
     if lst:
         return lst
-
-    # 2) Heurística via tabela de saldos: usa nomes das colunas como bancos
     with contextlib.suppress(Exception):
         cur = conn.execute("PRAGMA table_info('saldos_bancos')")
-        colunas = [c[1] for c in cur.fetchall()]  # (cid, name, type, notnull, dflt, pk)
+        colunas = [c[1] for c in cur.fetchall()]
         ignorar = {"id", "data", "created_at", "updated_at"}
         candidatos = [c for c in colunas if c not in ignorar]
         if candidatos:
             return sorted(candidatos, key=lambda s: s.lower().strip())
-
-    # 3) Fallback
     return DEFAULT_BANCOS[:]
 
 
@@ -394,10 +452,7 @@ def _try_get_bandeiras(conn) -> List[str]:
 
 
 def _get_categorias_full(conn) -> List[Dict[str, Any]]:
-    """
-    Retorna categorias com IDs reais.
-    Preferência: categorias_saida(id, nome) -> fallback: categorias(nome) sem id.
-    """
+    """Retorna categorias com IDs reais; fallback para nomes simples."""
     cats = _fetch_dicts(
         conn,
         """
@@ -409,16 +464,12 @@ def _get_categorias_full(conn) -> List[Dict[str, Any]]:
     )
     if cats:
         return cats
-    # Fallback sem id (gera id sintético na page, se necessário)
     nomes = _first_nonempty_from(conn, ["categorias", "cadastro_categorias_saida"])
     return [{"id": idx + 1, "nome": n} for idx, n in enumerate(nomes)]
 
 
 def _get_subcategorias_full(conn) -> List[Dict[str, Any]]:
-    """
-    Retorna subcategorias com IDs reais e vínculo por categoria_id.
-    Preferência: subcategorias_saida(id, nome, categoria_id) -> fallback plano (sem vínculo).
-    """
+    """Retorna subcategorias com FK de categoria; fallback plano."""
     subs = _fetch_dicts(
         conn,
         """
@@ -430,16 +481,15 @@ def _get_subcategorias_full(conn) -> List[Dict[str, Any]]:
     )
     if subs:
         return subs
-    # Fallback sem relação
     nomes = _first_nonempty_from(conn, ["subcategorias", "cadastro_subcategorias_saida"])
     return [{"id": idx + 1, "nome": n, "categoria_id": None} for idx, n in enumerate(nomes)]
 
 
-def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str, Any]:
+def carregar_listas_para_form(db_path: str | None = None, *_: Any, **__: Any) -> Dict[str, Any]:
     """
     Carrega listas auxiliares para o formulário de Saída.
 
-    Retorna dict com chaves:
+    Retorna dict:
       - bancos, formas, origens_dinheiro, cartoes, bandeiras
       - categorias: list[{'id','nome'}]
       - subcategorias: list[{'id','nome','categoria_id'}]
@@ -454,8 +504,7 @@ def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str,
             "subcategorias": [],
             "cartoes": [],
             "bandeiras": DEFAULT_BANDEIRAS[:],
-            # Provider default (sem DB): filtra por categoria_id se existir
-            "listar_subcategorias_por_categoria": lambda categoria_id: [],
+            "listar_subcategorias_por_categoria": lambda _categoria_id=None: [],
         }
 
     valid_path = isinstance(db_path, (str, bytes, bytearray)) and str(db_path).strip() != ""
@@ -469,15 +518,13 @@ def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str,
         bancos = _try_get_bancos(conn)
         cartoes = _try_get_cartoes(conn)
         bandeiras = _try_get_bandeiras(conn)
-        categorias = _get_categorias_full(conn)          # [{'id','nome'}]
-        subcategorias = _get_subcategorias_full(conn)    # [{'id','nome','categoria_id'}]
+        categorias = _get_categorias_full(conn)
+        subcategorias = _get_subcategorias_full(conn)
 
-        # Provider que respeita a relação categoria -> subcategorias (via FK)
         def _provider_subs_por_categoria(categoria_id: Any) -> List[Dict[str, Any]]:
             try:
                 if categoria_id in (None, "", 0, "0"):
                     return []
-                # categoria_id pode vir como str; normaliza para int quando possível
                 try:
                     cat_id = int(categoria_id)
                 except Exception:
@@ -505,10 +552,10 @@ def carregar_listas_para_form(db_path: str | None = None, *_, **__) -> Dict[str,
 
 
 # =============================================================================
-# Shims de compatibilidade (APIs antigas usadas pela page_lancamentos)
+# Compatibilidade (APIs antigas)
 # =============================================================================
 def _spread_args_to_kwargs(args: tuple, kwargs: dict, order: List[str]) -> dict:
-    """Mapeia args posicionais para kwargs seguindo 'order', sem sobrescrever chaves já existentes."""
+    """Mapeia args posicionais para kwargs seguindo `order`, sem sobrescrever já passados."""
     out = dict(kwargs)
     for i, v in enumerate(args):
         if i < len(order) and order[i] not in out:
@@ -517,13 +564,7 @@ def _spread_args_to_kwargs(args: tuple, kwargs: dict, order: List[str]) -> dict:
 
 
 def registrar_saida(*args, **kwargs):
-    """
-    Alias compatível da API antiga.
-    Ordem posicional aceita:
-      caminho_banco, valor, forma, origem, banco, categoria, subcategoria, descricao,
-      usuario, data, juros, multa, desconto, trans_uid,
-      tipo_obrigacao, obrigacao_id, obrigacao_id_fatura, obrigacao_id_boleto, obrigacao_id_emprestimo
-    """
+    """Compat: aceita ordem posicional antiga e aliases de chaves."""
     order = [
         "caminho_banco", "valor", "forma", "origem", "banco",
         "categoria", "subcategoria", "descricao", "usuario", "data",
@@ -533,7 +574,15 @@ def registrar_saida(*args, **kwargs):
     ]
     kw = _spread_args_to_kwargs(args, kwargs, order)
 
-    # Sinônimos
+    # Aliases vindos do form/page
+    if "categoria" not in kw and "cat_nome" in kw:
+        kw["categoria"] = kw.get("cat_nome")
+    if "subcategoria" not in kw and "sub_categoria" in kw:
+        kw["subcategoria"] = kw.get("sub_categoria")
+    if "descricao" not in kw and "descricao_final" in kw:
+        kw["descricao"] = kw.get("descricao_final")
+
+    # Aliases de origem/banco
     if "origem" not in kw and "origem_dinheiro" in kw:
         kw["origem"] = kw.get("origem_dinheiro")
     if "banco" not in kw and "banco_nome" in kw:
@@ -543,7 +592,7 @@ def registrar_saida(*args, **kwargs):
 
 
 def registrar_saida_dinheiro(*args, **kwargs):
-    """Alias compatível: força forma 'DINHEIRO' e usa 'origem_dinheiro' se fornecida."""
+    """Compat: força forma 'DINHEIRO' e usa 'origem_dinheiro' se fornecida."""
     order = [
         "caminho_banco", "valor", "origem_dinheiro",
         "categoria", "subcategoria", "descricao", "usuario", "data",
@@ -552,6 +601,14 @@ def registrar_saida_dinheiro(*args, **kwargs):
         "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
     ]
     kw = _spread_args_to_kwargs(args, kwargs, order)
+
+    if "categoria" not in kw and "cat_nome" in kw:
+        kw["categoria"] = kw.get("cat_nome")
+    if "subcategoria" not in kw and "sub_categoria" in kw:
+        kw["subcategoria"] = kw.get("sub_categoria")
+    if "descricao" not in kw and "descricao_final" in kw:
+        kw["descricao"] = kw.get("descricao_final")
+
     kw.setdefault("forma", "DINHEIRO")
     if "origem" not in kw and "origem_dinheiro" in kw:
         kw["origem"] = kw.get("origem_dinheiro")
@@ -559,7 +616,7 @@ def registrar_saida_dinheiro(*args, **kwargs):
 
 
 def registrar_saida_bancaria(*args, **kwargs):
-    """Alias compatível para saídas bancárias (PIX/DÉBITO)."""
+    """Compat: fluxo bancário (PIX/DÉBITO/CRÉDITO)."""
     order = [
         "caminho_banco", "valor", "forma", "banco_nome",
         "categoria", "subcategoria", "descricao", "usuario", "data",
@@ -568,6 +625,14 @@ def registrar_saida_bancaria(*args, **kwargs):
         "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
     ]
     kw = _spread_args_to_kwargs(args, kwargs, order)
+
+    if "categoria" not in kw and "cat_nome" in kw:
+        kw["categoria"] = kw.get("cat_nome")
+    if "subcategoria" not in kw and "sub_categoria" in kw:
+        kw["subcategoria"] = kw.get("sub_categoria")
+    if "descricao" not in kw and "descricao_final" in kw:
+        kw["descricao"] = kw.get("descricao_final")
+
     if "banco" not in kw and "banco_nome" in kw:
         kw["banco"] = kw.get("banco_nome")
     return registrar_saida_action(**kw)
@@ -578,7 +643,7 @@ __all__ = [
     "registrar_saida_dinheiro_action",
     "registrar_saida_bancaria_action",
     "carregar_listas_para_form",
-    # aliases antigos:
+    # compat:
     "registrar_saida",
     "registrar_saida_dinheiro",
     "registrar_saida_bancaria",

@@ -2,16 +2,15 @@
 """
 Página principal da Saída — monta layout e aciona forms/actions.
 
-Comportamentos mantidos do original:
+Mantém:
 - Toggle do formulário (botão "🔴 Saída")
-- Campos e fluxos idênticos (inclui Pagamentos: Fatura/Boletos/Empréstimos)
-- Validações e mensagens
-- `st.rerun()` após sucesso
+- Campos/fluxos idênticos (inclui Pagamentos: Fatura/Boletos/Empréstimos)
+- Validações e `st.rerun()` após sucesso
 
-Compatibilidade:
+Compat:
 - Aceita `carregar_listas_para_form` como dict (novo) ou tupla/list (6/8 itens legado).
-- Converte categorias/subcategorias para DataFrame com colunas ['id','nome'].
-- Chama o `render_form_saida` apenas UMA vez (evita keys duplicadas tipo 'valor_saida').
+- Converte categorias/subcategorias para DataFrame com colunas ['id', 'nome'].
+- Chama `render_form_saida` apenas UMA vez (evita keys duplicadas).
 """
 
 from __future__ import annotations
@@ -39,6 +38,7 @@ ListProvider = Callable[..., list | pd.DataFrame]
 
 # ----------------- helpers -----------------
 def _norm_date(d: Any) -> _dt.date:
+    """Coerção segura para date."""
     return coerce_data(d)
 
 
@@ -47,6 +47,7 @@ def _coalesce_state(
     caminho_banco: Optional[str],
     data_lanc: Optional[Any],
 ) -> Tuple[str, _dt.date]:
+    """Extrai db_path e data do state/args com fallback."""
     db = None
     dt = None
     if state is not None:
@@ -64,9 +65,11 @@ def _coalesce_state(
 
 
 def _as_df_id_nome(obj: Any) -> pd.DataFrame:
-    """Converte entrada em DataFrame padronizado com colunas ['id','nome'].
+    """Padroniza entrada em DataFrame ['id','nome'].
+
+    Regras:
     - Se já existir 'id', NÃO reinserimos (evita 'cannot insert id, already exists').
-    - Garante presença de 'nome' (tenta renomear 1ª coluna ou 'category' -> 'nome').
+    - Garante presença de 'nome' (renomeia 1ª coluna ou 'category' -> 'nome').
     """
     if isinstance(obj, pd.DataFrame):
         df = obj.copy()
@@ -115,10 +118,10 @@ def _as_df_id_nome(obj: Any) -> pd.DataFrame:
 
 
 def _wrap_provider_df(provider: ListProvider) -> Callable[..., pd.DataFrame]:
-    """Envolve provider (que pode aceitar args/kwargs) e sempre retorna DataFrame ['id','nome']."""
+    """Envolve provider (pode aceitar args/kwargs) e retorna DataFrame ['id','nome'].""" 
     def _wrapped(*args, **kwargs) -> pd.DataFrame:
         try:
-            raw = provider(*args, **kwargs)  # provider que aceita args (ex.: categoria_id)
+            raw = provider(*args, **kwargs)  # ex.: provider(categoria_id)
         except TypeError:
             raw = provider()                 # provider sem args
         return _as_df_id_nome(raw)
@@ -126,7 +129,7 @@ def _wrap_provider_df(provider: ListProvider) -> Callable[..., pd.DataFrame]:
 
 
 def _get_nome_por_id(df: pd.DataFrame, _id: Any) -> Optional[str]:
-    """Busca o nome pelo id em um DF ['id','nome']."""
+    """Resolve o nome pelo id em um DF ['id','nome'].""" 
     if df is None or _id in (None, "", 0, "0"):
         return None
     try:
@@ -149,81 +152,103 @@ def _payload_to_kwargs(
     categorias_df: pd.DataFrame,
     listar_subcategorias_fn: Callable[..., pd.DataFrame],
 ) -> Dict[str, Any]:
-    """Traduz o payload do form para o formato aceito por `registrar_saida`/action."""
-    # Campos base
+    """Traduz o payload do form para os kwargs aceitos por `registrar_saida`."""
+    # Valores básicos
     valor = payload.get("valor_saida") or payload.get("valor") or 0
-    forma = payload.get("forma_pagamento_sel") or payload.get("forma")
-    origem = payload.get("origem_dinheiro_sel") or payload.get("origem")
-    banco = payload.get("banco_sel") or payload.get("banco")
-    descricao = payload.get("descricao") or payload.get("observacao") or payload.get("obs")
+    forma = payload.get("forma_pagamento") or payload.get("forma_pagamento_sel") or payload.get("forma")
+    origem = payload.get("origem_dinheiro") or payload.get("origem_dinheiro_sel") or payload.get("origem")
+    banco = payload.get("banco_escolhido") or payload.get("banco_sel") or payload.get("banco")
+
+    # Descrição: somente o texto digitado
+    descricao = (
+        payload.get("descricao")
+        or payload.get("descricao_final")
+        or payload.get("observacao")
+        or payload.get("obs")
+        or ""
+    )
+
     juros = payload.get("juros") or 0
     multa = payload.get("multa") or 0
     desconto = payload.get("desconto") or 0
-    trans_uid = payload.get("trans_uid")
+    trans_uid = payload.get("trans_uid") or payload.get("uid") or None
 
-    # Categoria/subcategoria — tentar por nome direto; se vier id, resolver nome pelo DF/provider
-    categoria_nome = (
-        payload.get("categoria_nome")
-        or payload.get("categoria")
-        or payload.get("categoria_sel_nome")
-    )
+    # Categoria
+    categoria_nome = payload.get("categoria") or payload.get("cat_nome") or payload.get("categoria_nome")
     if not categoria_nome:
-        cat_id = payload.get("categoria_id") or payload.get("categoria_sel") or payload.get("categoria_sel_id")
+        cat_id = (
+            payload.get("cat_id")
+            or payload.get("categoria_id")
+            or payload.get("categoria_sel")
+            or payload.get("categoria_sel_id")
+        )
         categoria_nome = _get_nome_por_id(categorias_df, cat_id)
 
+    # Id da categoria para filtrar subcategorias relacionadas
+    try:
+        cat_id_int = int(
+            payload.get("cat_id")
+            or payload.get("categoria_id")
+            or payload.get("categoria_sel")
+            or payload.get("categoria_sel_id")
+            or 0
+        ) or None
+    except Exception:
+        cat_id_int = None
+
+    # Subcategoria
     subcategoria_nome = (
-        payload.get("subcategoria_nome")
+        payload.get("sub_categoria")
+        or payload.get("subcat_nome")
         or payload.get("subcategoria")
-        or payload.get("subcategoria_sel_nome")
+        or payload.get("subcategoria_nome")
     )
     if not subcategoria_nome:
-        sub_id = payload.get("subcategoria_id") or payload.get("subcategoria_sel") or payload.get("subcategoria_sel_id")
-        # Se temos categoria_id, dá para montar DF de subcats certas e resolver nome por id
-        cat_id = payload.get("categoria_id") or payload.get("categoria_sel") or payload.get("categoria_sel_id")
+        sub_id = (
+            payload.get("subcategoria_id")
+            or payload.get("subcategoria_sel")
+            or payload.get("subcategoria_sel_id")
+        )
         try:
-            cat_id_int = int(cat_id) if cat_id not in (None, "", 0, "0") else None
+            subs_df = listar_subcategorias_fn(cat_id_int) if cat_id_int else pd.DataFrame(columns=["id", "nome"])
         except Exception:
-            cat_id_int = None
-        subcats_df = listar_subcategorias_fn(cat_id_int) if cat_id_int else pd.DataFrame(columns=["id", "nome"])
-        subcategoria_nome = _get_nome_por_id(subcats_df, sub_id)
+            subs_df = pd.DataFrame(columns=["id", "nome"])
+        subcategoria_nome = _get_nome_por_id(subs_df, sub_id)
 
     # Integração CAP (Pagamentos)
     tipo_pag = (payload.get("tipo_pagamento_sel") or "").strip()
     tipo_obrigacao = None
     obrigacao_id = None
-
     if payload.get("is_pagamentos"):
-        # mapear para nomenclatura esperada pela action
         mapa = {
             "Fatura Cartão de Crédito": "FATURA_CARTAO",
             "Boletos": "BOLETO",
-            "Empréstimos": "EMPRESTIMO",
-            "Emprestimos": "EMPRESTIMO",
+            "Empréstimos e Financiamentos": "EMPRESTIMO",
+            "Emprestimos e Financiamentos": "EMPRESTIMO",
         }
-        tipo_obrigacao = mapa.get(tipo_pag) or None
-        # tentar capturar um id de destino/obrigação
+        tipo_obrigacao = mapa.get(tipo_pag) or payload.get("tipo_obrigacao")
         obrigacao_id = (
-            payload.get("destino_pagamento_id")
+            payload.get("obrigacao_id_fatura")
+            or payload.get("obrigacao_id_boleto")
+            or payload.get("obrigacao_id_emprestimo")
+            or payload.get("parcela_obrigacao_id")
             or payload.get("obrigacao_id")
-            or payload.get("id_destino_pagamento")
-            or payload.get("id_obrigacao")
         )
-        # coerção simples
         try:
             obrigacao_id = int(obrigacao_id) if obrigacao_id not in (None, "", 0, "0") else None
         except Exception:
             obrigacao_id = None
 
+    # Kwargs finais para action
     return {
-        "caminho_banco": payload.get("caminho_banco") or "",  # será sobrescrito pelo chamador
         "valor": valor,
-        "forma": forma,
-        "origem": origem,
-        "banco": banco,
-        "categoria": categoria_nome,
-        "subcategoria": subcategoria_nome,
-        "descricao": descricao,
-        "usuario": usuario_nome,
+        "forma": (forma or "").strip(),
+        "origem": (origem or "").strip(),
+        "banco": (banco or "").strip(),
+        "categoria": (categoria_nome or "").strip(),
+        "subcategoria": (subcategoria_nome or "").strip(),
+        "descricao": (descricao or "").strip(),
+        "usuario": (usuario_nome or "-").strip(),
         "data": data_lanc.strftime("%Y-%m-%d"),
         "juros": juros,
         "multa": multa,
@@ -258,30 +283,26 @@ def render_saida(
     usuario: Dict[str, Any] = st.session_state.get("usuario_logado", {"nome": "Sistema"})
     usuario_nome: str = usuario.get("nome", "Sistema")
 
-    # Carregar listas (compat dict/6/8) e padronizar para DF quando necessário
+    # Providers/listas
     try:
         carregado = carregar_listas_para_form(_db_path)
 
         if isinstance(carregado, dict):
-            # Dict (implementação atual de actions_saida)
             nomes_bancos = list(carregado.get("bancos", []))
             nomes_cartoes = list(carregado.get("cartoes", []))
             categorias_df = _as_df_id_nome(carregado.get("categorias", []))
 
-            # provider RELACIONAL (categoria_id -> subcategorias)
             subprov = carregado.get("listar_subcategorias_por_categoria")
             if not callable(subprov):
                 subprov = lambda categoria_id=None: []
-            listar_subcategorias_fn = _wrap_provider_df(subprov)  # aceita *args/**kwargs
+            listar_subcategorias_fn = _wrap_provider_df(subprov)
 
-            # demais providers herdados (legado)
             listar_destinos_fatura_em_aberto_fn = lambda: []
             carregar_opcoes_pagamentos_fn = lambda: []
             listar_boletos_em_aberto_fn = lambda: []
             listar_empfin_em_aberto_fn = lambda: []
 
         elif isinstance(carregado, (list, tuple)) and len(carregado) >= 8:
-            # Formato novo (8 itens)
             (
                 nomes_bancos,
                 nomes_cartoes,
@@ -296,7 +317,6 @@ def render_saida(
             listar_subcategorias_fn = _wrap_provider_df(listar_subcategorias_fn)
 
         else:
-            # Formato antigo (6 itens)
             (
                 nomes_bancos,
                 nomes_cartoes,
@@ -314,7 +334,7 @@ def render_saida(
         st.error(f"❌ Falha ao preparar formulário: {e}")
         return
 
-    # Render UI (chama só UMA vez — evita duplicar widgets e keys)
+    # Render UI (apenas uma chamada — evita duplicar widgets/keys)
     def _render_form_saida_compat() -> Dict[str, Any]:
         sig = inspect.signature(render_form_saida)
         params = sig.parameters
@@ -324,8 +344,8 @@ def render_saida(
             invalidate_cb=invalidate_confirm,
             nomes_bancos=nomes_bancos,
             nomes_cartoes=nomes_cartoes,
-            categorias_df=categorias_df,                      # DF ['id','nome']
-            listar_subcategorias_fn=listar_subcategorias_fn,  # provider -> DF ['id','nome']
+            categorias_df=categorias_df,
+            listar_subcategorias_fn=listar_subcategorias_fn,
             listar_destinos_fatura_em_aberto_fn=listar_destinos_fatura_em_aberto_fn,
             carregar_opcoes_pagamentos_fn=carregar_opcoes_pagamentos_fn,
         )
@@ -350,47 +370,44 @@ def render_saida(
         st.warning("⚠️ Confirme os dados antes de salvar.")
         return
 
-    # Execução com rastreio
-    from shared.debug_trace import debug_wrap_ctx
-    with debug_wrap_ctx("Salvar Saída"):
-        try:
-            # Traduz o payload para os kwargs esperados pela action
-            kw = _payload_to_kwargs(
-                payload=payload,
-                data_lanc=_data_lanc,
-                usuario_nome=usuario_nome,
-                categorias_df=categorias_df,
-                listar_subcategorias_fn=listar_subcategorias_fn,
-            )
-            kw["caminho_banco"] = _db_path  # garante caminho do banco correto
+    # Execução
+    try:
+        kw = _payload_to_kwargs(
+            payload=payload,
+            data_lanc=_data_lanc,
+            usuario_nome=usuario_nome,
+            categorias_df=categorias_df,
+            listar_subcategorias_fn=listar_subcategorias_fn,
+        )
+        kw["caminho_banco"] = _db_path
 
-            res = registrar_saida(**kw)
+        res = registrar_saida(**kw)
 
-        except ValueError:
-            st.warning("Valor do pagamento maior que valor da fatura.")
-            return
-        except Exception as e:
-            st.error("Erro ao registrar a saída.")
-            st.exception(e)
-            return
+    except ValueError:
+        st.warning("Valor do pagamento maior que valor da fatura.")
+        return
+    except Exception as e:
+        st.error("Erro ao registrar a saída.")
+        st.exception(e)
+        return
 
-        msg_ok = res.get("mensagem", "") if isinstance(res, dict) else str(res)
-        if isinstance(res, dict) and res.get("ok") and not msg_ok:
-            msg_ok = "Saída registrada com sucesso."
+    msg_ok = res.get("mensagem", "") if isinstance(res, dict) else str(res)
+    if isinstance(res, dict) and res.get("ok") and not msg_ok:
+        msg_ok = "Saída registrada com sucesso."
 
-        if isinstance(payload, dict) and payload.get("is_pagamentos") and payload.get("tipo_pagamento_sel") == "Fatura Cartão de Crédito":
-            if "idempotência" not in str(msg_ok) and "já registrada" not in str(msg_ok):
-                valor_pag = float(payload.get("valor_saida") or 0.0)
-                msg_ok = f"Pagamento de fatura registrado! Pago: R$ {valor_pag:.2f}"
+    if isinstance(payload, dict) and payload.get("is_pagamentos") and payload.get("tipo_pagamento_sel") == "Fatura Cartão de Crédito":
+        if "idempotência" not in str(msg_ok) and "já registrada" not in str(msg_ok):
+            valor_pag = float(payload.get("valor_saida") or 0.0)
+            msg_ok = f"Pagamento de fatura registrado! Pago: R$ {valor_pag:.2f}"
 
-        st.session_state["msg_ok"] = msg_ok
+    st.session_state["msg_ok"] = msg_ok
 
-        if isinstance(payload, dict) and payload.get("is_pagamentos") and payload.get("tipo_pagamento_sel") != "Boletos":
-            st.info(
-                f"Destino classificado: {payload.get('tipo_pagamento_sel')} → "
-                f"{payload.get('destino_pagamento_sel') or '—'}"
-            )
+    if isinstance(payload, dict) and payload.get("is_pagamentos") and payload.get("tipo_pagamento_sel") != "Boletos":
+        st.info(
+            f"Destino classificado: {payload.get('tipo_pagamento_sel')} → "
+            f"{payload.get('destino_pagamento_sel') or '—'}"
+        )
 
-        st.session_state.form_saida = False
-        st.success(msg_ok)
-        st.rerun()
+    st.session_state.form_saida = False
+    st.success(msg_ok)
+    st.rerun()

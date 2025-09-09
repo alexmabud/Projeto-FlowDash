@@ -1,13 +1,18 @@
 # services/ledger/service_ledger.py
 """
-Fachada do Ledger — agrega mixins de forma robusta (compat),
-com resolução dinâmica para reduzir acoplamento entre refactors.
+LedgerService
+=============
 
-Principais pontos:
-- Repositórios resolvidos via importlib (evita que Pylance aponte import estático quebrado).
-- Mixins resolvidos com fallbacks e shims pontuais (mantém API pública).
-- API preservada: registrar_saida_boleto, pagar_parcela_boleto,
-  pagar_fatura_cartao/pagar_fatura, programar_emprestimo/pagar_parcela_emprestimo, etc.
+Fachada do Ledger que compõe mixins/serviços e delega as operações:
+
+- Saídas (dinheiro/bancária) via `_SaidasLedgerMixin`
+- Crédito / Fatura / Empréstimo / Boleto via serviços específicos
+- Repositórios resolvidos dinamicamente (evita acoplamento rígido)
+
+Notas:
+- Não reimplementa a lógica de `registrar_saida_*`: apenas delega.
+- Aplica fix-up pós-inserção em `saida` (Categoria, Sub_Categoria, Descricao).
+- Mantém compat com chamadas antigas e serviços opcionais.
 """
 
 from __future__ import annotations
@@ -28,12 +33,11 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_CURRENT_DIR, "..", ".."))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-
 # =====================================================================
-# Utils: resolução dinâmica de símbolos (classes) com fallbacks
+# Resolução dinâmica de símbolos (classes)
 # =====================================================================
 def _resolve_symbol(mod_names: list[str], attr_candidates: list[str]) -> Optional[Type[Any]]:
-    """Tenta obter uma classe pesquisando, na ordem, módulos e nomes de atributos."""
+    """Retorna a primeira classe encontrada dentre módulos/atributos candidatos."""
     for mod in mod_names:
         try:
             m = importlib.import_module(mod)
@@ -46,12 +50,8 @@ def _resolve_symbol(mod_names: list[str], attr_candidates: list[str]) -> Optiona
     return None
 
 
-def _resolve_mixin(
-    primary_mods: list[str],
-    primary_attrs: list[str],
-    fallback: Optional[Type[Any]] = None,
-) -> Type[Any]:
-    """Resolve um mixin por nome de módulo/atributo com fallback opcional."""
+def _resolve_mixin(primary_mods: list[str], primary_attrs: list[str], fallback: Optional[Type[Any]] = None) -> Type[Any]:
+    """Resolve um mixin; se não encontrar, retorna um mixin vazio."""
     cls = _resolve_symbol(primary_mods, primary_attrs)
     return cls or (fallback or type("EmptyMixin", (), {}))
 
@@ -60,163 +60,76 @@ def _resolve_mixin(
 # Repositórios (dinâmicos; sem import estático rígido)
 # =====================================================================
 MovimentacoesRepoType: Optional[Type[Any]] = _resolve_symbol(
-    mod_names=[
-        "repository.movimentacoes_repository",
-        "repository.movimentacoes_bancarias_repository",  # compat antigo
-    ],
-    attr_candidates=[
-        "MovimentacoesRepository",
-        "MovimentacoesBancariasRepository",  # compat antigo
-    ],
+    ["repository.movimentacoes_repository", "repository.movimentacoes_bancarias_repository"],
+    ["MovimentacoesRepository", "MovimentacoesBancariasRepository"],
 )
 
 CartoesRepoType: Optional[Type[Any]] = _resolve_symbol(
-    mod_names=[
-        "repository.cartoes_repository",
-        "repository.cartoes_credito_repository",  # compat antigo
-    ],
-    attr_candidates=[
-        "CartoesRepository",
-        "CartoesCreditoRepository",  # compat antigo
-    ],
+    ["repository.cartoes_repository", "repository.cartoes_credito_repository"],
+    ["CartoesRepository", "CartoesCreditoRepository"],
 )
 
-# CAP (obrigatório)
-from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository  # type: ignore
+SaidasRepoType: Optional[Type[Any]] = _resolve_symbol(
+    ["repository.saidas_repository"],
+    ["SaidasRepository"],
+)
 
-# Serviço de BOLETO (delegação explícita — NÃO herdamos como mixin)
+BancosRepoType: Optional[Type[Any]] = _resolve_symbol(
+    ["repository.bancos_repository"],
+    ["BancosRepository"],
+)
+
+CaixasRepoType: Optional[Type[Any]] = _resolve_symbol(
+    ["repository.caixas_repository", "repository.caixa_repository"],
+    ["CaixasRepository", "CaixaRepository"],
+)
+
+# CAP / Serviços especializados
+from repository.contas_a_pagar_mov_repository import ContasAPagarMovRepository  # type: ignore
 from services.ledger.service_ledger_boleto import ServiceLedgerBoleto  # type: ignore
 
-
 # =====================================================================
-# Mixins (ordem importa na MRO). Resolução dinâmica para os demais.
+# Mixins (ordem importa na MRO)
 # =====================================================================
-# Infra
 _InfraMixin = _resolve_mixin(
     ["services.ledger.service_ledger_infra", "service_ledger_infra", ".service_ledger_infra"],
     ["_InfraLedgerMixin"],
 )
 
-# Helpers CAP (status etc.)
 _CapStatusMixin = _resolve_mixin(
     ["services.ledger.service_ledger_cap_helpers", "service_ledger_cap_helpers", ".service_ledger_cap_helpers"],
     ["_CapStatusLedgerMixin"],
 )
 
-# Autobaixa
 _AutoBaixaMixin = _resolve_mixin(
     ["services.ledger.service_ledger_autobaixa", "service_ledger_autobaixa", ".service_ledger_autobaixa"],
     ["_AutoBaixaLedgerMixin"],
 )
 
-# Saídas (UI/Forms → dispatcher)
 _SaidasMixin = _resolve_mixin(
     ["services.ledger.service_ledger_saida", "service_ledger_saida", ".service_ledger_saida"],
     ["_SaidasLedgerMixin"],
 )
 
-# Crédito (cartão/limite etc.)
 _CreditoMixin = _resolve_mixin(
     ["services.ledger.service_ledger_credito", "service_ledger_credito", ".service_ledger_credito"],
     ["_CreditoLedgerMixin"],
 )
 
-# Empréstimos
 _EmpMixin = _resolve_mixin(
     ["services.ledger.service_ledger_emprestimo", "service_ledger_emprestimo", ".service_ledger_emprestimo"],
-    ["_EmprestimoLedgerMixin"],
+    ["_EmprestimoLedgerMixin", "ServiceLedgerEmprestimo"],  # compat
 )
 
-# Faturas (mixin direto ou wrapper para ServiceLedgerFatura)
 _FaturaMixin = _resolve_symbol(
     ["services.ledger.service_ledger_fatura", "service_ledger_fatura", ".service_ledger_fatura"],
-    ["_FaturaLedgerMixin", "FaturaCartaoMixin"],
-)
-if _FaturaMixin is None:
-    _ServiceFatura = _resolve_symbol(
-        ["services.ledger.service_ledger_fatura", "service_ledger_fatura", ".service_ledger_fatura"],
-        ["ServiceLedgerFatura"],
-    )
-
-    if _ServiceFatura is not None:
-
-        class _FaturaMixin:  # type: ignore
-            """Wrapper fino quando só existe ServiceLedgerFatura (sem mixin direto)."""
-
-            # -------- núcleo privado: assinatura canônica esperada pelo ServiceLedgerFatura
-            def _pagar_fatura_impl(
-                self,
-                *,
-                obrigacao_id: int,
-                principal: float,
-                juros: float = 0.0,
-                multa: float = 0.0,
-                desconto: float = 0.0,
-                data_evento: str | None = None,
-                usuario: str = "-",
-            ) -> dict[str, Any]:
-                svc = _ServiceFatura(self.db_path)  # type: ignore[attr-defined]
-                return svc.pagar_fatura(
-                    obrigacao_id=obrigacao_id,
-                    principal=principal,
-                    juros=juros,
-                    multa=multa,
-                    desconto=desconto,
-                    data_evento=data_evento,
-                    usuario=usuario,
-                    conn=None,
-                )
-
-            # -------- wrappers públicos com normalização de aliases (compat UI)
-            @staticmethod
-            def _normalize_fatura_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-                """Normaliza nomes usados na UI para a assinatura canônica do serviço."""
-                obrig = (
-                    kwargs.get("obrigacao_id")
-                    or kwargs.get("obrigacao_id_fatura")
-                    or kwargs.get("fatura_id")
-                )
-                principal = (
-                    kwargs.get("principal")
-                    if kwargs.get("principal") is not None
-                    else (
-                        kwargs.get("valor_principal")
-                        if kwargs.get("valor_principal") is not None
-                        else (
-                            kwargs.get("valor_base")
-                            if kwargs.get("valor_base") is not None
-                            else kwargs.get("valor", 0.0)
-                        )
-                    )
-                )
-                data_evt = kwargs.get("data_evento") or kwargs.get("data")
-                return {
-                    "obrigacao_id": int(obrig or 0),
-                    "principal": float(principal or 0.0),
-                    "juros": float(kwargs.get("juros") or 0.0),
-                    "multa": float(kwargs.get("multa") or 0.0),
-                    "desconto": float(kwargs.get("desconto") or 0.0),
-                    "data_evento": data_evt,
-                    "usuario": (kwargs.get("usuario") or "-"),
-                }
-
-            def pagar_fatura(self, **kwargs: Any) -> dict[str, Any]:
-                norm = self._normalize_fatura_kwargs(kwargs)
-                return self._pagar_fatura_impl(**norm)
-
-            def pagar_fatura_cartao(self, **kwargs: Any) -> dict[str, Any]:
-                norm = self._normalize_fatura_kwargs(kwargs)
-                return self._pagar_fatura_impl(**norm)
-
-    else:
-
-        class _FaturaMixin:  # vazio: mantém a MRO estável
-            pass
+    ["_FaturaLedgerMixin", "FaturaCartaoMixin", "ServiceLedgerFatura"],
+) or type("EmptyFaturaMixin", (), {})
 
 
-# Placeholder para manter a posição do “mixin de boleto” (delegação explícita)
 class _BoletoBase:
     """Sentinela para preservar a ordem MRO onde o serviço de boleto é delegado."""
+    pass
 
 
 # =====================================================================
@@ -225,21 +138,20 @@ class _BoletoBase:
 class LedgerService(
     _SaidasMixin,
     _CreditoMixin,
-    _BoletoBase,  # <- posição reservada; delegação explícita abaixo
+    _BoletoBase,
     _FaturaMixin,
     _EmpMixin,
     _AutoBaixaMixin,
     _CapStatusMixin,
-    _InfraMixin,  # util/base por último
+    _InfraMixin,
 ):
-    """Fachada central do Ledger, compondo mixins e serviços específicos.
+    """
+    Fachada central do Ledger, compondo mixins/serviços específicos.
 
-    Mantém API pré-existente:
-        - registrar_saida_credito
-        - registrar_saida_boleto / pagar_parcela_boleto
-        - programar_emprestimo / pagar_parcela_emprestimo
-        - pagar_fatura_cartao / pagar_fatura
-        - (UI) métodos providos por _SaidasLedgerMixin
+    Parâmetros
+    ----------
+    db_path : str
+        Caminho do banco SQLite.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -250,21 +162,214 @@ class LedgerService(
         self.cap_repo = ContasAPagarMovRepository(db_path)
         self.cartoes_repo = CartoesRepoType(db_path) if CartoesRepoType else None  # type: ignore
 
-        # Serviço específico de BOLETO (instanciado sob demanda — evita dependências circulares)
+        # Repositórios auxiliares (saídas/caixa/bancos)
+        self.saidas_repo = SaidasRepoType(db_path) if SaidasRepoType else None  # type: ignore
+        self.bancos_repo = BancosRepoType(db_path) if BancosRepoType else None  # type: ignore
+        self.caixa_repo = CaixasRepoType(db_path) if CaixasRepoType else None  # type: ignore
+
         self._boleto_svc: Optional[ServiceLedgerBoleto] = None
 
+        # Inicialização dos mixins (se exigirem __init__)
         try:
             super().__init__()  # type: ignore[misc]
         except TypeError:
             pass
 
-        logger.debug("LedgerService inicializado com db_path=%s", self.db_path)
-
-    def __repr__(self) -> str:
+    def __repr__(self) -> str:  # pragma: no cover
         return f"<LedgerService db_path={self.db_path!r}>"
 
-    # ------------------ Ponte/Delegação para BOLETO ------------------
+    # =========================
+    # Helpers locais (pós-inserção)
+    # =========================
+    @staticmethod
+    def _saida__pick_first_existing_col(cols_available: list[str], candidates: list[str]) -> str | None:
+        """Retorna a primeira coluna candidata existente na tabela."""
+        for c in candidates:
+            if c in cols_available:
+                return c
+        return None
+
+    def _saida__force_fields(
+        self,
+        *,
+        id_saida: int | None,
+        categoria: str | None,
+        sub_categoria: str | None,
+        descricao: str | None,
+        forma: str | None,
+        set_parcelas_1: bool,
+    ) -> None:
+        """
+        Garante que a linha recém-criada em `saida` possua:
+        Categoria / Sub_Categoria / Descricao / (Forma_de_Pagamento se existir)
+        e define Parcelas=1 quando aplicável (DINHEIRO/PIX/DÉBITO).
+        """
+        if not id_saida:
+            return
+        try:
+            import sqlite3
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(saida);")
+                cols = [row[1] for row in cur.fetchall()]
+
+                updates: dict[str, object] = {}
+
+                if categoria is not None:
+                    cat_col = self._saida__pick_first_existing_col(
+                        cols, ["Categoria", "Categorias", "categoria", "Categoria_Saida"]
+                    )
+                    if cat_col:
+                        updates[cat_col] = categoria
+
+                if sub_categoria is not None:
+                    sub_col = self._saida__pick_first_existing_col(
+                        cols, ["Sub_Categoria", "Sub_Categorias", "sub_categoria"]
+                    )
+                    if sub_col:
+                        updates[sub_col] = sub_categoria
+
+                if descricao is not None:
+                    desc_col = self._saida__pick_first_existing_col(
+                        cols, ["Descricao", "Descrição", "descricao"]
+                    )
+                    if desc_col:
+                        updates[desc_col] = descricao
+
+                if forma:
+                    forma_col = self._saida__pick_first_existing_col(
+                        cols, ["Forma_de_Pagamento", "forma_pagamento", "Forma_Pagamento", "Forma de Pagamento", "forma", "Forma"]
+                    )
+                    if forma_col:
+                        updates.setdefault(forma_col, forma)
+
+                if set_parcelas_1:
+                    parc_col = self._saida__pick_first_existing_col(
+                        cols, ["Parcelas", "parcelas", "qtd_parcelas", "Qtd_Parcelas", "numero_parcelas", "Numero_Parcelas", "num_parcelas", "n_parcelas"]
+                    )
+                    if parc_col:
+                        updates[parc_col] = 1
+
+                if updates:
+                    set_sql = ", ".join([f"{k} = :{k}" for k in updates])
+                    updates["__id"] = id_saida
+                    cur.execute(f"UPDATE saida SET {set_sql} WHERE id = :__id;", updates)
+                    conn.commit()
+        except Exception as e:  # pragma: no cover
+            logger.warning("Pós-inserção defensivo em 'saida' falhou: %s", e)
+
+    # ------------------ Saídas ------------------
+    def registrar_saida_dinheiro(
+        self,
+        *,
+        data: str,
+        valor: float,
+        origem_dinheiro: str,
+        categoria: str | None = None,
+        sub_categoria: str | None = None,
+        descricao: str | None = None,
+        usuario: str | None = None,
+        obrigacao_id_fatura: int | None = None,
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+        trans_uid: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Wrapper compat: delega ao mixin e aplica fix-up."""
+        # Campos não suportados pelo mixin
+        for k in (
+            "parcelas", "qtd_parcelas", "numero_parcelas", "num_parcelas", "n_parcelas",
+            "Forma_de_Pagamento", "forma_de_pagamento", "forma_pagamento",
+            "banco_saida", "bandeira", "cartao",
+            "obrigacao_id_boleto", "obrigacao_id_emprestimo", "obrigacao_id", "tipo_obrigacao",
+        ):
+            kwargs.pop(k, None)
+
+        result = super().registrar_saida_dinheiro(
+            data=data,
+            valor=valor,
+            origem_dinheiro=origem_dinheiro,
+            categoria=categoria,
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            usuario=(usuario or "-"),
+            obrigacao_id_fatura=obrigacao_id_fatura,
+            juros=juros,
+            multa=multa,
+            desconto=desconto,
+            trans_uid=trans_uid,
+        )
+
+        id_saida = result[0] if isinstance(result, (tuple, list)) and result else None
+        self._saida__force_fields(
+            id_saida=id_saida,
+            categoria=categoria,
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            forma="DINHEIRO",
+            set_parcelas_1=True,  # DINHEIRO ⇒ Parcelas = 1
+        )
+        return result
+
+    def registrar_saida_bancaria(
+        self,
+        *,
+        data: str,
+        valor: float,
+        banco_nome: str,
+        forma: str,
+        categoria: str | None = None,
+        sub_categoria: str | None = None,
+        descricao: str | None = None,
+        usuario: str | None = None,
+        obrigacao_id_fatura: int | None = None,
+        juros: float = 0.0,
+        multa: float = 0.0,
+        desconto: float = 0.0,
+        trans_uid: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Wrapper compat: delega ao mixin e aplica fix-up."""
+        for k in (
+            "parcelas", "qtd_parcelas", "numero_parcelas", "num_parcelas", "n_parcelas",
+            "Forma_de_Pagamento", "forma_de_pagamento", "forma_pagamento",
+            "banco_saida", "bandeira", "cartao",
+            "obrigacao_id_boleto", "obrigacao_id_emprestimo", "obrigacao_id", "tipo_obrigacao",
+        ):
+            kwargs.pop(k, None)
+
+        result = super().registrar_saida_bancaria(
+            data=data,
+            valor=valor,
+            banco_nome=banco_nome,
+            forma=forma,
+            categoria=categoria,
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            usuario=(usuario or "-"),
+            obrigacao_id_fatura=obrigacao_id_fatura,
+            juros=juros,
+            multa=multa,
+            desconto=desconto,
+            trans_uid=trans_uid,
+        )
+
+        id_saida = result[0] if isinstance(result, (tuple, list)) and result else None
+        forma_up = (forma or "").strip().upper()
+        self._saida__force_fields(
+            id_saida=id_saida,
+            categoria=categoria,
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            forma=forma_up,
+            set_parcelas_1=forma_up in {"PIX", "DÉBITO", "DEBITO"},
+        )
+        return result
+
+    # ------------------ BOLETO ------------------
     def _get_boleto(self) -> ServiceLedgerBoleto:
+        """Lazy-init do serviço de boleto (mantém ordem MRO intacta)."""
         if self._boleto_svc is None:
             self._boleto_svc = ServiceLedgerBoleto(self.db_path)
         return self._boleto_svc
@@ -286,11 +391,15 @@ class LedgerService(
         desconto: float = 0.0,
         data_evento: str | None = None,
         data_compra: str | None = None,     # compat
-        metodo: str | None = None,          # compat (alguns fluxos)
-        meio_pagamento: str | None = None,  # compat (alguns fluxos)
-        **_ignored: Any,                    # engole kwargs extras
+        metodo: str | None = None,          # compat
+        meio_pagamento: str | None = None,  # compat
+        **_ignored: Any,
     ) -> dict[str, Any]:
-        """Registra saída de BOLETO (avulsa) ou paga parcela via serviço (FIFO)."""
+        """
+        Registra saída de boleto avulsa ou pagamento de parcela (via ServiceLedgerBoleto).
+        Quando `obrigacao_id` é fornecido, delega ao serviço de boleto; caso contrário,
+        utiliza o dispatcher de lançamentos.
+        """
         _data_evt = data_evento or data_compra
 
         _forma = (forma or metodo or meio_pagamento)
@@ -321,6 +430,7 @@ class LedgerService(
                 data_evento=_data_evt,
             )
 
+        # Sem obrigação → delega ao dispatcher de saídas
         return self.registrar_lancamento(
             tipo_evento="SAIDA",
             categoria_evento="BOLETO",
@@ -334,45 +444,47 @@ class LedgerService(
             data_evento=_data_evt,
         )
 
-    # ------------------ Dispatcher seguro para 'registrar_lancamento' ------------------
+    # ------------------ Dispatcher seguro ------------------
     def registrar_lancamento(self, **kwargs: Any) -> dict[str, Any]:
+        """
+        Encaminha para a primeira implementação de `registrar_lancamento` encontrada
+        na MRO (mixin de saídas).
+        """
         for base in self.__class__.mro()[1:]:
             impl = base.__dict__.get("registrar_lancamento")
             if impl is not None:
                 return impl(self, **kwargs)  # type: ignore[misc]
         raise RuntimeError(
-            "registrar_lancamento() não está disponível no LedgerService.\n"
-            "- Verifique se o mixin de saídas está presente (services.ledger.service_ledger_saida)\n"
-            "  e se a classe exporta '_SaidasLedgerMixin' com o método 'registrar_lancamento'.\n"
-            "- Alternativa: informe 'obrigacao_id' para usar o fluxo de pagamento de parcela de BOLETO."
+            "registrar_lancamento() não está disponível. "
+            "Verifique se o mixin de saídas (services.ledger.service_ledger_saida) "
+            "está presente e expõe '_SaidasLedgerMixin' com 'registrar_lancamento'."
         )
 
-    # ------------------ Wrappers compat: BOLETO & EMPRESTIMO ------------------
+    # ------------------ Wrappers compat: boleto & empréstimo ------------------
     def pagar_parcela_boleto(
         self,
         *,
         obrigacao_id: int | None = None,
-        obrigacao_id_boleto: int | None = None,  # alias aceito
-        parcela_id: int | None = None,           # compat; ignorado (FIFO)
+        obrigacao_id_boleto: int | None = None,
+        parcela_id: int | None = None,
         valor_base: float | None = None,
-        valor_principal: float | None = None,    # alias aceito
-        valor: float | None = None,              # alias legado
+        valor_principal: float | None = None,
+        valor: float | None = None,
         juros: float = 0.0,
         multa: float = 0.0,
         desconto: float = 0.0,
         usuario: str | None = None,
         data_evento: str | None = None,
-        data: str | None = None,                 # alias aceito
+        data: str | None = None,
         **_kwargs: Any,
     ) -> dict[str, Any]:
-        """Compat: delega ao serviço de BOLETO (FIFO). Aceita aliases de IDs/valor/data."""
+        """Wrapper de compatibilidade para pagamento de parcela de boleto."""
         _obrig = obrigacao_id if obrigacao_id is not None else (obrigacao_id_boleto or 0)
         _principal = (
-            valor_base
-            if valor_base is not None
+            valor_base if valor_base is not None
             else (valor_principal if valor_principal is not None else (valor or 0.0))
         )
-        _data_evt = data_evento or data
+        _data_evt = data_evento or data  # <-- corrigido
 
         boleto = self._get_boleto()
         return boleto.pagar_parcela_boleto(
@@ -390,33 +502,30 @@ class LedgerService(
         self,
         *,
         obrigacao_id_emprestimo: int | None = None,
-        obrigacao_id: int | None = None,        # alias aceito
+        obrigacao_id: int | None = None,
         valor_principal: float | None = None,
-        valor_base: float | None = None,        # alias aceito
-        valor: float | None = None,             # alias legado
+        valor_base: float | None = None,
+        valor: float | None = None,
         juros: float = 0.0,
         multa: float = 0.0,
         desconto: float = 0.0,
         usuario: str | None = None,
         data_evento: str | None = None,
-        data: str | None = None,                # alias aceito
+        data: str | None = None,
         **_kwargs: Any,
     ) -> dict[str, Any]:
-        """Wrapper compatível para EMPRESTIMO (delegação ao ServiceLedgerEmprestimo)."""
-        _obrig = (
-            obrigacao_id_emprestimo if obrigacao_id_emprestimo is not None else (obrigacao_id or 0)
-        )
+        """Wrapper de compatibilidade para pagamento de parcela de empréstimo."""
+        _obrig = obrigacao_id_emprestimo if obrigacao_id_emprestimo is not None else (obrigacao_id or 0)
         _principal = (
-            valor_base
-            if valor_base is not None
+            valor_base if valor_base is not None
             else (valor_principal if valor_principal is not None else (valor or 0.0))
         )
-        _data_evt = data_evento or data
+        _data_evt = data_evento or data  # <-- corrigido
 
         try:
             mod = importlib.import_module("services.ledger.service_ledger_emprestimo")
             ServiceLedgerEmprestimo = getattr(mod, "ServiceLedgerEmprestimo")
-        except Exception as e:
+        except Exception as e:  # pragma: no cover
             raise RuntimeError("ServiceLedgerEmprestimo não encontrado ou inválido.") from e
 
         svc = ServiceLedgerEmprestimo(self.db_path)
