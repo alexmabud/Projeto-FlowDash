@@ -1,12 +1,13 @@
 # flowdash_pages/lancamentos/saida/actions_saida.py
 """
-Actions de Saída (dinheiro e bancária).
+Actions de Saída (dinheiro, bancária e crédito).
 
 Responsabilidades:
-- Normalizar entradas e delegar ao `LedgerService` (registrar saída em dinheiro ou bancária).
-- Integrar obrigações (FATURA_CARTAO, BOLETO, EMPRESTIMO).
+- Normalizar entradas e delegar ao `LedgerService`.
+- Integrar obrigações (FATURA_CARTAO, BOLETO, EMPRESTIMO) nos fluxos de pagamento.
 - Manter compatibilidade com chamadas antigas (aliases de parâmetros).
-- Garantir persistência de `Categoria`, `Sub_Categoria` e `Descricao` via fix-up pós-inserção.
+- Para CRÉDITO: não cria linha em `saida`; cria CAP (contas_a_pagar_mov),
+  fatura_cartao_itens e log em movimentacoes_bancarias (tipo 'registro').
 
 Retorno padrão:
     dict: { ok: bool, id_saida: int|None, id_mov: int|None, mensagem: str|None }
@@ -15,6 +16,7 @@ Retorno padrão:
 from __future__ import annotations
 
 import contextlib
+import re
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -65,9 +67,9 @@ def _money(v: Any) -> float:
     try:
         if dot == -1 and comma == -1:
             return float(s)
-        if dot > comma:  # estilo 1.234,56 ou 1,234.56 -> considera '.' decimal
-            return float(s.replace(",", ""))
-        return float(s.replace(".", "").replace(",", "."))
+        if dot > comma:
+            return float(s.replace(",", ""))  # 1,234.56 -> 1234.56
+        return float(s.replace(".", "").replace(",", "."))  # 1.234,56 -> 1234.56
     except Exception:
         with contextlib.suppress(Exception):
             return float(s.replace(",", "."))
@@ -91,8 +93,25 @@ def _norm_forma(forma: Optional[str]) -> str:
     """Normaliza a forma de pagamento para o padrão da aplicação."""
     f = (forma or "").strip().upper()
     if f == "DEBITO":
-        return "DÉBITO"
+        f = "DÉBITO"
+    if f.startswith("CREDITO") or f.startswith("CRÉDITO"):
+        f = "CRÉDITO"
     return f or "DINHEIRO"
+
+
+# extrai “3x” de textos como “Crédito 3x”, “credito 10X”, etc.
+_RX_PARC = re.compile(r"(\d+)\s*[Xx]\b")
+
+def _extract_parcelas_from_forma(txt: Optional[str]) -> Optional[int]:
+    t = _norm_str(txt) or ""
+    m = _RX_PARC.search(t)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+        return max(1, min(24, n))  # sanidade
+    except Exception:
+        return None
 
 
 def _resolve_obrigacao(
@@ -175,9 +194,9 @@ def registrar_saida_action(
     *,
     caminho_banco: str,
     valor: Any,
-    forma: Optional[str] = None,                 # "DINHEIRO" | "PIX" | "DÉBITO" | "CRÉDITO"
-    origem: Optional[str] = None,                # "Caixa"/"Caixa 2" ou nome da conta
-    banco: Optional[str] = None,                 # conta/banco (saídas bancárias)
+    forma: Optional[str] = None,                 # "DINHEIRO" | "PIX" | "DÉBITO" | "CRÉDITO" | "Crédito 3x"
+    origem: Optional[str] = None,                # "Caixa"/"Caixa 2" ou nome da conta/cartão
+    banco: Optional[str] = None,                 # conta/banco (ou cartão em UIs antigas)
 
     # Aliases aceitos (compat com UI/rotas antigas)
     categoria: Optional[str] = None,
@@ -193,7 +212,12 @@ def registrar_saida_action(
     multa: Any = 0.0,
     desconto: Any = 0.0,
     trans_uid: Optional[str] = None,
+
+    # CRÉDITO
     parcelas: Any = None,
+    cartao_nome: Optional[str] = None,
+    fechamento: Optional[int] = None,
+    vencimento: Optional[int] = None,
 
     # CAP
     tipo_obrigacao: Optional[str] = None,
@@ -205,9 +229,8 @@ def registrar_saida_action(
     """
     Registra uma saída. Decide o fluxo:
       - DINHEIRO  -> LedgerService.registrar_saida_dinheiro
-      - Bancária  -> LedgerService.registrar_saida_bancaria (PIX/DÉBITO/CRÉDITO)
-
-    Após gravar, aplica fix-up direto na tabela `saida` (defensivo).
+      - PIX/DÉBITO-> LedgerService.registrar_saida_bancaria
+      - CRÉDITO   -> LedgerService.registrar_lancamento (desvio p/ registrar_saida_credito)
     """
     valor_f = _money(valor)
     if valor_f <= 0:
@@ -225,36 +248,68 @@ def registrar_saida_action(
         obrigacao_id_emprestimo=obrigacao_id_emprestimo,
     )
 
-    # Normalização de campos textuais (somente o digitado; sem enriquecer descrição)
+    # Normalização de campos textuais (somente o digitado)
     cat_str = _str_or_empty(categoria if _norm_str(categoria) else cat_nome)
     subcat_str = _str_or_empty(subcategoria if _norm_str(subcategoria) else sub_categoria)
     desc_user = _str_or_empty(descricao if _norm_str(descricao) else descricao_final)
 
     try:
         ledger = LedgerService(caminho_banco)
+        usuario_s = _norm_str(usuario) or "-"
 
+        # ---------------------- Fluxo CRÉDITO (compra) ----------------------
+        if forma_norm == "CRÉDITO":
+            # Se vier “Crédito 3x” em forma e parcelas não informadas, extrair do texto
+            n_parc = int(parcelas or _extract_parcelas_from_forma(forma) or 1)
+            n_parc = max(1, min(12, n_parc))  # sanidade simples
+            cartao_eff = _norm_str(cartao_nome) or _norm_str(banco) or _norm_str(origem) or "Cartão"
+
+            id_like, id_mov = ledger.registrar_lancamento(
+                tipo_evento="SAIDA",
+                categoria_evento=cat_str,
+                subcategoria_evento=subcat_str,
+                valor_evento=valor_f,
+                forma="CRÉDITO",
+                origem=_norm_str(origem),
+                banco=_norm_str(banco),
+                juros=_money(juros),
+                multa=_money(multa),
+                desconto=_money(desconto),
+                descricao=desc_user,
+                usuario=usuario_s,
+                trans_uid=_norm_str(trans_uid),
+                data_evento=data_norm,
+                # extras consumidos pelo desvio de CRÉDITO no ledger:
+                parcelas=n_parc,
+                cartao_nome=cartao_eff,
+                fechamento=int(fechamento or 0),
+                vencimento=int(vencimento or 0),
+            )
+            # Não há linha em `saida` para fixar; devolvemos ids do fluxo
+            return {"ok": True, "id_saida": id_like, "id_mov": id_mov, "mensagem": None}
+
+        # ---------------- DINHEIRO / PIX / DÉBITO (pagamento “real”) --------
         if forma_norm == "DINHEIRO":
-            id_saida, _ = ledger.registrar_saida_dinheiro(
+            id_saida, id_mov = ledger.registrar_saida_dinheiro(
                 data=data_norm,
                 valor=float(valor_f),
                 origem_dinheiro=_norm_str(origem) or "Caixa",
                 categoria=cat_str,
                 sub_categoria=subcat_str,
                 descricao=desc_user,
-                usuario=_norm_str(usuario) or "-",
+                usuario=usuario_s,
                 juros=_money(juros),
                 multa=_money(multa),
                 desconto=_money(desconto),
                 trans_uid=_norm_str(trans_uid),
-                parcelas=parcelas,
                 obrigacao_id_fatura=obr_id if tipo_obr == "FATURA_CARTAO" else None,
                 obrigacao_id_boleto=obr_id if tipo_obr == "BOLETO" else None,
                 obrigacao_id_emprestimo=obr_id if tipo_obr == "EMPRESTIMO" else None,
             )
             _fixup_saida_row(caminho_banco, id_saida, cat_str, subcat_str, desc_user)
-            return {"ok": True, "id_saida": id_saida, "id_mov": None, "mensagem": None}
+            return {"ok": True, "id_saida": id_saida, "id_mov": id_mov, "mensagem": None}
 
-        # Fluxo bancário (PIX/DÉBITO/CRÉDITO)
+        # Fluxo bancário (PIX/DÉBITO)
         id_saida, id_mov = ledger.registrar_saida_bancaria(
             data=data_norm,
             valor=float(valor_f),
@@ -263,12 +318,11 @@ def registrar_saida_action(
             categoria=cat_str,
             sub_categoria=subcat_str,
             descricao=desc_user,
-            usuario=_norm_str(usuario) or "-",
+            usuario=usuario_s,
             juros=_money(juros),
             multa=_money(multa),
             desconto=_money(desconto),
             trans_uid=_norm_str(trans_uid),
-            parcelas=parcelas,
             obrigacao_id_fatura=obr_id if tipo_obr == "FATURA_CARTAO" else None,
             obrigacao_id_boleto=obr_id if tipo_obr == "BOLETO" else None,
             obrigacao_id_emprestimo=obr_id if tipo_obr == "EMPRESTIMO" else None,
@@ -347,13 +401,43 @@ def registrar_saida_bancaria_action(
     multa: Any = 0.0,
     desconto: Any = 0.0,
     trans_uid: Optional[str] = None,
+    # Se chamar com CRÉDITO por aqui, também funciona:
+    parcelas: Any = None,
+    cartao_nome: Optional[str] = None,
+    fechamento: Optional[int] = None,
+    vencimento: Optional[int] = None,
+    # CAP
     tipo_obrigacao: Optional[str] = None,
     obrigacao_id: Optional[int] = None,
     obrigacao_id_fatura: Optional[int] = None,
     obrigacao_id_boleto: Optional[int] = None,
     obrigacao_id_emprestimo: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Convenience: fluxo bancário (PIX/DÉBITO/CRÉDITO)."""
+    """Convenience: fluxo bancário (PIX/DÉBITO) e também CRÉDITO (encaminha p/ registrar_lancamento)."""
+    if _norm_forma(forma) == "CRÉDITO":
+        return registrar_saida_action(
+            caminho_banco=caminho_banco,
+            valor=valor,
+            forma="CRÉDITO",
+            banco=banco_nome,
+            categoria=categoria,
+            cat_nome=cat_nome,
+            subcategoria=subcategoria,
+            sub_categoria=sub_categoria,
+            descricao=descricao,
+            descricao_final=descricao_final,
+            usuario=usuario,
+            data=data,
+            juros=juros,
+            multa=multa,
+            desconto=desconto,
+            trans_uid=trans_uid,
+            parcelas=parcelas,
+            cartao_nome=cartao_nome or banco_nome,
+            fechamento=fechamento,
+            vencimento=vencimento,
+        )
+    # PIX/DÉBITO padrão:
     return registrar_saida_action(
         caminho_banco=caminho_banco,
         valor=valor,
@@ -569,6 +653,9 @@ def registrar_saida(*args, **kwargs):
         "caminho_banco", "valor", "forma", "origem", "banco",
         "categoria", "subcategoria", "descricao", "usuario", "data",
         "juros", "multa", "desconto", "trans_uid",
+        # crédito (se vierem):
+        "parcelas", "cartao_nome", "fechamento", "vencimento",
+        # CAP:
         "tipo_obrigacao", "obrigacao_id",
         "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
     ]
@@ -616,11 +703,14 @@ def registrar_saida_dinheiro(*args, **kwargs):
 
 
 def registrar_saida_bancaria(*args, **kwargs):
-    """Compat: fluxo bancário (PIX/DÉBITO/CRÉDITO)."""
+    """Compat: fluxo bancário (PIX/DÉBITO) e CRÉDITO (encaminha para registrar_lancamento)."""
     order = [
         "caminho_banco", "valor", "forma", "banco_nome",
         "categoria", "subcategoria", "descricao", "usuario", "data",
         "juros", "multa", "desconto", "trans_uid",
+        # crédito (se vierem):
+        "parcelas", "cartao_nome", "fechamento", "vencimento",
+        # CAP:
         "tipo_obrigacao", "obrigacao_id",
         "obrigacao_id_fatura", "obrigacao_id_boleto", "obrigacao_id_emprestimo",
     ]

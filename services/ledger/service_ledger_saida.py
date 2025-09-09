@@ -15,6 +15,13 @@ Integrações CAP:
 - BOLETO e EMPRESTIMO além de FATURA_CARTAO.
 - Usa **saida_total = principal + juros + multa** (desconto não sai do caixa).
 - Para FATURA_CARTAO evita duplicidade via `ledger_id` no serviço de fatura.
+
+Atualização:
+- Forma **CRÉDITO** agora é roteada para `registrar_saida_credito` (mixin de crédito),
+  sem criar linha em `saida` nem mexer nos saldos. Gera:
+    • LANCAMENTO na CAP (contas_a_pagar_mov),
+    • itens em fatura_cartao_itens (quando houver a tabela),
+    • log em movimentacoes_bancarias (tipo 'registro', valor 0.0).
 """
 
 from __future__ import annotations
@@ -104,12 +111,22 @@ class _SaidasLedgerMixin:
             return datetime.now().strftime("%Y-%m-%d")
 
     def _infer_forma(self, *, forma: Optional[str], banco: Optional[str], origem: Optional[str]) -> str:
-        """Normaliza a forma para 'DINHEIRO', 'PIX' ou 'DÉBITO'."""
+        """
+        Normaliza a forma para 'DINHEIRO', 'PIX', 'DÉBITO' ou 'CRÉDITO'.
+
+        Regras:
+        - Aceita variações como 'debito', 'credito', 'crédito 3x', etc. (remove sufixo ' 3x').
+        - Se origem = Caixa/Caixa 2 => DINHEIRO
+        - Se houver 'banco' e forma não informada => PIX (compat antiga)
+        """
         if forma:
-            f = (self._sane(forma) or "").upper()
-            if f == "DEBITO":
-                f = "DÉBITO"
-            if f in {"DINHEIRO", "PIX", "DÉBITO"}:
+            f = (self._sane(forma) or "").upper().strip()
+            # normaliza sem acento
+            f = f.replace("DEBITO", "DÉBITO").replace("CREDITO", "CRÉDITO")
+            # remove sufixo '<n>x'
+            if f.startswith("CRÉDITO"):
+                f = "CRÉDITO"
+            if f in {"DINHEIRO", "PIX", "DÉBITO", "CRÉDITO"}:
                 return f
         origem_norm = (origem or "").strip().lower()
         if origem_norm in {"caixa", "caixa 2", "caixa2"}:
@@ -164,9 +181,9 @@ class _SaidasLedgerMixin:
         tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
         obrigacao_id: Optional[int] = None,
         obrigacao_id_fatura: Optional[int] = None,  # legado
-        **_ignored: Any,
+        **_extra: Any,  # <- aqui capturamos campos adicionais como parcelas/cartao_nome
     ) -> Tuple[int, int]:
-        """Dispatcher genérico (somente SAIDA). Encaminha para dinheiro/bancária."""
+        """Dispatcher genérico (somente SAIDA). Encaminha para dinheiro/bancária/crédito (novo)."""
         if (self._sane(tipo_evento) or "SAIDA").upper() != "SAIDA":
             raise NotImplementedError("registrar_lancamento: apenas SAIDA é suportado neste mixin.")
 
@@ -190,11 +207,49 @@ class _SaidasLedgerMixin:
             origem=origem,
         )
 
+        # Normaliza tipo/obrigação (compat com obrigacao_id_fatura)
         tipo_obr_norm = (self._sane(tipo_obrigacao) or (categoria or "")).upper() if (tipo_obrigacao or categoria) else None
         if obrigacao_id_fatura and not obrigacao_id:
             obrigacao_id = int(obrigacao_id_fatura)
             tipo_obr_norm = "FATURA_CARTAO"
 
+        # --- NOVO: desvio para CRÉDITO (não mexe em saldos, não cria linha em 'saida') ---
+        if forma_eff == "CRÉDITO":
+            # Captura de campos específicos (virão do actions)
+            parcelas = int(_extra.get("parcelas") or _extra.get("n_parcelas") or 1)
+            cartao_nome = self._sane(_extra.get("cartao_nome") or banco or origem or "Cartão")
+            # Se o repo de cartões existir, infra cobre fechamento/vencimento; caso contrário, fallback 0/0
+            fechamento = int(_extra.get("fechamento") or 0)
+            vencimento = int(_extra.get("vencimento") or 0)
+
+            if not hasattr(self, "registrar_saida_credito"):
+                raise NotImplementedError(
+                    "Fluxo de CRÉDITO indisponível: mixin de crédito não está carregado neste Ledger."
+                )
+
+            lanc_ids, id_mov = self.registrar_saida_credito(  # type: ignore[attr-defined]
+                data_compra=data,
+                valor=valor,
+                parcelas=parcelas,
+                cartao_nome=cartao_nome or "Cartão",
+                categoria=categoria,
+                sub_categoria=subcategoria,
+                descricao=desc,
+                usuario=usuario_s,
+                fechamento=fechamento,
+                vencimento=vencimento,
+                trans_uid=trans_uid,
+            )
+
+            # Adaptamos o retorno para (id_like, id_mov): usa o 1º lançamento da CAP ou -1
+            id_like = int(lanc_ids[0]) if (lanc_ids and len(lanc_ids) > 0) else -1
+            logger.debug(
+                "registrar_lancamento[CRÉDITO]: cartao=%s parcelas=%s total=%.2f ids=%s mov=%s",
+                cartao_nome, parcelas, valor, lanc_ids, id_mov
+            )
+            return (id_like, int(id_mov))
+
+        # --- Fluxos já existentes ---
         if forma_eff == "DINHEIRO":
             origem_din = origem if origem in ("Caixa", "Caixa 2") else "Caixa"
             return self.registrar_saida_dinheiro(
