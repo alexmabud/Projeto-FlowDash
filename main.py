@@ -195,9 +195,6 @@ def _call_page(module_path: str):
 # LOGIN
 # ======================================================================================
 # Banner informativo do ambiente/banco (ajuda a evitar confusão entre dev/prod)
-with st.container():
-    st.caption(f"🗄️ Banco em uso: `{caminho_banco}`  •  DEBUG={'ON' if DEBUG else 'OFF'}")
-
 if not st.session_state.usuario_logado:
     st.title("🔐 Login")
 
