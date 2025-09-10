@@ -90,13 +90,39 @@ def _norm_date(s: Optional[str]) -> str:
 
 
 def _norm_forma(forma: Optional[str]) -> str:
-    """Normaliza a forma de pagamento para o padrão da aplicação."""
+    """
+    Normaliza a forma de pagamento para o padrão da aplicação.
+
+    Regras:
+    - Aceita variações: 'debito', 'credito', 'crédito 3x', 'cartao', 'cartão',
+      'cartao de credito', etc.
+    - Retornos possíveis: 'DINHEIRO', 'PIX', 'DÉBITO', 'CRÉDITO'
+      (quando não identificado, assume 'DINHEIRO').
+    """
     f = (forma or "").strip().upper()
+
+    # Normalizações básicas
     if f == "DEBITO":
         f = "DÉBITO"
-    if f.startswith("CREDITO") or f.startswith("CRÉDITO"):
-        f = "CRÉDITO"
-    return f or "DINHEIRO"
+
+    # Aliases de CRÉDITO (inclui "CARTAO/CARTÃO" e variações com "3x")
+    if (
+        f.startswith("CREDITO")
+        or f.startswith("CRÉDITO")
+        or f.startswith("CARTAO")
+        or f.startswith("CARTÃO")
+        or f.startswith("CARTAO DE CREDITO")
+        or f.startswith("CARTÃO DE CRÉDITO")
+    ):
+        return "CRÉDITO"
+
+    # Valores suportados diretamente
+    if f in {"DINHEIRO", "PIX", "DÉBITO"}:
+        return f
+
+    # Fallback defensivo
+    return "DINHEIRO"
+
 
 
 # extrai “3x” de textos como “Crédito 3x”, “credito 10X”, etc.

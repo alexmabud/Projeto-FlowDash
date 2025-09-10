@@ -1,27 +1,25 @@
 # services/ledger/service_ledger_saida.py
 """
-Saídas (dinheiro e bancária)
+Saídas (dinheiro, bancária e crédito)
 
-Registra saídas em dinheiro (Caixa/Caixa 2) e bancárias (PIX/DÉBITO),
-logando em `movimentacoes_bancarias` e integrando com CAP quando aplicável.
+- DINHEIRO / PIX / DÉBITO:
+  * Insere em `saida`
+  * Ajusta saldos (caixas/bancos)
+  * Loga em `movimentacoes_bancarias` (MB) como `tipo='saida'` com valor > 0
+  * Integra com CAP quando aplicável (BOLETO/EMPRESTIMO/FATURA_CARTAO)
+
+- CRÉDITO:
+  * NÃO mexe em `saida` nem nos saldos agora
+  * Cria itens em `fatura_cartao_itens` (um por parcela)
+  * Loga em MB como `tipo='registro'` com valor 0 (informativo)
+  * CAP/Fatura cuidam do pagamento futuro da fatura
 
 Compat e robustez:
-- Aceita valores como '400,00', '1.234,56' ou '1234.56' (parser BR/US-aware).
-- Aceita datas em 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD/MM/YYYY' ou 'DD-MM-YYYY'.
+- Aceita valores "400,00", "1.234,56" ou "1234.56" (parser BR/US-aware).
+- Aceita datas "YYYY-MM-DD", "YYYY/MM/DD", "DD/MM/YYYY" ou "DD-MM-YYYY".
 - Aceita aliases de forma (forma/forma_pagamento/metodo/meio_pagamento).
 - Sanitiza strings/UIDs.
 
-Integrações CAP:
-- BOLETO e EMPRESTIMO além de FATURA_CARTAO.
-- Usa **saida_total = principal + juros + multa** (desconto não sai do caixa).
-- Para FATURA_CARTAO evita duplicidade via `ledger_id` no serviço de fatura.
-
-Atualização:
-- Forma **CRÉDITO** agora é roteada para `registrar_saida_credito` (mixin de crédito),
-  sem criar linha em `saida` nem mexer nos saldos. Gera:
-    • LANCAMENTO na CAP (contas_a_pagar_mov),
-    • itens em fatura_cartao_itens (quando houver a tabela),
-    • log em movimentacoes_bancarias (tipo 'registro', valor 0.0).
 """
 
 from __future__ import annotations
@@ -59,7 +57,7 @@ _EPS = 0.005  # tolerância p/ “sobras” não aplicadas
 
 
 class _SaidasLedgerMixin:
-    """Regras de saída (dinheiro e bancária). Fornece dispatcher e fluxos."""
+    """Regras de saída (dinheiro, bancária e crédito). Fornece dispatcher e fluxos."""
 
     # ------------------------ Helpers de normalização ------------------------
 
@@ -82,12 +80,14 @@ class _SaidasLedgerMixin:
         s = str(v).strip()
         if not s:
             return 0.0
-        dot = s.rfind("."); comma = s.rfind(",")
+        dot = s.rfind(".")
+        comma = s.rfind(",")
         try:
             if dot == -1 and comma == -1:
                 return float(s)
-            if dot > comma:
+            if dot > comma:  # 1,234.56 (US)
                 return float(s.replace(",", ""))
+            # 1.234,56 (BR)
             return float(s.replace(".", "").replace(",", "."))
         except Exception:
             try:
@@ -115,19 +115,31 @@ class _SaidasLedgerMixin:
         Normaliza a forma para 'DINHEIRO', 'PIX', 'DÉBITO' ou 'CRÉDITO'.
 
         Regras:
-        - Aceita variações como 'debito', 'credito', 'crédito 3x', etc. (remove sufixo ' 3x').
+        - Aceita variações: 'debito', 'credito', 'crédito 3x', 'cartao', 'cartão', 'cartao de credito', etc.
         - Se origem = Caixa/Caixa 2 => DINHEIRO
         - Se houver 'banco' e forma não informada => PIX (compat antiga)
         """
         if forma:
             f = (self._sane(forma) or "").upper().strip()
-            # normaliza sem acento
+            # normalizações básicas
             f = f.replace("DEBITO", "DÉBITO").replace("CREDITO", "CRÉDITO")
-            # remove sufixo '<n>x'
-            if f.startswith("CRÉDITO"):
-                f = "CRÉDITO"
-            if f in {"DINHEIRO", "PIX", "DÉBITO", "CRÉDITO"}:
+
+            # aliases de CRÉDITO
+            if (
+                f.startswith("CRÉDITO")
+                or f.startswith("CREDITO")
+                or f.startswith("CARTAO")
+                or f.startswith("CARTÃO")
+                or f.startswith("CARTAO DE CREDITO")
+                or f.startswith("CARTÃO DE CRÉDITO")
+            ):
+                return "CRÉDITO"
+
+            if f in {"DINHEIRO", "PIX", "DÉBITO"}:
                 return f
+            if f == "DEBITO":
+                return "DÉBITO"
+
         origem_norm = (origem or "").strip().lower()
         if origem_norm in {"caixa", "caixa 2", "caixa2"}:
             return "DINHEIRO"
@@ -160,14 +172,14 @@ class _SaidasLedgerMixin:
     def registrar_lancamento(
         self,
         *,
-        tipo_evento: str,                       # 'SAIDA' ou 'ENTRADA'
+        tipo_evento: str,  # 'SAIDA' ou 'ENTRADA'
         categoria_evento: Optional[str] = None,
         subcategoria_evento: Optional[str] = None,
         valor_evento: float | str = 0.0,
         forma: Optional[str] = None,
         forma_pagamento: Optional[str] = None,  # alias compat
-        metodo: Optional[str] = None,           # alias compat
-        meio_pagamento: Optional[str] = None,   # alias compat
+        metodo: Optional[str] = None,  # alias compat
+        meio_pagamento: Optional[str] = None,  # alias compat
         origem: Optional[str] = None,
         banco: Optional[str] = None,
         juros: float | str = 0.0,
@@ -178,12 +190,12 @@ class _SaidasLedgerMixin:
         trans_uid: Optional[str] = None,
         data_evento: Optional[str] = None,
         # ---- CAP genérico ----
-        tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
+        tipo_obrigacao: Optional[str] = None,  # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
         obrigacao_id: Optional[int] = None,
         obrigacao_id_fatura: Optional[int] = None,  # legado
-        **_extra: Any,  # <- aqui capturamos campos adicionais como parcelas/cartao_nome
+        **_extra: Any,  # <- campos adicionais como parcelas/cartao_nome
     ) -> Tuple[int, int]:
-        """Dispatcher genérico (somente SAIDA). Encaminha para dinheiro/bancária/crédito (novo)."""
+        """Dispatcher genérico (somente SAIDA). Encaminha para dinheiro/bancária/crédito."""
         if (self._sane(tipo_evento) or "SAIDA").upper() != "SAIDA":
             raise NotImplementedError("registrar_lancamento: apenas SAIDA é suportado neste mixin.")
 
@@ -213,19 +225,13 @@ class _SaidasLedgerMixin:
             obrigacao_id = int(obrigacao_id_fatura)
             tipo_obr_norm = "FATURA_CARTAO"
 
-        # --- NOVO: desvio para CRÉDITO (não mexe em saldos, não cria linha em 'saida') ---
+        # --- CRÉDITO: cria Fatura + MB registro (valor=0) ---
         if forma_eff == "CRÉDITO":
-            # Captura de campos específicos (virão do actions)
             parcelas = int(_extra.get("parcelas") or _extra.get("n_parcelas") or 1)
             cartao_nome = self._sane(_extra.get("cartao_nome") or banco or origem or "Cartão")
-            # Se o repo de cartões existir, infra cobre fechamento/vencimento; caso contrário, fallback 0/0
-            fechamento = int(_extra.get("fechamento") or 0)
-            vencimento = int(_extra.get("vencimento") or 0)
 
             if not hasattr(self, "registrar_saida_credito"):
-                raise NotImplementedError(
-                    "Fluxo de CRÉDITO indisponível: mixin de crédito não está carregado neste Ledger."
-                )
+                raise NotImplementedError("Fluxo de CRÉDITO indisponível: mixin de crédito não está carregado neste Ledger.")
 
             lanc_ids, id_mov = self.registrar_saida_credito(  # type: ignore[attr-defined]
                 data_compra=data,
@@ -236,12 +242,10 @@ class _SaidasLedgerMixin:
                 sub_categoria=subcategoria,
                 descricao=desc,
                 usuario=usuario_s,
-                fechamento=fechamento,
-                vencimento=vencimento,
+                fechamento=int(_extra.get("fechamento") or 0),
+                vencimento=int(_extra.get("vencimento") or 0),
                 trans_uid=trans_uid,
             )
-
-            # Adaptamos o retorno para (id_like, id_mov): usa o 1º lançamento da CAP ou -1
             id_like = int(lanc_ids[0]) if (lanc_ids and len(lanc_ids) > 0) else -1
             logger.debug(
                 "registrar_lancamento[CRÉDITO]: cartao=%s parcelas=%s total=%.2f ids=%s mov=%s",
@@ -249,7 +253,7 @@ class _SaidasLedgerMixin:
             )
             return (id_like, int(id_mov))
 
-        # --- Fluxos já existentes ---
+        # --- DINHEIRO ---
         if forma_eff == "DINHEIRO":
             origem_din = origem if origem in ("Caixa", "Caixa 2") else "Caixa"
             return self.registrar_saida_dinheiro(
@@ -261,11 +265,14 @@ class _SaidasLedgerMixin:
                 descricao=desc,
                 usuario=usuario_s,
                 trans_uid=trans_uid,
-                juros=jv, multa=mv, desconto=dv,
+                juros=jv,
+                multa=mv,
+                desconto=dv,
                 tipo_obrigacao=tipo_obr_norm,
                 obrigacao_id=obrigacao_id,
             )
 
+        # --- BANCÁRIA (PIX/DÉBITO) ---
         banco_nome = self._sane(banco) or (self._sane(origem) or "Banco 1")
         return self.registrar_saida_bancaria(
             data=data,
@@ -277,7 +284,9 @@ class _SaidasLedgerMixin:
             descricao=desc,
             usuario=usuario_s,
             trans_uid=trans_uid,
-            juros=jv, multa=mv, desconto=dv,
+            juros=jv,
+            multa=mv,
+            desconto=dv,
             tipo_obrigacao=tipo_obr_norm,
             obrigacao_id=obrigacao_id,
         )
@@ -346,7 +355,7 @@ class _SaidasLedgerMixin:
         multa: float | str = 0.0,
         desconto: float | str = 0.0,
         # ---- CAP genérico ----
-        tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
+        tipo_obrigacao: Optional[str] = None,  # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
         obrigacao_id: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Registra uma saída **em dinheiro** e integra com CAP (opcional)."""
@@ -508,7 +517,7 @@ class _SaidasLedgerMixin:
         multa: float | str = 0.0,
         desconto: float | str = 0.0,
         # ---- CAP genérico ----
-        tipo_obrigacao: Optional[str] = None,   # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
+        tipo_obrigacao: Optional[str] = None,  # 'BOLETO' | 'FATURA_CARTAO' | 'EMPRESTIMO'
         obrigacao_id: Optional[int] = None,
     ) -> Tuple[int, int]:
         """Registra uma saída **bancária** e integra com CAP (opcional)."""
@@ -646,3 +655,106 @@ class _SaidasLedgerMixin:
                 id_saida, id_mov, saida_total, sobra_reg, (tipo_eff or "-"), (obrigacao_id or "-"),
             )
             return (id_saida, id_mov)
+
+    # ------------------------ CRÉDITO: Fatura + MB registro ------------------------
+
+    def registrar_saida_credito(
+        self,
+        *,
+        data_compra: str,
+        valor: float,
+        parcelas: int,
+        cartao_nome: str,
+        categoria: Optional[str],
+        sub_categoria: Optional[str],
+        descricao: Optional[str],
+        usuario: str,
+        fechamento: int = 0,  # compat (não usado aqui)
+        vencimento: int = 0,  # compat (não usado aqui)
+        trans_uid: Optional[str] = None,
+    ) -> tuple[list[int], int]:
+        """
+        Compra no CARTÃO:
+          - Cria itens em `fatura_cartao_itens` (um por parcela).
+          - Loga em MB como 'registro' (valor=0.0).
+          - NÃO mexe em saldos de bancos/caixas aqui.
+
+        Retorna: (ids_itens_fatura, id_mov_mb)
+        """
+        # Import local para manter o arquivo autossuficiente
+        from repository.fatura_cartao_itens_repository import FaturaCartaoItensRepository
+        from hashlib import sha256
+
+        # -------- sane inputs --------
+        data_compra = self._parse_date(data_compra)
+        cartao_nome_s = self._sane(cartao_nome) or "Cartão"
+        categoria_s = self._sane(categoria) or "-"
+        subcat_s = self._sane(sub_categoria) or "-"
+        desc_s = self._sane(descricao) or "-"
+        usuario_s = self._sane(usuario) or "-"
+
+        # -------- parcelas e valores --------
+        p = max(1, int(parcelas or 1))
+        total = float(valor)
+        if total <= 0:
+            raise ValueError("Valor total da compra no crédito deve ser > 0.")
+
+        base = round((total / p), 2)
+        valores = [base] * p
+        ajuste = round(total - (base * p), 2)
+        if abs(ajuste) >= 0.01:
+            valores[-1] = round(valores[-1] + ajuste, 2)
+
+        # -------- UID por compra (compartilhado entre as parcelas) --------
+        seed = f"{cartao_nome_s}|{data_compra}|{desc_s}|{p}"
+        purchase_uid = sha256(seed.encode("utf-8")).hexdigest()
+
+        # -------- inserir itens na fatura --------
+        repo_fci = FaturaCartaoItensRepository(self.db_path)
+        ids_itens: list[int] = []
+        for i in range(1, p + 1):
+            item_id = repo_fci.inserir_item(
+                data_compra=data_compra,
+                cartao=cartao_nome_s,
+                descricao_compra=desc_s,
+                parcela_num=i,
+                parcelas=p,
+                valor_parcela=valores[i - 1],
+                categoria=categoria_s,
+                purchase_uid=purchase_uid,
+                usuario=usuario_s,
+            )
+            ids_itens.append(int(item_id))
+
+        # -------- log em MB como 'registro' (valor 0) --------
+        obs = _fmt_obs_saida(
+            forma="CRÉDITO",
+            valor=total,
+            categoria=categoria_s,
+            subcategoria=subcat_s,
+            descricao=desc_s,
+            banco=None,
+        )
+
+        valor_str = f"{total:.2f}"
+        seed_mb = f"CREDITO|{data_compra}|{valor_str}|{cartao_nome_s}|{p}|{desc_s}"
+        trans_uid_mb = str(trans_uid or gerar_trans_uid("mb", seed=seed_mb))
+
+        with get_conn(self.db_path) as conn:
+            id_mov = log_mov_bancaria(
+                conn,
+                data=data_compra,
+                banco=cartao_nome_s,         # guarda o nome do cartão na coluna 'banco'
+                tipo="registro",             # não afeta saldo agora
+                valor=0.0,                   # valor contábil 0 neste momento
+                origem="credito_programado", # para diferenciar no extrato
+                observacao=obs,
+                usuario=usuario_s,
+                referencia_id=(ids_itens[0] if ids_itens else None),
+                referencia_tabela="fatura_cartao_itens",
+                trans_uid=trans_uid_mb,
+                data_hora=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            conn.commit()
+
+        return (ids_itens, int(id_mov))
